@@ -8,7 +8,7 @@
   fail:  running -> failed；retry: failed -> ready；recover: 所有 running -> ready
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
 """
-import argparse, json, os, sys, time
+import argparse, collections, datetime, glob, json, os, sys, time
 
 
 def now_ms():
@@ -23,6 +23,9 @@ def load(path):
 
 
 def save(path, data):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -193,6 +196,57 @@ def cmd_status(a, data, _):
         print('失败待重试: ' + ' '.join(t['id'] for t in failed))
 
 
+
+def default_board():
+    """无 --board 时：遗留 .expert-taskboard.json 优先，否则用 .expert-taskboards/default.json。"""
+    legacy = os.path.join(os.getcwd(), '.expert-taskboard.json')
+    if os.path.exists(legacy):
+        return legacy
+    return os.path.join(os.getcwd(), '.expert-taskboards', 'default.json')
+
+
+def all_boards():
+    """当前目录下的全部任务板（含遗留文件与 .expert-taskboards/*.json）。"""
+    found = []
+    legacy = os.path.join(os.getcwd(), '.expert-taskboard.json')
+    if os.path.exists(legacy):
+        found.append(legacy)
+    gdir = os.path.join(os.getcwd(), '.expert-taskboards')
+    if os.path.isdir(gdir):
+        found.extend(sorted(glob.glob(os.path.join(gdir, '*.json'))))
+    return found
+
+
+def cmd_boards(a, _data=None):
+    found = all_boards()
+    if not found:
+        print('（当前目录没有任务板）')
+        return
+    for p in found:
+        try:
+            data = json.load(open(p, encoding='utf-8'))
+        except Exception:
+            print(f'{os.path.relpath(p)} （损坏）')
+            continue
+        tasks = data.get('tasks', {})
+        st = collections.Counter(t['status'] for t in tasks.values())
+        upd = max([t.get('updated', 0) for t in tasks.values()] or [0])
+        ts = datetime.datetime.fromtimestamp(upd / 1000).strftime('%m-%d %H:%M') if upd else '-'
+        dist = ' '.join(f'{k}={v}' for k, v in sorted(st.items())) or '空'
+        print(f"{os.path.relpath(p)} | {len(tasks)} 任务 | {dist} | 最近更新 {ts}")
+
+
+def cmd_archive(a, data, path):
+    open_tasks = [t for t in data['tasks'].values() if t['status'] not in ('done', 'failed')]
+    if open_tasks and not a.force:
+        listing = ', '.join(f"{t['id']}[{t['status']}]" for t in open_tasks)
+        sys.exit(f'拒绝归档：还有未收口任务 {listing}；先 done/fail，或确认放弃用 --force')
+    os.makedirs('.expert-taskboards/archive', exist_ok=True)
+    name = time.strftime('%Y%m%d-%H%M%S') + '-' + os.path.basename(path)
+    os.replace(path, os.path.join('.expert-taskboards', 'archive', name))
+    print(f'已归档 {os.path.relpath(path)} -> .expert-taskboards/archive/{name}')
+
+
 def main():
     ap = argparse.ArgumentParser(description='expert-orchestrator 任务板')
     ap.add_argument('--board', help='状态文件路径，默认 <cwd>/.expert-taskboard.json')
@@ -215,9 +269,14 @@ def main():
     p = sub.add_parser('recover'); p.set_defaults(fn=cmd_recover)
     p = sub.add_parser('deps'); p.add_argument('id'); p.set_defaults(fn=cmd_deps)
     p = sub.add_parser('status'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('boards'); p.set_defaults(fn=cmd_boards)
+    p = sub.add_parser('archive'); p.add_argument('--force', action='store_true'); p.set_defaults(fn=cmd_archive)
 
     a = ap.parse_args()
-    path = a.board or os.path.join(os.getcwd(), '.expert-taskboard.json')
+    if a.cmd == 'boards':
+        a.fn(a)
+        return
+    path = a.board or default_board()
     data = load(path)
     a.fn(a, data, path)
 

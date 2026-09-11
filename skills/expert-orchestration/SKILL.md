@@ -13,7 +13,7 @@ whenToUse: 每轮用户请求涉及实施工作（写代码/改配置/改文档/
 每条新的用户消息都开启一轮新循环：
 
 1. **重新分诊**（第 1 节），不允许因为上一轮已有计划或"只是收尾"就直接动手。
-2. **有活跃计划**：先查任务板（`status`）与第 4 节门禁判断（尤其：即将 commit？范围变了？），再继续委派剩余子任务。
+2. **有活跃计划**：先 `boards` 总览全部任务板，再查当前项目板的 `status`，结合第 4 节门禁判断（尤其：即将 commit？范围变了？），继续委派剩余子任务。
 3. **无活跃计划但属实施任务**：按第 1 节分级——大型先 PM，小型实施直接委派执行专家。
 4. 本轮若尚未加载过本协议（新会话或历史已压缩），必须先加载再行动。
 
@@ -32,7 +32,7 @@ whenToUse: 每轮用户请求涉及实施工作（写代码/改配置/改文档/
 2. 规划任务书必须自包含（专家看不到对话）：目标与验收期望、已知约束、关键上下文（工作目录、相关文件路径、已确认事实），并明确「只规划不执行」。
 3. 组装规划任务书前先读经验池（第 8 节），把相关教训写进「经验提示」。
 4. 要求 PM 返回结构化计划：子任务清单（2–6 条，每条含做什么、建议执行专家领域、验收标准）、依赖与并行关系、里程碑顺序、风险与范围外项。
-5. 大型任务把计划落进任务板（第 9 节 taskboard.py）：每个子任务一个条目，`--owner` 标执行专家、`--desc` 写验收标准、`--dep` 声明依赖；todo_write 同步关键里程碑给用户看。
+5. 大型任务把计划落进任务板（第 9 节 taskboard.py）：**每个项目/计划一个独立板**——`--board .expert-taskboards/<项目slug>.json`（如 dsh-onebot-m1），禁止把无关任务建进同一个板；每个子任务一个条目，`--owner` 标执行专家、`--desc` 写验收标准、`--dep` 声明依赖；todo_write 同步关键里程碑给用户看。
 
 ## 3. 执行编排
 
@@ -106,7 +106,7 @@ whenToUse: 每轮用户请求涉及实施工作（写代码/改配置/改文档/
 
 技能目录 = 本文件所在目录；两个脚本零依赖，python3 直接跑。
 
-**任务板 taskboard.py**（状态文件 `<cwd>/.expert-taskboard.json`；多步骤大型任务必用）：
+**任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）：
 
     python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3
@@ -114,6 +114,8 @@ whenToUse: 每轮用户请求涉及实施工作（写代码/改配置/改文档/
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要"     # 依赖它的任务自动转 ready
     python3 <技能目录>/tools/taskboard.py fail T3 "原因" ; retry T3
     python3 <技能目录>/tools/taskboard.py recover               # 会话崩溃后恢复 running -> ready
+    python3 <技能目录>/tools/taskboard.py boards                # 列出当前目录全部任务板（防遗留污染）
+    python3 <技能目录>/tools/taskboard.py archive --board .expert-taskboards/<项目slug>.json  # 项目收口后归档（有未收口任务需 --force）
 
 **消息总线 bus.py**（信箱 `<cwd>/.expert-bus/`；并行专家协作必用）：
 

@@ -80,6 +80,19 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 2. 直接交代任务即可：编排者自动分诊、请 PM 规划、委派专家。
 3. 大型任务可随时插话调整；里程碑与 commit 前会自动过评审 + PM 检查点。
 
+## 📚 专家库与来源声明
+
+本插件分发的专家提示词按来源分为四部分（每个专家文件 frontmatter 的 `来源` 字段标注出处，完整清单见 [EXPERTS.md](EXPERTS.md)）：
+
+| 来源 | 数量 | 内容 |
+|---|---|---|
+| 本项目自建 | 11 | 编排协议配套的中文兜底专家（generalist、PM、前后端、审查、测试、安全、数据、运维、文档、设计） |
+| [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents)（MIT） | 62 | 技术栈专项：语言/框架（Rust、Go、Swift、Kotlin…）、基础设施（K8s/Terraform…）、数据与 AI（LLM 架构、MLOps…）、质量调试（混沌/性能/调试）、开发者体验、垂直栈（区块链/支付/医疗合规…）、架构模式（微服务/GraphQL…） |
+| [wshobson/agents](https://github.com/wshobson/agents)（MIT） | 4 | 独有技术栈：Julia、ARM Cortex 嵌入式、NVIDIA DGX 运维、LLM 微调 |
+| [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh)（MIT） | 1 | 中文生态增量：搜索增长编排器 |
+
+以上上游项目均为 MIT 许可证，专家正文版权归各自作者所有，本仓库的分发遵循 MIT 并在此声明致谢。
+
 ## 🛠️ 自定义
 
 - **专家提示词库**：`skills/expert-orchestration/experts/*.md`，直接增删改，格式照现有文件（头部「适用任务」供分诊匹配）；Agency 花名册无匹配领域时自动回退到这里。
@@ -95,6 +108,7 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — 核心框架
 - [MichengAI/dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents) — Agency 专家花名册（本 preset 的专家来源）
 - [Asher-2000/dsh-expert-mode](https://github.com/Asher-2000/dsh-expert-mode) — 五锚自检 / 经验池 / 独立评审 / 任务板 / 消息总线五个机制的灵感来源
+- [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) · [wshobson/agents](https://github.com/wshobson/agents) · [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) — 专家库引用来源（MIT）
 
 ## License
 

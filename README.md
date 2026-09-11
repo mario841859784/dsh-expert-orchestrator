@@ -31,10 +31,24 @@ or manually copy `agent.cordis.yml`, `preset.yml` and `skills/` into `~/.dsh/.ag
 
 The deployer never deletes anything in the target directory, refreshes protocol files only on version bumps, and treats `lessons.md` / `experts/*.md` as user data (add-only).
 
+## Expert library & attribution
+
+Shipped experts carry a `来源` (source) frontmatter field; the full catalog with per-expert sources lives in [EXPERTS.md](EXPERTS.md):
+
+| Source | Count | Content |
+|---|---|---|
+| Self-authored | 11 | Chinese fallback experts shipped with the orchestration protocol |
+| [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) (MIT) | 62 | Stack specialists: languages/frameworks, infrastructure, data & AI, quality/debugging, DX, vertical domains, architecture patterns |
+| [wshobson/agents](https://github.com/wshobson/agents) (MIT) | 4 | Unique stacks: Julia, ARM Cortex embedded, NVIDIA DGX ops, LLM fine-tuning |
+| [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) (MIT) | 1 | Chinese-ecosystem increment: search-growth orchestrator |
+
+All upstream projects are MIT-licensed; expert texts remain copyrighted by their authors, redistribution here follows MIT with attribution.
+
 ## Credits
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - [MichengAI/dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents) — the Agency expert roster
 - [Asher-2000/dsh-expert-mode](https://github.com/Asher-2000/dsh-expert-mode) — inspiration for the five-anchor check, experience pool, independent review, taskboard and message bus
+- [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) · [wshobson/agents](https://github.com/wshobson/agents) · [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) — imported expert library sources (MIT)
 
 MIT © mario841859784

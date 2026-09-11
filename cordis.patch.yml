@@ -1,0 +1,7 @@
+# dsh-expert-orchestrator plugin registration
+# The agent-plane composition (persona + expert orchestration preset) lives in
+# agent.cordis.yml; this patch registers the deployer so `dsh plugin add`
+# mounts it and the preset lands in ~/.dsh/.agent-presets/expert-orchestrator/.
+- insert:
+  - id: dsh-expert-orchestrator
+    name: dsh-expert-orchestrator

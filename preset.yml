@@ -2,4 +2,4 @@ name: 专家编排模式
 description: |
   PM 先行规划 + Agency 专家优先委派的编排 Agent：每轮强制分诊与五锚自检，实施一律委派专家；
   任务板管理依赖与状态，消息总线并行落盘，commit 前独立评审 + PM 检查点，任务收尾沉淀经验池。
-version: "1.3.0"
+version: "1.4.0"

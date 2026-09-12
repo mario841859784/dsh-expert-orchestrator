@@ -13,3 +13,9 @@
 - 用户报「图片里存在 X」与像素级证据矛盾时，不迎合断言、给出字形证据并请用户指认位置，第二张截图（Web 端渲染）即定位成功；QQ 截图与 Web 截图是同一渲染管线的两种消费者，交叉比对能区分「内容缺字」vs「端侧字形缺字」。
 - 运行中的 Cordis 插件进程不热加载 lib/（HMR 只重应用配置），改 lib 后必须重启宿主进程生效；涉及生产通道（QQ）的重启会让当前会话通道短暂中断，重启动作应交用户择时，验收分「磁盘 lib 已生效」与「live 进程已生效」两步记录。
 - commit 前必查分支拓扑（git log --decorate + merge-base）：detached HEAD 上的修复 commit 有 GC 风险，且本地分支可能落后于部署 tag；把分支快进到已验证链前先 diff tag..main 确认方向，防止 checkout 把部署基线回退。
+
+## 2026-09-12 缓存率优化改造 v1.4.0
+- 本次改造目标是提高智谱（GLM）隐式前缀缓存命中率；缓存率只能在线上观察：经 new-api 聚合 `usage.prompt_tokens_details.cached_tokens / prompt_tokens`，本地无法直接测得。
+- 若渠道为 GLM Coding Plan 套餐转发，cached_tokens 可能恒为 0——这是渠道特性，与改造本身无关，判定效果前先确认渠道类型。
+- 写验收断言（正则/行数）前必须先对照仓库实际布局：PM 规划时曾把 SKILL.md 误记为 288 行（实际 133 行），凭记忆写断言会误判。
+- 部署副本 `~/.dsh/.agent-presets/expert-orchestrator/` 不自动更新，需重新部署 preset 后新会话才生效。

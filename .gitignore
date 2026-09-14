@@ -5,3 +5,7 @@ node_modules/
 .expert-taskboard.json
 .expert-lessons.md
 .expert-taskboard.json.tmp
+
+# trim-cli：scripts/ 与 bin/（平台二进制）仅存在于部署副本，不入库
+skills/trim-cli/bin/
+skills/trim-cli/scripts/

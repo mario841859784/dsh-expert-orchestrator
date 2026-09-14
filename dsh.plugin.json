@@ -1,7 +1,7 @@
 {
   "name": "dsh-expert-orchestrator",
-  "description": "专家编排模式 agent preset — 首席编排者：PM 先行规划、Agency 专家优先委派、任务板依赖调度、消息总线并行落盘、独立评审 + PM 交付门禁、经验池沉淀。",
-  "version": "1.4.2",
+  "description": "专家编排模式 agent preset — 首席编排者：每条消息先归类分诊、PM 先行规划、Agency 专家优先委派、任务板依赖调度、消息总线并行落盘、分级交付门禁、经验池按需沉淀。",
+  "version": "1.4.3",
   "entry": {
     "name": "dsh-expert-orchestrator",
     "inject": []

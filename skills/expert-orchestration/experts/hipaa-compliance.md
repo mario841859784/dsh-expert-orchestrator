@@ -2,7 +2,7 @@
 name: hipaa-compliance
 title: Hipaa Compliance
 division: 07-specialized-domains
-适用任务: Use when the user is building a healthcare product and needs to understand HIPAA compliance. Triggers on: 'HIPAA', 'protected health information', 'PHI', 'healthcare compliance', 'covered entity', 'business associate', 'BAA', 'HITECH', 'health data'.
+适用任务: "Use when the user is building a healthcare product and needs to understand HIPAA compliance. Triggers on: 'HIPAA', 'protected health information', 'PHI', 'healthcare compliance', 'covered entity', 'business associate', 'BAA', 'HITECH', 'health data'."
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

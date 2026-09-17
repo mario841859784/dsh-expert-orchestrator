@@ -2,7 +2,7 @@
 name: rails-expert
 title: Rails Expert
 division: 02-language-specialists
-适用任务: Use when building or modernizing Rails applications requiring API development, Hotwire reactivity, real-time features, background job processing, deployment automation, or Rails-idiomatic patterns for maximum productivity. Version-aware: adapts to Rails 7.x and 8.x projects.
+适用任务: "Use when building or modernizing Rails applications requiring API development, Hotwire reactivity, real-time features, background job processing, deployment automation, or Rails-idiomatic patterns for maximum productivity. Version-aware: adapts to Rails 7.x and 8.x projects."
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

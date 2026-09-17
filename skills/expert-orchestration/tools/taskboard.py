@@ -7,6 +7,7 @@
   claim: ready -> running；done: running -> done（依赖它的任务自动转 ready）
   fail:  running -> failed；retry: failed -> ready；recover: 所有 running -> ready
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
+检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
 """
 import argparse, collections, datetime, glob, json, os, sys, time
 
@@ -92,6 +93,12 @@ def cmd_list(a, data, _):
         show(data['tasks'][tid])
 
 
+def last_checkpoint(t):
+    """取最新检查点；旧板条目无 checkpoints 字段时返回 None。"""
+    cps = t.get('checkpoints') or []
+    return cps[-1] if cps else None
+
+
 def cmd_show(a, data, _):
     t = get_task(data, a.id)
     show(t)
@@ -101,6 +108,10 @@ def cmd_show(a, data, _):
         print(f"  结果: {t['summary']}")
     if t['fail']:
         print(f"  失败原因: {t['fail']}")
+    cp = last_checkpoint(t)
+    if cp:
+        n = len(t.get('checkpoints') or [])
+        print(f"  最新检查点({n}): [{cp['time']}] {cp['note']}")
     ok, why = deps_state(t, data['tasks'])
     if t['dep'] and not ok:
         print(f"  依赖未满足（{why}）")
@@ -154,6 +165,16 @@ def cmd_retry(a, data, path):
     show(t)
 
 
+def cmd_progress(a, data, path):
+    t = get_task(data, a.id)
+    ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+    t.setdefault('checkpoints', []).append({'time': ts, 'note': a.note})
+    t['updated'] = now_ms()
+    save(path, data)
+    show(t)
+    print(f"  最新检查点({len(t['checkpoints'])}): [{ts}] {a.note}")
+
+
 def cmd_recover(a, data, path):
     n = 0
     for t in data['tasks'].values():
@@ -194,6 +215,11 @@ def cmd_status(a, data, _):
         print('进行中: ' + ' '.join(t['id'] for t in running))
     if failed:
         print('失败待重试: ' + ' '.join(t['id'] for t in failed))
+    for t in running + failed:
+        cp = last_checkpoint(t)
+        if cp:
+            print(f"  {t['id']} 最新检查点: [{cp['time']}] {cp['note']}")
+
 
 
 
@@ -266,6 +292,8 @@ def main():
     p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.set_defaults(fn=cmd_done)
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); p.set_defaults(fn=cmd_retry)
+    p = sub.add_parser('progress'); p.add_argument('id'); p.add_argument('note'); p.set_defaults(fn=cmd_progress)
+
     p = sub.add_parser('recover'); p.set_defaults(fn=cmd_recover)
     p = sub.add_parser('deps'); p.add_argument('id'); p.set_defaults(fn=cmd_deps)
     p = sub.add_parser('status'); p.set_defaults(fn=cmd_status)

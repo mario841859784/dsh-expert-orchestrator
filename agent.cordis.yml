@@ -19,6 +19,15 @@
 # pool instances — `provide()` throws on the second registration under the
 # same realm symbol; labels join REALMS, and are not what this file needs.)
 
+# ── self-deploy ──────────────────────────────────────────────────────────────
+
+# 部署插件：源仓→.agent-presets 刷新。以绝对路径 composition 条目引用源仓
+# 插件入口（先例：profiles/web/cordis.patch.yml 的 dsh-onebot）；挂载时比对
+# .deployed-version marker 与 VERSION（1.5.0），不一致则刷新协议文件。
+# inject: [] 且 apply 不发布任何服务，与 tool-fs 等行同构，无需 isolate realm。
+- id: expert-orchestrator-deploy
+  name: '/vol2/1000/ssd/workspace/project1/dsh-expert-orchestrator/lib/index.js'
+
 # ── identity ────────────────────────────────────────────────────────────────
 
 # The preset's own persona, shadowing the deployment default for this agent.

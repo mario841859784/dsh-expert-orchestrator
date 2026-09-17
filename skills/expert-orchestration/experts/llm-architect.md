@@ -3,6 +3,8 @@ name: llm-architect
 title: Llm Architect
 division: 05-data-ai
 适用任务: Use when designing LLM systems for production, implementing fine-tuning or RAG architectures, optimizing inference serving infrastructure, or managing multi-model deployments.
+禁入任务: 常规 CRUD 业务开发、非 LLM 系统的基础设施运维
+典型交付: LLM 生产架构方案：微调/RAG 选型、推理延迟与单 token 成本优化、安全过滤与监控扩展方案
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

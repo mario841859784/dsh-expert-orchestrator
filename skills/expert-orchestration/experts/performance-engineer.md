@@ -3,6 +3,8 @@ name: performance-engineer
 title: Performance Engineer
 division: 04-quality-security
 适用任务: Use this agent when you need to identify and eliminate performance bottlenecks in applications, databases, or infrastructure systems, and when baseline performance metrics need improvement.
+禁入任务: 功能特性开发、无性能基线的盲目调参
+典型交付: 性能基线与瓶颈分析、负载测试结果、经指标验证的优化项与扩展性结论
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

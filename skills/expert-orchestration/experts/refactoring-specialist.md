@@ -3,6 +3,8 @@ name: refactoring-specialist
 title: Refactoring Specialist
 division: 06-developer-experience
 适用任务: Use when you need to transform poorly structured, complex, or duplicated code into clean, maintainable systems while preserving all existing behavior.
+禁入任务: 新功能开发、改变外部行为的变更
+典型交付: 行为保持的重构方案与实施：零行为变更验证、测试覆盖维持、复杂度指标下降记录
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

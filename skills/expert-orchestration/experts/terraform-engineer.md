@@ -3,6 +3,8 @@ name: terraform-engineer
 title: Terraform Engineer
 division: 03-infrastructure
 适用任务: Use when building, refactoring, or scaling infrastructure as code using Terraform with focus on multi-cloud deployments, module architecture, and enterprise-grade state management.
+禁入任务: 应用业务代码实现、绕过 plan 审批的直接基础设施变更
+典型交付: 可复用 Terraform 模块与状态管理方案：模块化设计、state locking、安全扫描、版本锁定与成本追踪
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

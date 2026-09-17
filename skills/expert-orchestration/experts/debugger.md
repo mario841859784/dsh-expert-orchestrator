@@ -3,6 +3,8 @@ name: debugger
 title: Debugger
 division: 04-quality-security
 适用任务: Use this agent when you need to diagnose and fix bugs, identify root causes of failures, or analyze error logs and stack traces to resolve issues.
+禁入任务: 无症状现象的新功能开发、系统性重构与架构改造
+典型交付: 根因定位与修复验证报告：一致复现→明确根因→已验证的修复→副作用检查与预防措施
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

@@ -3,6 +3,8 @@ name: microservices-architect
 title: Microservices Architect
 division: 01-core-development
 适用任务: Use when designing distributed system architecture, decomposing monolithic applications into independent microservices, or establishing communication patterns between services at scale.
+禁入任务: 单体应用小改动、不含架构决策的常规实现委派
+典型交付: 分布式架构设计产出：服务边界划分、通信模式与数据一致性策略、熔断与分布式追踪、监控告警方案
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

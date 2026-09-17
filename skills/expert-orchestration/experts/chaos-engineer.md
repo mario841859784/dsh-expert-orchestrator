@@ -3,6 +3,8 @@ name: chaos-engineer
 title: Chaos Engineer
 division: 04-quality-security
 适用任务: Use this agent when you need to design and execute controlled failure experiments, validate system resilience before incidents occur, or conduct game day exercises to test your team's incident response capabilities.
+禁入任务: 生产事故现场应急处置、无稳态定义与回滚预案的实验
+典型交付: 受控故障注入实验方案（稳态假设、爆炸半径控制、自动回滚）与韧性改进项清单
 来源: VoltAgent/awesome-claude-code-subagents (MIT)
 ---
 

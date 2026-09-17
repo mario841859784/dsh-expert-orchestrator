@@ -8,6 +8,7 @@
   fail:  running -> failed；retry: failed -> ready；recover: 所有 running -> ready
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
 检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
+指标：metrics 按 owner 聚合 任务数/累计返工/换人次数（新字段 rework/switched，旧板无此字段兼容）；done 支持 --rework N / --switched 记录返工与换人，供项目收口时反哺专家路由表。
 """
 import argparse, collections, datetime, glob, json, os, sys, time
 
@@ -112,6 +113,10 @@ def cmd_show(a, data, _):
     if cp:
         n = len(t.get('checkpoints') or [])
         print(f"  最新检查点({n}): [{cp['time']}] {cp['note']}")
+    rework = t.get('rework') or 0
+    switched = t.get('switched') or False
+    if rework or switched:
+        print(f"  返工 {rework} 次" + ('，已换人' if switched else ''))
     ok, why = deps_state(t, data['tasks'])
     if t['dep'] and not ok:
         print(f"  依赖未满足（{why}）")
@@ -134,7 +139,13 @@ def cmd_done(a, data, path):
     if t['status'] != 'running':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 running 可完成")
     t['status'] = 'done'
+    if a.rework is not None and a.rework < 0:
+        sys.exit('错误：--rework 不能为负数')
     t['summary'] = a.summary or ''
+    if a.rework is not None:
+        t['rework'] = a.rework
+    if a.switched:
+        t['switched'] = True
     t['updated'] = now_ms()
     promoted = refresh(data)
     save(path, data)
@@ -221,6 +232,21 @@ def cmd_status(a, data, _):
             print(f"  {t['id']} 最新检查点: [{cp['time']}] {cp['note']}")
 
 
+def cmd_metrics(a, data, _):
+    if not data['tasks']:
+        print('（任务板为空，无数据可聚合）')
+        return
+    agg = {}
+    for t in data['tasks'].values():
+        o = t['owner'] or '（未分配）'
+        s = agg.setdefault(o, [0, 0, 0])
+        s[0] += 1
+        s[1] += t.get('rework') or 0
+        if t.get('switched'):
+            s[2] += 1
+    for o, (n, rw, sw) in sorted(agg.items(), key=lambda kv: (-kv[1][0], kv[0])):
+        print(f"{o} | 任务数 {n} | 累计返工 {rw} | 换人 {sw}")
+
 
 
 def default_board():
@@ -289,10 +315,11 @@ def main():
     p.set_defaults(fn=cmd_list)
     p = sub.add_parser('show'); p.add_argument('id'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('claim'); p.add_argument('id'); p.add_argument('owner', nargs='?'); p.set_defaults(fn=cmd_claim)
-    p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.set_defaults(fn=cmd_done)
+    p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.set_defaults(fn=cmd_done)
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser('progress'); p.add_argument('id'); p.add_argument('note'); p.set_defaults(fn=cmd_progress)
+    p = sub.add_parser('metrics'); p.set_defaults(fn=cmd_metrics)
 
     p = sub.add_parser('recover'); p.set_defaults(fn=cmd_recover)
     p = sub.add_parser('deps'); p.add_argument('id'); p.set_defaults(fn=cmd_deps)

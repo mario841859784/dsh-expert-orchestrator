@@ -258,3 +258,54 @@ sha256 验签失败（archive pin / pack / MANIFEST 逐文件）维持硬拒不�
 - 自定义含凭据本地来源：仍整包拒收（`scanRejected`），零落盘。
 - 既有 39+48 冒烟回归（symlink 断言按裁决更新后）+ M1/M2 PoC（M1 全拒、本地 symlink 根拒收、sha256 失配拒收）全过；归档 symlink 成员整包拒收用例按裁决改为「跳过+记录」断言。
 - 无 git commit/push；在途改动未触碰。
+
+## 跨源智能去重 + 推荐配置（T4 · host 侧实施记录）
+
+> 落盘物：`lib/index.js`、`lib/remote.js`、`source-registry.json`、本节。背景用户反馈：『跨源重名专家太容易触发，考虑智能去重』『现有几个专家来源对用户来说选择困难，需要推荐配置』。红线遵守：仅改上述四个授权文件（`lib/client.js` 由并行前端专家负责）；未 commit/push。
+
+### 去重契约（与 client/协议逐字对齐）
+
+`SourcesSnapshot` 新增顶层 `dedupGroups[]`：**仅含启用来源中 >1 成员的组**，元素结构：
+
+```
+{ key, members: [{ sourceId, file, name, title }], representative: { sourceId, file }, rule }
+```
+
+分组规则（重叠链接经 union-find 传递合并）：
+- **a) 同名跨源/同源重名**：规范化 name 一致即成组（规范化 = NFKC 折叠 + 小写 + 剥离全部空白/标点/符号码点，`"Backend Architect" === "backend-architect"`）；name 缺失时以规范化 title 兜底作为键材料；
+- **b) 中英对照**：`agency-agents` 与 `agency-agents-zh`（`DEDUP_AGENCY_PAIR`，lib/index.js 导出）**同相对路径视为同一专家**。实测两上游（@ad9264e / @da1542f）均为 `<domain>/<domain>-<slug>.md` 布局，路径相等即可靠链接，name/title 归一仅作对子外的一般规则——zh 文件 frontmatter `name` 为中文（如 `后端架构师`），与英文对位文件名归一后不等，故对子规则必须存在；
+- **c) 跨源同 title 不同 name 不强归组**，title 仅随 member 透出供 UI 参考（member.title 取 frontmatter `title:` 或首个非代码围栏 H1）。
+
+组 key 命名空间（不透明字符串，client 原样回传 setDedupChoice）：对子链接的组取最小公共相对路径 `pair:<rel>`；纯同名组取首个 (rank, file) 成员的键材料 `name:<norm>`。`rule` ∈ `agency-path-pair`（成员全为对子来源）| `mixed`（对子 + 同名链接并存）| `name-match`。
+
+**代表规则（优先级降序）**：
+1. `sources.json` 的 `dedup.choice[key] = sourceId`（用户手动，见新 Remote 方法）——非成员/stale choice 静默忽略回落；
+2. `preferLang`（sources.json `dedup.preferLang` 显式设置 > registry `defaults.preferLang`，缺省 `'zh'`）——**仅作用于 agency 对子**（`agency-agents-zh` 优先于 `agency-agents`；对子外来源 lang 视为 null 不参与）；
+3. 注册表顺序（rank：bundled-core=0 < legacy-adapted=1 < registry 顺序 2+i < 自定义 1000+state 序）；
+4. 首个启用来源（(rank, file) 稳定排序）。
+
+**shadowed 语义**：非代表成员在 `merged/roster.json` 对应行标注 `shadowed: true`（代表行不设该字段）。文件保留在各自 source 目录与 merged/ 视图，**不删除、不移动、不影响安全扫描状态**；协议侧读取花名册时 shadowed 行仅作展示降级提示。
+
+### Remote 契约变更（供前端对齐）
+
+1. 新增 `setDedupChoice(key, sourceId, expectedRevision) → SourcesSnapshot`：pin 某去重组的代表来源，持久化为 `dedup.choice[key]`；未知 key / 非成员 sourceId / 过期 expectedRevision 均拒绝；no-op（choice 已相等）**不 bump revision**。
+2. 新增 `clearDedupChoice(key, expectedRevision) → SourcesSnapshot`：恢复默认代表规则；已默认时 no-op 不 bump revision。
+3. 两方法与既有变更方法同型：expectedRevision 乐观锁 + sources-state 互斥锁（`withSourcesLock`）；返回完整新快照。
+4. `getSources` 及全部变更方法返回的快照新增顶层 `dedupGroups[]`（如上）与 `recommendedNote: string | null`（registry 顶层推荐说明透传）；registry 来源行新增 `recommended: boolean`（bundled-core 隐含恒启，**不设**该字段）。严格 codec 对未声明字段剥离不报错，旧 client 向后兼容；前端对齐时在 `sourcesSnapshotSchema`/`sourceEntrySchema` 追加可选字段即可。
+5. 去重引擎纯函数化并导出（lib/index.js）：`normalizeExpertName`、`parseExpertIdentity`、`buildDedupGroups(entries, {choice, preferLang})`、`computeDedupGroups(dst, state, registry)`、`DEDUP_AGENCY_PAIR`，便于单测与协议侧复用。
+
+### 推荐配置数据（source-registry.json）
+
+- `sources[].recommended`：`awesome-claude-code-subagents=true`、`agency-agents-zh=true`、`wshobson-agents=false`、`agency-agents=false`（中文用户推荐集；bundled-core 隐含恒启不设标记）；
+- 顶层 `recommendedNote`：双语一句推荐说明，快照透传；
+- `defaults.preferLang: "zh"`：去重代表规则缺省语言偏好（用户显式设置优先；当前无独立 Remote 方法，预留 settings 扩展）。
+
+### roster 格式升级
+
+`merged/roster.json` 新增 `rosterFormat: 2`、行级 `name`/`title`/`shadowed`、顶层 `dedupGroups` 与 `dedup: { preferLang, choice }`；`mergedStateHash` 输入追加格式标签 `roster-dedup-v1`，保证既有部署升级后首次 apply 强制重建一次花名册（实测旧哈希 → 重建后 rosterFormat=2）。格式 <2 的旧 roster 读取时 `dedupGroups` 返回空数组（不猜测、不报错），待重建自愈。
+
+### 验收记录（/tmp 沙箱）
+
+- 专项套件 `/tmp/eso-dedup-test/test-dedup.mjs`：**52/52 全过**，覆盖 ①同源重名/跨源同名/中英对照分组与代表（含 rank、preferLang、choice 覆盖、stale choice 忽略、传递合并 mixed）②choice 覆盖与 clear（乐观锁拒绝、未知 key 拒绝、非成员拒绝、no-op 不 bump）③shadowed 不删盘（merged 与 source 目录文件均存在、翻转后标注正确）④快照含 `dedupGroups`/`recommended`/`recommendedNote` 且 Remote 层可消费（结构断言）⑤旧 roster 不崩溃 + 升级路径自愈。
+- 既有冒烟回归重跑：`/tmp/eso-smoke/smoke-rest.mjs` **51/51**、`smoke-a.mjs` **45/45** 全过（日志 run-t4-rest.log / run-a-dyn2.log，smoke-a 修正版重跑于 2026-09-18 21:27 CST）。注：①两脚本断言 `apply().migration` 返回值系 7b775e0 之前的旧契约，/tmp 沙箱脚本已按现契约（迁移数经落账态代理验证）适配后重跑；②smoke-a 的 descriptor 断言已改为**动态口径**——数量与参数签名从 `lib/client.js` 导出的 `EXPERT_SOURCES_DESCRIPTORS` 与 `lib/remote.js` 服务原型提取比对，不硬编码 7/9（T4 去重新增 `setDedupChoice`/`clearDedupChoice` 后实测 9==9 对齐）；旧 44/44 记录系 T4 前静态断言（硬编码 7）口径、已不可复现，由本条取代；仓库内无测试文件改动。
+- 无 git commit/push；未触碰 `lib/client.js` 及任何非授权文件。

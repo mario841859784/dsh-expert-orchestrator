@@ -1,7 +1,9 @@
 {
-  "$comment": "expert-orchestrator 来源注册表 · 随包出厂（T2）。下载通道：GitHub 直连 archive 优先 → ghproxy 类镜像兜底（前缀可经 env DSH_GH_MIRROR_PREFIXES 覆盖，逗号分隔）→ release pack 兜底（离线）。所有通道产物统一 sha256 验签，不匹配拒收。ref 为 pinned commit，保证验签哈希长期有效。",
+  "$comment": "expert-orchestrator 来源注册表 · 随包出厂（T2）。下载通道：GitHub 直连 archive 优先 → ghproxy 类镜像兜底（前缀可经 env DSH_GH_MIRROR_PREFIXES 覆盖，逗号分隔）→ release pack 兜底（离线）。所有通道产物统一 sha256 验签，不匹配拒收。ref 为 pinned commit，保证验签哈希长期有效。T4 推荐配置：sources[].recommended 为客户端「一键推荐」集合（bundled-core 隐含恒启，不设标记）；recommendedNote 为双语推荐说明；defaults.preferLang 为跨源去重代表规则的语言偏好（sources.json dedup.preferLang 显式设置优先）。",
   "version": 1,
+  "recommendedNote": "中文用户推荐集：启用 awesome-claude-code-subagents 与 agency-agents-zh（bundled-core 恒启）。Recommended set for Chinese-first users: enable awesome-claude-code-subagents and agency-agents-zh (bundled-core is always on).",
   "defaults": {
+    "preferLang": "zh",
     "mirrorPrefixes": ["https://ghproxy.net/", "https://gh-proxy.com/"],
     "mirrorTemplate": "{prefix}https://github.com/{repo}/archive/{ref}.tar.gz",
     "directTemplate": "https://codeload.github.com/{repo}/tar.gz/{ref}",
@@ -22,6 +24,7 @@
       "sha256": "13bf5a78158dfe683d1e0b6b5feb0da97a28ae115758807f2efd8bcf2906e2e1",
       "sha256Scope": "archive@ref",
       "fileCount": 171,
+      "recommended": true,
       "include": ["categories/**/*.md"],
       "exclude": []
     },
@@ -39,6 +42,7 @@
       "sha256": "254ffad3e004ec1c08399d9dbacd1ec6b40e92668440552c2540bf39773a5140",
       "sha256Scope": "archive@ref",
       "fileCount": 202,
+      "recommended": false,
       "include": ["plugins/*/agents/*.md"],
       "exclude": []
     },
@@ -56,6 +60,7 @@
       "sha256": "c6cae326424a5cf5151a022eb02a4baf35d9f4a9b088eea74f58e63defafd627",
       "sha256Scope": "archive@ref",
       "fileCount": 274,
+      "recommended": false,
       "include": ["*/*.md"],
       "exclude": [".github/**", "README.md", "CONTRIBUTING*.md", "SECURITY.md"]
     },
@@ -73,6 +78,7 @@
       "sha256": "72453d57724b047e851705c591e486a862e06f5c0717ade98ef341508ea35104",
       "sha256Scope": "archive@ref",
       "fileCount": 273,
+      "recommended": true,
       "include": ["*/*.md"],
       "exclude": [".github/**", "README*.md", "CONTRIBUTING*.md", "SECURITY.md"]
     }

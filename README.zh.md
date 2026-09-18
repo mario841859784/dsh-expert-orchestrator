@@ -72,7 +72,9 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 
 - **从不删除**目标目录里的任何文件（你加的技能、自定义专家都安全）；
 - 协议文件（persona/技能/工具脚本）按版本标记刷新，本地手工修改在重启后保留，插件升级时才更新；
-- `lessons.md` 与 `experts/*.md` 属于运行时用户数据——**只增不覆盖**。
+- `lessons.md` 与 `expert-sources/`（下载的来源包与合并花名册视图）属于运行时用户数据——**只增不覆盖**。
+
+安装后出厂只含 **11 个 bundled core 专家**（`skills/expert-orchestration/experts/`）。四个上游专家来源包**不随包分发**——在插件设置页的**「专家来源」**面板下载并启用：host 侧经 GitHub 直连或 CDN 镜像双通道拉取，解包前先做 sha256（pinned archive 哈希）验签。安装时安全扫描（凭据泄漏 + 指令注入模式）按来源分两档执行：**注册表来源**（pinned sha256）扫描命中 → 发出警告，由用户确认后放行，不自动拒收；**注册表外自定义/本地路径来源**扫描命中 → 硬拒；符号链接一律跳过并记录，不因此拒包。
 
 ### 本地源码自部署（可选）
 
@@ -86,7 +88,7 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
       name: '/绝对路径/dsh-expert-orchestrator/lib/index.js'
 ```
 
-升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`，共 10 项）；USER_DATA（`experts/`、`lessons.md`）只缺才补。宿主层本地挂载不受该覆盖影响。
+升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`，共 10 项），且 `skills/expert-orchestration/experts/` 现只含 11 个 bundled core 专家、按 PROTOCOL 随版本刷新；USER_DATA（`lessons.md`、`expert-sources/`——下载的来源包与合并花名册）只缺才补、绝不覆盖。升级到本版本后首次运行时，历史上适配过的专家副本会一次性迁移进 `expert-sources/legacy-adapted/`（冻结本地来源，默认启用）而非被删除。宿主层本地挂载不受该覆盖影响。
 
 存量迁移提示：若此前在 `agent.cordis.yml` 中手工加过 `expert-orchestrator-deploy` 条目，升级前应先迁移到宿主层 `cordis.patch.yml`，否则 VERSION 变更刷新会用出厂版覆盖该条目、静默断掉本地链路。
 
@@ -96,18 +98,20 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 2. 直接交代任务即可：编排者自动分诊、请 PM 规划、委派专家。
 3. 大型任务可随时插话调整；里程碑与 commit 前会自动过评审 + PM 检查点。
 
-## 📚 专家库与来源声明
+## 📚 专家来源项目
 
-本插件分发的专家提示词按来源分为四部分（每个专家文件 frontmatter 的 `来源` 字段标注出处，完整清单见 [EXPERTS.md](EXPERTS.md)）：
+11 个 bundled core 专家之外的内容来自四个 MIT 许可的上游项目。四者均已登记进 `skills/expert-orchestration/source-registry.json`，并**原样引用、不改名不改内容**（文件按上游原样解包，署名见 [NOTICE](NOTICE)）：
 
-| 来源 | 数量 | 内容 |
-|---|---|---|
-| 本项目自建 | 11 | 编排协议配套的中文兜底专家（generalist、PM、前后端、审查、测试、安全、数据、运维、文档、设计） |
-| [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents)（MIT） | 62 | 技术栈专项：语言/框架（Rust、Go、Swift、Kotlin…）、基础设施（K8s/Terraform…）、数据与 AI（LLM 架构、MLOps…）、质量调试（混沌/性能/调试）、开发者体验、垂直栈（区块链/支付/医疗合规…）、架构模式（微服务/GraphQL…） |
-| [wshobson/agents](https://github.com/wshobson/agents)（MIT） | 4 | 独有技术栈：Julia、ARM Cortex 嵌入式、NVIDIA DGX 运维、LLM 微调 |
-| [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh)（MIT） | 1 | 中文生态增量：搜索增长编排器 |
+| 项目 | 许可 | 本插件中的采纳关系 | 收录文件 |
+|---|---|---|---|
+| [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) | MIT | **classic 包内容源**——离线 classic 包中历史适配专家副本的内容锚（62 个文件） | 171（`categories/**/*.md`） |
+| [wshobson/agents](https://github.com/wshobson/agents) | MIT | **classic 包内容源**——离线 classic 包中历史适配专家副本的内容锚（4 个文件） | 202（`plugins/*/agents/*.md`） |
+| [msitarzewski/agency-agents](https://github.com/msitarzewski/agency-agents) | MIT | **独立来源包**——作为独立来源整包安装 | 274（`*/*.md`） |
+| [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) | MIT | **独立来源包**——作为独立来源整包安装 | 273（`*/*.md`） |
 
-以上上游项目均为 MIT 许可证，专家正文版权归各自作者所有，本仓库的分发遵循 MIT 并在此声明致谢。
+表中数字为各来源 pinned ref 解包实测数（按注册表 include/exclude 规则筛选后实际落盘的文件数，已对照 pinned archive 的 sha256 核验）。
+
+前两者是 classic 包（离线兜底 release，锚定历史上 67 个适配过的专家副本）的内容源；后两者以独立来源包形式提供。下载走 GitHub 直连或 CDN 镜像双通道并做 sha256 验签与分档安装时安全扫描（分档规则见上文部署策略一节）；装好的来源专家在合并花名册中以「来源名 / 原名」组织，跨源重名专家并存并显式标注来源。以上上游项目均为 MIT 许可证，专家正文版权归各自作者所有，本仓库的分发遵循 MIT 并在此声明致谢。
 
 ## 🛠️ 自定义
 
@@ -124,7 +128,7 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — 核心框架
 - [MichengAI/dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents) — Agency 专家花名册（本 preset 的专家来源）
 - [Asher-2000/dsh-expert-mode](https://github.com/Asher-2000/dsh-expert-mode) — 五锚自检 / 经验池 / 独立评审 / 任务板 / 消息总线五个机制的灵感来源
-- [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) · [wshobson/agents](https://github.com/wshobson/agents) · [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) — 专家库引用来源（MIT）
+- [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) · [wshobson/agents](https://github.com/wshobson/agents) · [msitarzewski/agency-agents](https://github.com/msitarzewski/agency-agents) · [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) — 专家库引用来源（MIT）
 
 ## License
 

@@ -212,6 +212,16 @@
 
 `SourcesSnapshot = { revision, sources[], mirrorPrefixes[], conflicts[], confirmRequired? }`，sources 行含 `{id,name,upstream,license,installedVersion,enabled,builtin,status,statusDetail,lastUpdated, scanFindings?, skippedSymlinks?}`（scanFindings/skippedSymlinks 见「扫描策略修订」节；旧 client 对未声明行字段剥离不报错）。client 侧 `vObject` 对声明外字段剥离，故新增顶层 `confirmRequired` 对旧 client 向后兼容（被剥离、不报错）。
 
+**conflicts 分类契约（v2.1.1，2026-09-18 用户裁决）**：basename 冲突由去重引擎分类（`classifyBasenameConflict`），快照的报警面 = **仅 `unresolved` 类**；roster.json 保留全量记录并携带 `class` 字段供审计。三类定义：
+
+| class | 判定 | 报警 |
+|---|---|---|
+| `resolved-by-dedup` | 该 basename 的全部命中位于同一去重组（组内有 representative）——调用目标已由引擎消歧 | 否 |
+| `basename-only` | 命中分属不同专家身份（name/title 归一后不同，或至少一方身份不可判定且非全部相同）——不同专家恰好同文件名 | 否 |
+| `unresolved` | 全部命中同一归一身份却未被任何去重组覆盖——防御性分支（未来来源）；必须保留报警 | 是 |
+
+快照 `conflicts[]` 条目形状不变（`{expert, sources}`，client `conflictEntrySchema` 兼容），仅内容过滤为 unresolved 类；roster.json `conflicts[]` 条目新增 `class` 字段（数组结构不变，向后兼容）。`computeConflicts` 优先消费 merged/roster.json 的分类结果（前提：roster 覆盖的来源集合与当前启用集合完全一致），roster 缺失/不可读/不覆盖时回退旧的全量 basename 计算（保守方向：宁可多报警）。
+
 **M3 确认门（host 强制，UI 需配合）**：`setSourceEnabled` 启用**非注册表来源**（`kind='custom'`：用户自加 GitHub 仓库 / 本地路径）时要求显式确认：
 
 1. 首次启用未携带 `ackRisks === true`（第 4 个位置参数，boolean，可省略）：**拒绝**——不改任何状态、不 bump revision，返回快照附 `confirmRequired = { id, method: 'setSourceEnabled', ackField: 'ackRisks', reason }` 标记；

@@ -5,3 +5,15 @@
 - insert:
   - id: dsh-expert-orchestrator
     name: dsh-expert-orchestrator
+  # Typert Remote root service for expert source management: exposes the
+  # `expertSources` namespace (getSources/addSource/removeSource/
+  # setSourceEnabled/downloadSource/updateSource/setMirrorPrefixes, all
+  # returning a SourcesSnapshot with an expectedRevision optimistic lock)
+  # so the api-gateway discovers the route and the settings page (T3,
+  # lib/client.js EXPERT_SOURCES_DESCRIPTORS) can read/write source state.
+  # `./lib/remote.js` is anchored to a file URL beside this patch by the
+  # host's anchorInsertedPluginNames — required because the package `exports`
+  # map (added for the ./client entry) blocks bare deep-path specifiers like
+  # `dsh-expert-orchestrator/lib/remote.js`.
+  - id: expert-sources-remote
+    name: ./lib/remote.js

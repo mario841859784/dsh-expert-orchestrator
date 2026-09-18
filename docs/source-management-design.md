@@ -190,7 +190,7 @@
 
 ### 安装流水
 
-拉包 → sha256 验签 → tar 原样解包（不改名不改内容）→ include/exclude 选文件 → 安全扫描（`SCAN_PATTERNS`：凭据 10 模式 + 指令注入 6 模式，与上架核查同源标准；命中即拒收，安装目录不落任何文件）→ 写 `expert-sources/<id>/` 与 `.source-manifest.json`（独立标注层，记录 path/upstreamPath/sha256/channel）→ 入册 sources.json → 重建 merged 视图。
+拉包 → sha256 验签 → tar 原样解包（不改名不改内容；symlink 成员跳过并记录 `skippedSymlinks`，绝不跟随）→ include/exclude 选文件 → 安全扫描（`SCAN_PATTERNS`：凭据 10 模式 + 指令注入 6 模式，与上架核查同源标准；命中处置按「扫描策略修订」节三分野：注册表来源确认后放行、自定义来源拒收）→ 写 `expert-sources/<id>/` 与 `.source-manifest.json`（独立标注层，记录 path/upstreamPath/sha256/channel/scanFindings/skippedSymlinks）→ 入册 sources.json → 重建 merged 视图。
 
 ### 迁移（apply 时，幂等）
 
@@ -206,11 +206,11 @@
 | `addSource(input{url,name}, expectedRevision)` | | `SourcesSnapshot` | GitHub repo URL 或本地路径；id 由 host 白名单派生（M1） |
 | `removeSource(id, expectedRevision)` | | `SourcesSnapshot` | id 白名单校验 + 路径前缀断言（M1）；legacy-adapted/bundled-core 拒删 |
 | `setSourceEnabled(id, enabled, expectedRevision, ackRisks?)` | | `SourcesSnapshot` | **M3 确认门，见下** |
-| `downloadSource(id, channel<'github'\|'cdn'>, expectedRevision)` | | `SourcesSnapshot` | 进程内互斥（M5）；失败仅记 status 不 bump |
-| `updateSource(id, channel<'github'\|'cdn'>, expectedRevision)` | | `SourcesSnapshot` | 同上（update 语义） |
+| `downloadSource(id, channel<'github'\|'cdn'>, expectedRevision, ackScan?)` | | `SourcesSnapshot` | 进程内互斥（M5）；失败仅记 status 不 bump；扫描命中 → `confirmRequired`（ackField `ackScan`，见「扫描策略修订」节） |
+| `updateSource(id, channel<'github'\|'cdn'>, expectedRevision, ackScan?)` | | `SourcesSnapshot` | 同上（update 语义） |
 | `setMirrorPrefixes(prefixes: string[], expectedRevision)` | | `SourcesSnapshot` | ≤16 条，http(s) 前缀 |
 
-`SourcesSnapshot = { revision, sources[], mirrorPrefixes[], conflicts[], confirmRequired? }`，sources 行含 `{id,name,upstream,license,installedVersion,enabled,builtin,status,statusDetail,lastUpdated}`。client 侧 `vObject` 对声明外字段剥离，故新增顶层 `confirmRequired` 对旧 client 向后兼容（被剥离、不报错）。
+`SourcesSnapshot = { revision, sources[], mirrorPrefixes[], conflicts[], confirmRequired? }`，sources 行含 `{id,name,upstream,license,installedVersion,enabled,builtin,status,statusDetail,lastUpdated, scanFindings?, skippedSymlinks?}`（scanFindings/skippedSymlinks 见「扫描策略修订」节；旧 client 对未声明行字段剥离不报错）。client 侧 `vObject` 对声明外字段剥离，故新增顶层 `confirmRequired` 对旧 client 向后兼容（被剥离、不报错）。
 
 **M3 确认门（host 强制，UI 需配合）**：`setSourceEnabled` 启用**非注册表来源**（`kind='custom'`：用户自加 GitHub 仓库 / 本地路径）时要求显式确认：
 
@@ -226,3 +226,35 @@
 ### classic pack（release source-packs-v1）
 
 `scripts/build-classic-pack.mjs`：从 git HEAD 自动发现 67 个 `来源:` 文件 → 浅 fetch 4 注册表 pinned commit（git fetch 失败自动回退 codeload archive 通道，TLS 重试一次）→ frontmatter 剥离 + 空白级归一化（行尾空白/首尾空行/连续空行压缩；对应 T1「62 逐字节一致 + 5 个多 1 空行」的口径）正文比对，basename+正文唯一匹配锚定 → `awesome-claude-code-subagents/`(62) + `wshobson-agents/`(4) + `agency-agents-zh/`(1) 三项目分子目录零改名零改内容（注：任务书原文「两项目」按 62+4+1 的实际上游分布落为三个子目录）→ MANIFEST.json（逐文件 sha256）→ tgz。sha256 `1865d469d415095102aa696094cf63ef57b25611cf12bd438b195be014a0e778`，已回填注册表 pack.sha256，并上传 GitHub release tag `source-packs-v1`。
+
+---
+
+## 扫描策略修订（用户裁决 · host 侧实施记录）
+
+> 落盘物：`lib/index.js`、`lib/remote.js`、本节。安全裁决三分野：①注册表来源扫描命中 → 警告 + 用户确认放行；②symlink 成员 → 一律跳过并记录（不再整包拒收）；③自定义/本地路径来源扫描命中 → 维持硬拒。红线遵守：仅改上述三个文件；未 commit/push。
+
+### 策略三分野（host 强制）
+
+| 场景 | 旧行为 | 新行为（本修订） |
+|------|--------|------------------|
+| 注册表来源（source-registry.json、pinned sha256）扫描命中 | 整包拒收（`scanRejected`，零落盘） | **命中不拒收**：首次无确认下载中止安装（零落盘、revision 不动），返回快照附 `confirmRequired = { id, method: 'downloadSource'\|'updateSource', ackField: 'ackScan', reason }` + 命中明细持久化；用户确认后携带 `ackScan: true` 重试 → 正常入册，命中明细持久化进 sources.json（`scanFindings` ≤100 条 + `scanAckAt` 时间戳 + `.source-manifest.json` 亦记 `scanFindings`），行 status 置 `ok` |
+| tar 成员 / 本地文件 symlink | 归档含 symlink 成员 → 整包拒收；本地内层 symlink 静默跳过 | **一律跳过并记录**：`collectSkippedSymlinks`（lstat，绝不跟随），rel 路径随来源持久化为 `skippedSymlinks`（≤100 条，manifest 亦记），不拒整包、不进入安装/扫描/merged 流水线。本地来源 **symlink 根目录仍拒收**（M2b 语义不变：根被跳过=无可安装内容，且属独立注入防护面） |
+| 自定义/本地路径来源扫描命中 | 整包拒收 | **维持硬拒不变**（`security scan rejected …` → `scanRejected`），不提供 ackScan 放行路径 |
+
+sha256 验签失败（archive pin / pack / MANIFEST 逐文件）维持硬拒不变；M1 来源 id 白名单与路径前缀断言不变。
+
+### Remote 契约变更（供前端对齐）
+
+1. `downloadSource(id, channel<'github'\|'cdn'>, expectedRevision, ackScan?)` 与 `updateSource(...同型)`：**新增第 4 位置参数 `ackScan`（boolean，可省略，与 `ackRisks` 同型）**。旧 client 传 3 参 → host 得 `ackScan=undefined` → 走确认分支，向后兼容。
+2. 快照新增**可选行字段** `scanFindings: [{file,line,kind,name}] | null` 与 `skippedSymlinks: string[] | null`（null = 从未安装/未产生）。确认分支的 pending 快照另附**顶层** `scanFindings`（client `sourcesSnapshotSchema` 已声明可选顶层字段，作为确认弹窗的命中明细兜底；`confirmRequired` 内嵌字段会被严格 codec 剥离，故不放内层）。client 侧 `sourceEntrySchema` 为 vObject 严格 codec，旧 client 对未声明字段**剥离不报错**；前端对齐时在 `sourceEntrySchema` 追加这两个可选字段即可渲染命中/跳过明细。
+3. 确认分支**不新增 status 枚举值**（client `SOURCE_STATUSES` 为固定枚举，新增值会导致校验失败）：pending 状态复用 `scanRejected` + `statusDetail`（`security scan: N finding(s) — awaiting ackScan confirmation …`）；确认入册后置 `ok`。前端如需区分文案，可在 `scanFindings != null && status === 'scanRejected'` 时显示「待确认」。
+4. `confirmRequired` 标记复用既有 `ackMarkerSchema = { id, method, ackField, reason }`（reason ≤256）；`method` 取值 `downloadSource` / `updateSource`，`ackField` 恒为 `'ackScan'`。前端对齐：download/update 的返回快照若带 `confirmRequired`，弹确认框（明示命中明细与风险）后以第 4 参 `true` 重试；descriptor 需为 `downloadSource`/`updateSource` 追加 `jsonParameter("ackScan", "boolean", vBoolean())`。
+5. `setSourceEnabled` 的 M3 ackRisks 门不受影响（注册表来源带 `scanFindings` 启停无需再次确认）。
+
+### 验收记录（/tmp 沙箱，真拉上游）
+
+- agency-agents @ad9264e（274 文件）真拉：无 ack → `confirmRequired`（7 条命中）+ 零落盘 + revision 不动；`ackScan:true` 重试 → 入册 fileCount=274、`scanFindings` 7 条可查（sources.json 与快照行均可见）。
+- wshobson-agents @4236bb9 真拉（上游含 symlink `CLAUDE.md → AGENTS.md`）：不再拒收，正常入册（202 文件），`skippedSymlinks = ["CLAUDE.md"]` 持久化；symlink 未跟随、未落盘。
+- 自定义含凭据本地来源：仍整包拒收（`scanRejected`），零落盘。
+- 既有 39+48 冒烟回归（symlink 断言按裁决更新后）+ M1/M2 PoC（M1 全拒、本地 symlink 根拒收、sha256 失配拒收）全过；归档 symlink 成员整包拒收用例按裁决改为「跳过+记录」断言。
+- 无 git commit/push；在途改动未触碰。

@@ -1,0 +1,36 @@
+dsh-expert-orchestrator
+Copyright (c) mario841859784 and contributors
+
+This plugin ships 11 bundled-core expert prompts written for this project
+(skills/expert-orchestration/experts/, MIT, same as this repository).
+
+Third-party expert sources are distributed through the source-registry
+mechanism (skills/expert-orchestration/source-registry.json +
+expert-sources/<source-id>/). The following upstream collections are
+downloaded verbatim (zero rename, zero content edit) and remain the property
+of their authors; each is licensed MIT:
+
+  awesome-claude-code-subagents
+    Copyright (c) VoltAgent
+    https://github.com/VoltAgent/awesome-claude-code-subagents
+    License: https://github.com/VoltAgent/awesome-claude-code-subagents/blob/main/LICENSE (MIT)
+
+  wshobson-agents
+    Copyright (c) wshobson
+    https://github.com/wshobson/agents
+    License: https://github.com/wshobson/agents/blob/main/LICENSE (MIT)
+
+  agency-agents
+    Copyright (c) msitarzewski
+    https://github.com/msitarzewski/agency-agents
+    License: https://github.com/msitarzewski/agency-agents/blob/main/LICENSE (MIT)
+
+  agency-agents-zh
+    Copyright (c) jnMetaCode
+    https://github.com/jnMetaCode/agency-agents-zh
+    License: https://github.com/jnMetaCode/agency-agents-zh/blob/main/LICENSE (MIT)
+
+The classic offline pack (scripts/build-classic-pack.mjs, release tag
+source-packs-v1) redistributes 67 upstream-original files from
+awesome-claude-code-subagents (62), wshobson/agents (4) and
+agency-agents-zh (1) under the above MIT notices, verbatim.

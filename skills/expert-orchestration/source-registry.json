@@ -1,0 +1,86 @@
+{
+  "$comment": "expert-orchestrator 来源注册表 · 随包出厂（T2）。下载通道：GitHub 直连 archive 优先 → ghproxy 类镜像兜底（前缀可经 env DSH_GH_MIRROR_PREFIXES 覆盖，逗号分隔）→ release pack 兜底（离线）。所有通道产物统一 sha256 验签，不匹配拒收。ref 为 pinned commit，保证验签哈希长期有效。",
+  "version": 1,
+  "defaults": {
+    "mirrorPrefixes": ["https://ghproxy.net/", "https://gh-proxy.com/"],
+    "mirrorTemplate": "{prefix}https://github.com/{repo}/archive/{ref}.tar.gz",
+    "directTemplate": "https://codeload.github.com/{repo}/tar.gz/{ref}",
+    "securityScan": "on-install"
+  },
+  "sources": [
+    {
+      "id": "awesome-claude-code-subagents",
+      "title": "Awesome Claude Code Subagents",
+      "upstream": {
+        "repo": "VoltAgent/awesome-claude-code-subagents",
+        "url": "https://github.com/VoltAgent/awesome-claude-code-subagents",
+        "ref": "ca7a50b7648682c3a9e33dbf0a12c5a4c770cb89",
+        "refType": "commit"
+      },
+      "license": "MIT",
+      "version": "ca7a50b",
+      "sha256": "13bf5a78158dfe683d1e0b6b5feb0da97a28ae115758807f2efd8bcf2906e2e1",
+      "sha256Scope": "archive@ref",
+      "fileCount": 171,
+      "include": ["categories/**/*.md"],
+      "exclude": []
+    },
+    {
+      "id": "wshobson-agents",
+      "title": "wshobson/agents Subagent Collection",
+      "upstream": {
+        "repo": "wshobson/agents",
+        "url": "https://github.com/wshobson/agents",
+        "ref": "4236bb91f8395b0435f1d8b8baf9e8e4c69a8620",
+        "refType": "commit"
+      },
+      "license": "MIT",
+      "version": "4236bb9",
+      "sha256": "254ffad3e004ec1c08399d9dbacd1ec6b40e92668440552c2540bf39773a5140",
+      "sha256Scope": "archive@ref",
+      "fileCount": 202,
+      "include": ["plugins/*/agents/*.md"],
+      "exclude": []
+    },
+    {
+      "id": "agency-agents",
+      "title": "Agency Agents",
+      "upstream": {
+        "repo": "msitarzewski/agency-agents",
+        "url": "https://github.com/msitarzewski/agency-agents",
+        "ref": "ad9264e309bd5e5422c04784372d7841b1e5d604",
+        "refType": "commit"
+      },
+      "license": "MIT",
+      "version": "ad9264e",
+      "sha256": "c6cae326424a5cf5151a022eb02a4baf35d9f4a9b088eea74f58e63defafd627",
+      "sha256Scope": "archive@ref",
+      "fileCount": 274,
+      "include": ["*/*.md"],
+      "exclude": [".github/**", "README.md", "CONTRIBUTING*.md", "SECURITY.md"]
+    },
+    {
+      "id": "agency-agents-zh",
+      "title": "Agency Agents（中文版）",
+      "upstream": {
+        "repo": "jnMetaCode/agency-agents-zh",
+        "url": "https://github.com/jnMetaCode/agency-agents-zh",
+        "ref": "da1542f56c95db75d0da18485eccad722a5f4fde",
+        "refType": "commit"
+      },
+      "license": "MIT",
+      "version": "da1542f",
+      "sha256": "72453d57724b047e851705c591e486a862e06f5c0717ade98ef341508ea35104",
+      "sha256Scope": "archive@ref",
+      "fileCount": 273,
+      "include": ["*/*.md"],
+      "exclude": [".github/**", "README*.md", "CONTRIBUTING*.md", "SECURITY.md"]
+    }
+  ],
+  "pack": {
+    "$comment": "离线兜底通道：release 附件整包（含 67 个 classic 锚定文件 + 全部来源元数据）。安装 pack 通道时按 MANIFEST.json 逐文件 sha256 验签。",
+    "tag": "source-packs-v1",
+    "url": "https://github.com/mario841859784/dsh-expert-orchestrator/releases/download/source-packs-v1/source-packs-v1.tgz",
+    "sha256": "1865d469d415095102aa696094cf63ef57b25611cf12bd438b195be014a0e778"
+  }
+}

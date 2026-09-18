@@ -19,7 +19,7 @@
 |------|------|
 | 收到任务 | 每轮**强制重新分诊**（三级：大型 / 小型实施 / 只读），杜绝"上一轮在做就直接续"的漂移 |
 | 大型任务 | **先召唤 PM 专家**（高级项目经理 / 项目推进专员）产出结构化计划，再逐项委派 |
-| 实施改动 | **一律委派专家执行**（Agency 花名册 321 人优先，无匹配时回退自带专家库）；协调官只做只读验证 |
+| 实施改动 | **一律委派专家执行**（Agency 花名册优先，无匹配时回退自带专家库）；协调官只做只读验证 |
 | 并行协作 | 专家产出走**文件消息总线**落盘，协调官只读摘要不转述全文 |
 | 交付前 | **独立评审专家**（评审者 ≠ 实现者，回炉 ≤2 轮）+ **PM 检查点**，双门禁放行 |
 | 任务收尾 | 提炼 ≤3 条教训写入**经验池**，下次同类任务自动注入 |
@@ -50,7 +50,7 @@
 
 ## 📦 安装
 
-> 前置：Node.js 22+ 的 DSH 环境；`python3`（任务板与消息总线）；可选安装 [dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents)（Agency 花名册，不装则自动走自带专家库）。
+> 前置：Node.js 22+ 的 DSH 环境；`python3`（任务板与消息总线）；可选安装 [dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents)（Agency 花名册，不装则自动走自带专家库）。内置 `trim-cli` 技能的 scripts wrapper 与 bin 二进制不在本包内（files 白名单不含），需按 trim-cli skill 文档另行获取。
 
 ### 方式 A：DSH 插件管理器（推荐）
 
@@ -73,6 +73,22 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 - **从不删除**目标目录里的任何文件（你加的技能、自定义专家都安全）；
 - 协议文件（persona/技能/工具脚本）按版本标记刷新，本地手工修改在重启后保留，插件升级时才更新；
 - `lessons.md` 与 `experts/*.md` 属于运行时用户数据——**只增不覆盖**。
+
+### 本地源码自部署（可选）
+
+插件管理器安装（`dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator`）会经 bundle patch 自动挂载部署器，无需任何手工 composition 条目。
+
+仅当想从本地源码 checkout 加载插件时，才往宿主层 patch（与 dsh-onebot 同款机制）：在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 中插入以下片段：
+
+```yaml
+- insert:
+    - id: expert-orchestrator-deploy
+      name: '/绝对路径/dsh-expert-orchestrator/lib/index.js'
+```
+
+升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`，共 10 项）；USER_DATA（`experts/`、`lessons.md`）只缺才补。宿主层本地挂载不受该覆盖影响。
+
+存量迁移提示：若此前在 `agent.cordis.yml` 中手工加过 `expert-orchestrator-deploy` 条目，升级前应先迁移到宿主层 `cordis.patch.yml`，否则 VERSION 变更刷新会用出厂版覆盖该条目、静默断掉本地链路。
 
 ## 🚀 使用
 

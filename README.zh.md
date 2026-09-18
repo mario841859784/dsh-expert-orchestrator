@@ -76,6 +76,8 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 
 安装后出厂只含 **11 个 bundled core 专家**（`skills/expert-orchestration/experts/`）。四个上游专家来源包**不随包分发**——在插件设置页的**「专家来源」**面板下载并启用：host 侧经 GitHub 直连或 CDN 镜像双通道拉取，解包前先做 sha256（pinned archive 哈希）验签。安装时安全扫描（凭据泄漏 + 指令注入模式）按来源分两档执行：**注册表来源**（pinned sha256）扫描命中 → 发出警告，由用户确认后放行，不自动拒收；**注册表外自定义/本地路径来源**扫描命中 → 硬拒；符号链接一律跳过并记录，不因此拒包。
 
+专家管理支持专家粒度：已安装来源中的任一专家可单独停用（文件保留，可随时恢复）；并可在设置页创建/编辑/软删除最多 **200 位自定义专家**——custom 来源 rank 仅次于 bundled-core，作为去重代表时优先于来源包重名者；内置与来源包专家为只读引用（修改需复制为自定义副本）；自定义 prompt 为用户自写，不经第三方来源扫描，受长度限额约束。
+
 ### 本地源码自部署（可选）
 
 插件管理器安装（`dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator`）会经 bundle patch 自动挂载部署器，无需任何手工 composition 条目。

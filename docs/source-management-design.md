@@ -319,3 +319,45 @@ sha256 验签失败（archive pin / pack / MANIFEST 逐文件）维持硬拒不�
 - 专项套件 `/tmp/eso-dedup-test/test-dedup.mjs`：**52/52 全过**，覆盖 ①同源重名/跨源同名/中英对照分组与代表（含 rank、preferLang、choice 覆盖、stale choice 忽略、传递合并 mixed）②choice 覆盖与 clear（乐观锁拒绝、未知 key 拒绝、非成员拒绝、no-op 不 bump）③shadowed 不删盘（merged 与 source 目录文件均存在、翻转后标注正确）④快照含 `dedupGroups`/`recommended`/`recommendedNote` 且 Remote 层可消费（结构断言）⑤旧 roster 不崩溃 + 升级路径自愈。
 - 既有冒烟回归重跑：`/tmp/eso-smoke/smoke-rest.mjs` **51/51**、`smoke-a.mjs` **45/45** 全过（日志 run-t4-rest.log / run-a-dyn2.log，smoke-a 修正版重跑于 2026-09-18 21:27 CST）。注：①两脚本断言 `apply().migration` 返回值系 7b775e0 之前的旧契约，/tmp 沙箱脚本已按现契约（迁移数经落账态代理验证）适配后重跑；②smoke-a 的 descriptor 断言已改为**动态口径**——数量与参数签名从 `lib/client.js` 导出的 `EXPERT_SOURCES_DESCRIPTORS` 与 `lib/remote.js` 服务原型提取比对，不硬编码 7/9（T4 去重新增 `setDedupChoice`/`clearDedupChoice` 后实测 9==9 对齐）；旧 44/44 记录系 T4 前静态断言（硬编码 7）口径、已不可复现，由本条取代；仓库内无测试文件改动。
 - 无 git commit/push；未触碰 `lib/client.js` 及任何非授权文件。
+
+## v2.2 专家管理（自定义专家 CRUD + per-expert 启停）
+
+### custom-experts.json（用户数据）
+
+路径 `expert-sources/custom-experts.json`，结构 `{customExperts: [...]}`，属用户数据——apply() 只刷新 PROTOCOL 与 copy-if-missing USER_DATA，永不触碰（`expert-sources/` 目录天然不在两清单内，已核实无删除路径）。
+
+记录契约（Agency expert-contract 语义，零依赖手写校验替代 zod）：
+
+| 字段 | 约束 |
+|---|---|
+| slug | `/^custom-[0-9a-f]{8}$/`（防路径穿越；缺省创建时自动生成） |
+| name | 1–40 字符；不得含 `@`、控制字符（`\u0000-\u001f\u007f`）；trim 后入库 |
+| description | 1–160 字符 |
+| prompt | 1–20000 字符（用户自写内容=自有可信文本，**不做第三方安全扫描**，与 Agency 一致） |
+| division | 可选，`/^[a-z][a-z0-9-]{0,63}$/` |
+| emoji | 可选，单图形 Emoji（Intl.Segmenter grapheme==1 + Extended_Pictographic） |
+| enabled | boolean，默认 true（per-expert 启停走 saveCustom 的 enabled 参数） |
+| deleted / wasEnabled / createdAt / updatedAt | 软删除与审计 |
+
+校验规则：活跃（非 deleted）总数 ≤200；`normalizeName`（NFKC+lowercase+去空白/标点）在「活跃自定义专家」内重名即拒绝；**custom 与来源包/core 专家同名不拒绝**——交由去重引擎成组（rank 5 的 custom 版与来源版并存，用户可 setDedupChoice 指定代表），与验收「custom 并入合并视图+与来源包重名去重」一致；错误消息双语 key 化（invalid/duplicate/limit/readonly/conflict/missing，Error.key 供 client 分支）。
+
+### 合并视图与去重集成
+
+- custom 作为伪来源 `id="custom"`（rank=5，介于 bundled-core=0/legacy=1 与 registry=2+i 之间）物化为 `merged/custom/<slug>.md`：frontmatter `name`/`description` 经 `JSON.stringify` 引号化（PR #5382 YAML 教训——裸标量含 `: ` 会炸解析）+ prompt 正文；
+- 停用（enabled=false）的 custom：落盘但 roster 标 `disabled: true`，不参与去重仲裁；
+- custom 成员进入 dedupEntries → 可与来源包专家成组，`setDedupChoice` 可指定 custom 版为代表；
+- `mergedStateHash` 输入追加：`JSON.stringify(expertEnabled)` + custom-experts.json 文件哈希（状态变化即触发重建）。
+
+### per-expert 启停（CatalogSnapshot 粒度）
+
+- 存储：sources.json 新增 `expertEnabled: {"<sourceId>/<相对路径>": false}`——**缺省=启用，只存显式停用项**；自定义专家走记录内 `enabled` 字段（同一语义两条写入路径）；
+- 合并视图：显式停用项 roster 行标 `disabled: true`（文件保留在 merged/ 与来源目录，类比 shadowed 不删盘），**排除出 dedupEntries**（停用者不得成为代表）；
+- `setExpertEnabled(ref, enabled, rev)`：ref={sourceId,file}；`custom` 来源拒绝（readonly，走 saveCustom）；bundled-core 允许专家级停用（用户显式裁决优先于「core 保底」的来源级语义）；no-op（状态已一致）不 bump revision。
+
+### SourcesSnapshot 契约扩展（全部向后兼容，宽松可选字段）
+
+- `sources[].files[]`（新增，读自 roster.json；roster 缺失/格式不符时该字段缺省）：`{file, slug?(custom), name, title, enabled, shadowed, disabled, custom}`；
+- `sources[]` 末尾追加伪来源条目 `id="custom"`（`custom: true`）；
+- 顶层 `customExperts[]` 摘要：`{slug, name, description, division, emoji, promptLength, enabled}`；损坏时 `customExpertsError`（降级为空数组，不炸快照）；
+- Remote 方法 9 → **13**：`saveCustom(input, enabled, rev)` / `deleteCustom(slug, rev)` / `getCustom(slug)`（读，无 rev）/ `setExpertEnabled(ref, enabled, rev)`——全部复用 expectedRevision 乐观锁 + withSourcesLock 互斥。
+- 收口追加 **14**：`getExpertContent(ref{sourceId,file}) → {content}`——只读 persona 正文访问器（「从来源专家复制为自定义」预填），无 expectedRevision；`custom` 伪来源拒绝（自有内容走 getCustom）；file 解析前缀断言（同 setExpertEnabled seatbelt，穿越/绝对路径/缺失一律 missing 拒绝）。

@@ -31,6 +31,8 @@ or manually copy `agent.cordis.yml`, `preset.yml` and `skills/` into `~/.dsh/.ag
 
 After install, only the **11 bundled core experts** ship in `skills/expert-orchestration/experts/`. The four upstream expert source packs are **not** bundled — download and enable them from the plugin's settings page (**Expert sources**): the host runtime fetches via the GitHub direct or CDN mirror channels and verifies sha256 (pinned archive hashes) before unpacking anything. Install-time security scans (credential-leak + prompt-injection patterns) are tiered by origin: for **registry sources** (sha256-pinned), a scan hit raises a warning and proceeds only after explicit user confirmation — never auto-rejection; **custom/local-path sources** outside the registry are hard-rejected on a hit; symlinks are always skipped and logged, never a rejection on their own.
 
+Expert management is per-expert: any single expert inside an installed source can be disabled individually (files stay, re-enable anytime), and the settings page lets you create/edit/soft-delete up to **200 custom experts** — custom experts rank just below bundled-core and take precedence over source-pack duplicates when chosen as the dedup representative; built-in and source-pack experts are read-only references (copy to a custom expert to modify); custom prompts are user-written, skip third-party source scanning, and are subject to length limits.
+
 The deployer never deletes anything in the target directory, refreshes protocol files only on version bumps, and treats `lessons.md` and `expert-sources/` (downloaded source packs + merged roster view) as user data (add-only).
 
 ### Local source self-deploy (optional)

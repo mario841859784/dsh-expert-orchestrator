@@ -8,7 +8,7 @@
   fail:  running -> failed；retry: failed -> ready；recover: 所有 running -> ready
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
 检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
-指标：metrics 按 owner 聚合 任务数/累计返工/换人次数（新字段 rework/switched，旧板无此字段兼容）；done 支持 --rework N / --switched 记录返工与换人，供项目收口时反哺专家路由表。
+指标：metrics 按 owner 聚合 任务数/累计返工/换人次数（新字段 rework/switched，旧板无此字段兼容）；done 支持 --rework N / --switched 记录返工与换人，--by 记录实际执行者（新字段 executors，旧板无此字段兼容），供项目收口时反哺专家路由表。
 """
 import argparse, collections, datetime, glob, json, os, sys, time
 
@@ -117,6 +117,9 @@ def cmd_show(a, data, _):
     switched = t.get('switched') or False
     if rework or switched:
         print(f"  返工 {rework} 次" + ('，已换人' if switched else ''))
+    exs = t.get('executors') or []
+    if exs:
+        print('  实际执行者: ' + ', '.join(f"{e['name']}[{e['time']}]" for e in exs))
     ok, why = deps_state(t, data['tasks'])
     if t['dep'] and not ok:
         print(f"  依赖未满足（{why}）")
@@ -146,10 +149,17 @@ def cmd_done(a, data, path):
         t['rework'] = a.rework
     if a.switched:
         t['switched'] = True
+    if a.by and a.by != t['owner']:
+        ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('executors', []).append({'name': a.by, 'time': ts})
     t['updated'] = now_ms()
     promoted = refresh(data)
     save(path, data)
     show(t)
+    if a.by and a.by != t['owner']:
+        print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
+    elif not a.by and t['owner'] in ('', '编排者'):
+        print('提醒：owner 为空或编排者时建议用 --by <执行专家名> 记录实际执行者（多专家/门禁条目）')
     if promoted:
         print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
 
@@ -315,7 +325,7 @@ def main():
     p.set_defaults(fn=cmd_list)
     p = sub.add_parser('show'); p.add_argument('id'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('claim'); p.add_argument('id'); p.add_argument('owner', nargs='?'); p.set_defaults(fn=cmd_claim)
-    p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.set_defaults(fn=cmd_done)
+    p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); p.set_defaults(fn=cmd_done)
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser('progress'); p.add_argument('id'); p.add_argument('note'); p.set_defaults(fn=cmd_progress)

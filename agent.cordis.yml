@@ -1,6 +1,7 @@
 # The `expert-orchestrator` agent preset: decomposes tasks and delegates each
-# subtask to the best-matching expert subagent (Agency roster first, bundled
-# expert-prompt library as fallback), then integrates and verifies the results.
+# subtask to the merged expert roster (bundled core + enabled sources; optional
+# Agency roster if the dsh-agency-agents plugin is installed), then integrates
+# and verifies the results.
 #
 # This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
 # standing scope; every session naming it joins by scope parentage, so the

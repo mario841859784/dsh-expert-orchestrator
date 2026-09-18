@@ -2,7 +2,7 @@
 
 # DSH Expert Orchestrator（专家编排模式）
 
-**PM 先行规划 · Agency 专家优先委派 · 门禁交付 · 经验沉淀**
+**PM 先行规划 · 合并花名册优先委派 · 门禁交付 · 经验沉淀**
 
 一个 DeepSeek Harness（DSH）**agent preset 插件**：安装后 DSH 即获得一个「首席编排者」会话模式——
 不亲自写码，而是分诊任务、请项目管理专家规划、把实施委派给最合适的领域专家，并以门禁保证交付质量。
@@ -19,7 +19,7 @@
 |------|------|
 | 收到任务 | 每轮**强制重新分诊**（三级：大型 / 小型实施 / 只读），杜绝"上一轮在做就直接续"的漂移 |
 | 大型任务 | **先召唤 PM 专家**（高级项目经理 / 项目推进专员）产出结构化计划，再逐项委派 |
-| 实施改动 | **一律委派专家执行**（Agency 花名册优先，无匹配时回退自带专家库）；协调官只做只读验证 |
+| 实施改动 | **一律委派专家执行**（合并花名册优先：bundled-core + 已启用来源；无匹配时回退自带专家库；dsh-agency-agents 为可选共存项而非依赖）；协调官只做只读验证 |
 | 并行协作 | 专家产出走**文件消息总线**落盘，协调官只读摘要不转述全文 |
 | 交付前 | **独立评审专家**（评审者 ≠ 实现者，回炉 ≤2 轮）+ **PM 检查点**，双门禁放行 |
 | 任务收尾 | 提炼 ≤3 条教训写入**经验池**，下次同类任务自动注入 |
@@ -50,7 +50,7 @@
 
 ## 📦 安装
 
-> 前置：Node.js 22+ 的 DSH 环境；`python3`（任务板与消息总线）；可选安装 [dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents)（Agency 花名册，不装则自动走自带专家库）。内置 `trim-cli` 技能的 scripts wrapper 与 bin 二进制不在本包内（files 白名单不含），需按 trim-cli skill 文档另行获取。
+> 前置：Node.js 22+ 的 DSH 环境；`python3`（任务板与消息总线）；可选安装 [dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents)（Agency 花名册——**本插件已解耦对它的依赖**：不装时协议完整可用、自动走自带专家库兜底；装了其花名册也只视为额外来源）。内置 `trim-cli` 技能的 scripts wrapper 与 bin 二进制不在本包内（files 白名单不含），需按 trim-cli skill 文档另行获取。
 
 ### 方式 A：DSH 插件管理器（推荐）
 
@@ -113,9 +113,11 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 
 前两者是 classic 包（离线兜底 release，锚定历史上 67 个适配过的专家副本）的内容源；后两者以独立来源包形式提供。下载走 GitHub 直连或 CDN 镜像双通道并做 sha256 验签与分档安装时安全扫描（分档规则见上文部署策略一节）；装好的来源专家在合并花名册中以「来源名 / 原名」组织，跨源重名专家并存并显式标注来源。以上上游项目均为 MIT 许可证，专家正文版权归各自作者所有，本仓库的分发遵循 MIT 并在此声明致谢。
 
+**推荐配置（中文用户）**：来源集建议启用 **awesome-claude-code-subagents + agency-agents-zh**——加上 11 个 bundled core 专家即可覆盖路由表常见条目，且含中文原生专家文本；其余来源按需再加（来源未启用时协议自动降级到 bundled-core，不报错不中断）。**解耦声明**：本插件**不再依赖 dsh-agency-agents**——专家选择以合并花名册（bundled-core + 已启用来源）为主供给；未安装 dsh-agency-agents 时协议完整可用，已安装时其花名册仅视为额外来源、本协议不依赖。
+
 ## 🛠️ 自定义
 
-- **专家提示词库**：`skills/expert-orchestration/experts/*.md`，直接增删改，格式照现有文件（头部「适用任务」供分诊匹配）；Agency 花名册无匹配领域时自动回退到这里。
+- **专家提示词库**：`skills/expert-orchestration/experts/*.md`，直接增删改，格式照现有文件（头部「适用任务」供分诊匹配）；合并花名册无匹配领域时自动回退到这里。
 - **经验池**：全局 `skills/expert-orchestration/lessons.md` + 各工作区 `.expert-lessons.md`。
 - **编排协议**：`agent.cordis.yml`（persona 铁律与循环）+ `skills/expert-orchestration/SKILL.md`（完整协议）。
 
@@ -126,7 +128,7 @@ cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
 ## 🤝 致谢
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — 核心框架
-- [MichengAI/dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents) — Agency 专家花名册（本 preset 的专家来源）
+- [MichengAI/dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents) — Agency 专家花名册（可选共存来源，本插件不依赖）
 - [Asher-2000/dsh-expert-mode](https://github.com/Asher-2000/dsh-expert-mode) — 五锚自检 / 经验池 / 独立评审 / 任务板 / 消息总线五个机制的灵感来源
 - [VoltAgent/awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents) · [wshobson/agents](https://github.com/wshobson/agents) · [msitarzewski/agency-agents](https://github.com/msitarzewski/agency-agents) · [jnMetaCode/agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) — 专家库引用来源（MIT）
 

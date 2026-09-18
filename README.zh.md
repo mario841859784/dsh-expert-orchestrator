@@ -47,6 +47,7 @@
 | 💬 **消息总线 bus.py** | 信箱式落盘消息：`send/read/ack/broadcast/stats`，并行专家零转述协作，省协调官上下文 |
 | 🛡️ **交付门禁** | 独立评审（同意/部分同意/反对+理由，回炉上限 2 轮）→ PM 检查点，commit 前强制 |
 | 💾 **经验池** | 全局 `lessons.md` + 项目级 `.expert-lessons.md` 双层沉淀，委派任务书自动注入相关教训 |
+| 🧙 **原生专家工具** | `list_experts`（浏览合并花名册，紧凑/展开双模式）、`summon_expert`（白纸精召：persona 经 sanitizePersona 注入，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝，task 8000 码点上限）、`summon_experts`（批量 ≤8、并发 4、部分成功语义）。递归防护：spawn 子代理带六项 toolFilter deny（不可再召唤专家、不可嵌套 subagent/fork、不可 workflow），工具 schema default 3 纵深兜底——单层委派，无失控专家树 |
 
 ## 📦 安装
 

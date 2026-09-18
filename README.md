@@ -20,6 +20,7 @@ A DeepSeek Harness (DSH) **agent preset plugin**: once installed, DSH gets an "E
 - **Taskboard + message bus** — two zero-dependency Python tools: a dependency-DAG task scheduler and a mailbox bus so parallel experts hand off full output on disk while replying with short summaries.
 - **Delivery gate** — independent reviewer (≠ implementer, ≤2 rework rounds) then a PM checkpoint before any commit/delivery.
 - **Experience pool** — ≤3 reusable lessons captured per task and injected into future task briefs.
+- **Native expert tools** — `list_experts` (browse the merged roster, compact/expanded modes), `summon_expert` (single white-paper summon: persona injected via sanitizePersona, resolution exact → aliases → unambiguous title, shadowed/disabled rejected, 8K-char task cap), and `summon_experts` (batch ≤8, concurrency 4, partial-success semantics). Recursion protection: spawned sub-agents get a six-entry `toolFilter` deny list (no expert-tool re-summoning, no `subagent`/`subagent_fork` nesting, no `workflow`) with the tool schema default depth 3 as a backstop — one level of delegation, no runaway expert trees.
 
 ## Install
 

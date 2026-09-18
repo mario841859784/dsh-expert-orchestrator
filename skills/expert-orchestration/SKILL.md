@@ -26,7 +26,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 - **大型任务**（满足其一：跨 ≥2 个领域；≥3 个产出物；目标模糊需拆解；多项目并行）→ 第 2 节 PM 规划 → 建任务板 → 第 3 节逐项委派。
 - **小型实施**（≤3 个文件的聚焦修改，无新领域）→ 免 PM，直接第 3 节委派 1 名执行专家，你验收。改版本声明、改文档、小修复都属此类——**委派，而不是自己改**。
 - **只读操作**（问答、检索、读代码、跑测试核对）→ 可亲自做，无需委派。
-- **成本分级 L/H 标注**（实施类任务分诊时标注）：L = ≤3 个文件的低风险机械改动 → 走自带库 `experts/` 短 persona 的 `subagent` 委派（persona 约 20 行，省去合并花名册全量浏览与长 persona 注入）；H = 跨域/模糊/高风险 → 走合并花名册专家或 PM。约束如实声明：`summon_expert`（Agency 可选工具）与 `subagent` 工具均不支持指定模型，L 级省的是 persona/上下文 token；指定模型仅 `workflow` 工具大批量场景可用。判定顺序：先按大/小/只读分诊，实施类再标 L/H；任务同时命中「小型实施」与 L 时，以自带库短 persona 的 L 级路径为准，路由去向以 L/H 为准，免于双规则打架。
+- **成本分级 L/H 标注**（实施类任务分诊时标注）：L = ≤3 个文件的低风险机械改动 → 走自带库 `experts/` 短 persona 的 `subagent` 委派（persona 约 20 行，省去合并花名册全量浏览与长 persona 注入）；H = 跨域/模糊/高风险 → 走合并花名册专家或 PM。约束如实声明：`summon_expert`（本插件自有工具）与 `subagent` 工具均不支持指定模型，L 级省的是 persona/上下文 token；指定模型仅 `workflow` 工具大批量场景可用。判定顺序：先按大/小/只读分诊，实施类再标 L/H；任务同时命中「小型实施」与 L 时，以自带库短 persona 的 L 级路径为准，路由去向以 L/H 为准，免于双规则打架。
 
 ## 2. PM 规划召唤
 
@@ -40,14 +40,14 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 ## 3. 执行编排
 
-- 逐个子任务召唤执行专家，选人按三级定向查找，**主供给是合并花名册（含 bundled-core 与已启用来源，§6）**：① 先查本技能目录下的 `routing.md`（相对路径基于技能目录），按任务类型取首选/备选专家；② 再按专家 frontmatter（适用任务/禁入任务/典型交付）过滤确认匹配——该过滤适用于自带库/bundled-core 专家（其 frontmatter 字段由本协议约定）；合并花名册（§6）中的外部来源专家为上游原样文件，入册时只登记来源名/文件路径/sha256（`expert-sources/merged/roster.json`，**无 frontmatter 索引**），不适用 frontmatter 字段过滤——定位以『来源名 + 原名』（`merged/<来源ID>/<上游相对路径>`）为准，适用性需读取文件本身判断，跨源重名专家在花名册中显式标注来源、互不覆盖（去重语义见 §6）；已显式停用（disabled）的单个专家不进入候选（§6 per-expert 启停）。③ 兜底才全量浏览合并花名册——已安装 Agency 时可用 `list_experts`（可按 division 过滤），其结果同样覆盖 bundled-core 与已启用外部来源（来源标注见合并花名册），未安装 Agency 时直接读 `expert-sources/merged/roster.json`。**Agency（dsh-agency-agents 的 `summon_expert`/`summon_experts`/`list_experts`）是可选增强而非依赖：未安装 dsh-agency-agents 时本协议完整可用**——召唤一律改用 `subagent` 工具（§6 自带库路径，逐个调用可并行）；已安装时其花名册视为额外来源，可并入候选但不构成本协议依赖。routing.md 与本协议冲突时以 SKILL.md 为准。**召唤前必须核对专家名为花名册真实存在名（已装 Agency 用 `list_experts` 核对，未装时读 `expert-sources/merged/roster.json` 核对）——花名册名与自带库 experts/*.md 的 title 是两套命名（如 后端架构师≠后端工程师、安全工程师≠安全审计专家），用错即召唤失败；召唤失败改派或实际执行者与 owner 不符时，任务板 owner 必须立即同步为实际执行者名。**
-- **委派通道分工**（解耦后定案）：实施型专家 = 白纸 `subagent` **阻塞式批量**（任务书带 persona 指针行 + 自包含规格；一条消息多个 `run_in_background:false` 调用即并行+屏障，等整批回报后同轮汇总，复刻 Agency 整批汇报语义）；连续性角色（联调/续作/检查点汇报）= `subagent_fork`；长任务/需用户中途转向 = fork 后台 + 任务板跟踪；`summon_expert(s)`/`list_experts` 仅在 dsh-agency-agents 插件已安装且工具可用时使用，通道异常（召唤失败/发射失效）时回退 `subagent`/`subagent_fork`（机构教训：工具快照陈旧时召唤发射会失效，勿反复重试）。
+- 逐个子任务召唤执行专家，选人按三级定向查找，**主供给是合并花名册（含 bundled-core 与已启用来源，§6）**：① 先查本技能目录下的 `routing.md`（相对路径基于技能目录），按任务类型取首选/备选专家；② 再按专家 frontmatter（适用任务/禁入任务/典型交付）过滤确认匹配——该过滤适用于自带库/bundled-core 专家（其 frontmatter 字段由本协议约定）；合并花名册（§6）中的外部来源专家为上游原样文件，入册时只登记来源名/文件路径/sha256（`expert-sources/merged/roster.json`，**无 frontmatter 索引**），不适用 frontmatter 字段过滤——定位以『来源名 + 原名』（`merged/<来源ID>/<上游相对路径>`）为准，适用性需读取文件本身判断，跨源重名专家在花名册中显式标注来源、互不覆盖（去重语义见 §6）；已显式停用（disabled）的单个专家不进入候选（§6 per-expert 启停）。③ 兜底才全量浏览合并花名册——用自有 `list_experts`（紧凑/展开双模式，可按 division 过滤），其结果覆盖 bundled-core 与已启用外部来源（来源标注见合并花名册），工具加载失败降级时直接读 `expert-sources/merged/roster.json`。**`summon_expert`/`summon_experts`/`list_experts` 是本插件自有工具，随插件常驻、不依赖 dsh-agency-agents**（该插件已卸载或另装均不影响本协议）；dsh-agency-agents 若另装，其花名册仅视为额外来源。工具加载失败（注册降级为不注册）时回退 `subagent`（§6 自带库路径）。routing.md 与本协议冲突时以 SKILL.md 为准。**召唤前必须核对专家名为花名册真实存在名（用自有 `list_experts` 或读 `expert-sources/merged/roster.json` 核对）——花名册名与自带库 experts/*.md 的 title 是两套命名（如 后端架构师≠后端工程师、安全工程师≠安全审计专家），用错即召唤失败；召唤失败改派或实际执行者与 owner 不符时，任务板 owner 必须立即同步为实际执行者名。**
+- **委派通道分工**（v2.3.0 定稿，自有召唤工具回归为主通道）：`list_experts` 浏览合并花名册（紧凑/展开双模式）→ `summon_expert` 白纸召唤（persona 由工具注入——sanitizePersona 剥 frontmatter/控制字符/100K 上限；单一专家精召，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝；task 8000 码点上限）→ `summon_experts` 批量（≤8、并发 4，部分成功语义）；`subagent`/`subagent_fork` 降级为补充通道（联调/续作/长任务后台）。**递归防护**：spawn 出的子代理经 toolFilter deny 六项（list_experts/summon_expert/summon_experts/subagent/subagent_fork/workflow），活跃 subagent/subagent_fork 行同 deny——子代理不能再召唤专家；maxDepth 已移除，工具 schema default 3 纵深兜底。**历史经验保留**：summon 通道异常（召唤失败/发射失效/工具加载失败降级）时回退 `subagent`/`subagent_fork`（机构教训：工具快照陈旧时召唤发射会失效，勿反复重试）。
 - 花名册无匹配领域时，转第 6 节使用自带专家提示词库，用 `subagent` 工具委派。
 - **召唤方式与缓存**（上游隐式前缀缓存：请求开头逐字节相同才命中，前部任何变化都会截断公共前缀）：
   - 需要父会话上下文的反复角色（PM 规划、检查点汇报、进度汇报）→ 优先 `subagent_fork`：继承父会话历史=KV 前缀复用，天然带全局上下文；fork 产出同样受 ≤10 行摘要约束。fork 的提示词按 §5 模板全文组装（含 `<专家提示词全文>`）；fork 时 §2「专家看不到对话」前提不适用，§2 默认召唤方式不变。
   - 评审专家 → 保留 spawn：评审者≠实现者的独立性优先于缓存收益，fork 会让评审者继承编排者的上下文框定（含实现者的结果汇报）。
-  - 无状态一次性实施专家 → 仍按合并花名册优先 spawn（已装 Agency 时可用 `summon_expert`，未装时用 `subagent`）。
-  - 同质大批量召唤（≥4 个且专家提示词文件 ≥150 行）→ 分批串行提交：批量召唤（已装 Agency 用 `summon_experts`，未装用多个 `subagent` 并行）每批 ≤4、批间等待完成，第二批起可命中首批写入的共享前缀（单次 8 个在并发 4 下已天然分两波）；异质/小批量仍并行（延迟优先）。以上仅给建议，默认行为不变。
+  - 无状态一次性实施专家 → 用自有 `summon_expert` 白纸召唤（persona 由工具注入）；工具不可用时回退 `subagent`。
+  - 同质大批量召唤（≥4 个且专家提示词文件 ≥150 行）→ 分批串行提交：批量召唤用自有 `summon_experts`（≤8、并发 4、部分成功语义；工具不可用时回退多个 `subagent` 并行）每批 ≤4、批间等待完成，第二批起可命中首批写入的共享前缀（单次 8 个在并发 4 下已天然分两波）；异质/小批量仍并行（延迟优先）。以上仅给建议，默认行为不变。
 - 委派时把 PM 对该子任务的验收标准写进任务书；认领对应任务板条目（`claim`），完成后 `done` 推进依赖链。
 - **执行者记录**：done 时编排者核对实际执行者与 owner 一致；多专家共担一个条目时，各自 progress 留痕，编排者把实际执行者写入 summary（或拆条目）——任务板必须能回答『这条实际是谁做的』。
 - **并行专家走消息总线**（第 9 节 bus.py）：任务书里要求专家把完整产出 `send` 到 coordinator 信箱并在工作区落盘产物文件，最终回复只给 ≤10 行摘要；你用 `read --box coordinator` 取全文整合。专家间接力：A `send` 给 B 的信箱，B 的任务书只让它 `read`，你不过手转述。
@@ -65,7 +65,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 ### 3.1 断点恢复（专家中途报错退出的续跑）
 
-- **检查点落盘（仅长任务/多阶段委派强制；小型实施免，避免总线噪音）**：委派多阶段任务时，任务书按 §5 模板写明「检查点」要求——专家每完成一个阶段即执行 `python3 <技能目录>/tools/taskboard.py progress <任务ID> "已完成…；产物:路径；agent_id:<若有的话>"` 落盘检查点，并按「产出落盘」`bus.py send` 同步 coordinator 信箱。平台事实：subagent 委派的子代理是持久会话，报错退出后仍在注册表（idle/ready 状态），任务书带上 durable agent id 时可用 `send_message` 唤醒原会话从最近一步续跑；`summon_expert`（已装 Agency 时）调用不暴露 agent id，失败后只能靠检查点组装续跑任务书重派。
+- **检查点落盘（仅长任务/多阶段委派强制；小型实施免，避免总线噪音）**：委派多阶段任务时，任务书按 §5 模板写明「检查点」要求——专家每完成一个阶段即执行 `python3 <技能目录>/tools/taskboard.py progress <任务ID> "已完成…；产物:路径；agent_id:<若有的话>"` 落盘检查点，并按「产出落盘」`bus.py send` 同步 coordinator 信箱。平台事实：subagent 委派的子代理是持久会话，报错退出后仍在注册表（idle/ready 状态），任务书带上 durable agent id 时可用 `send_message` 唤醒原会话从最近一步续跑；`summon_expert` 调用不暴露 agent id，失败后只能靠检查点组装续跑任务书重派。
 - **专家报错退出的处理顺序（禁止无检查点直接从头重跑）**：
   1. 先 `bus.py read --box coordinator` 找该任务最后一条检查点汇报，同时 `taskboard.py show <任务ID>` 读板上的最新检查点；
   2. 有 durable agent id 的 subagent 委派 → 优先 `send_message` 唤醒原会话续跑（上下文仍在原会话，成本最低）；
@@ -98,7 +98,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     红线：工作树可能有其他会话未提交改动——禁止 git checkout -- / git restore / 清理非本任务改动，发现即报告
     产出落盘：<并行协作时>完成后执行 python3 <技能目录>/tools/bus.py send --from <你的专家名> --to coordinator --subject "<一句话>" --body "<完整产出或摘要+文件路径>"；你的最终回复只保留 ≤10 行摘要
     署名：所有 bus 落款（--from）与任务板 claim/done 必须与委派给你的专家名逐字一致（含空格与全半角），不得使用变体、简称或英文 id
-    persona：先 read <persona路径>（由 roster-aliases.json 按你的委派名解析），以其工作方式与交付要求为准；无命中时按本任务书规格执行
+    persona：经 `summon_expert` 委派时 persona 已由工具注入，无需自读；经 `subagent`/fork 委派时先 read <persona路径>（roster-aliases.json 按委派名解析），以其工作方式与交付要求为准；无命中时按本任务书规格执行
     检查点：<长任务/多阶段委派必填，小任务可省>每完成一个阶段执行 python3 <技能目录>/tools/taskboard.py progress <任务ID> "已完成…；产物:路径；agent_id:<若有的话>"，并 bus send 同步 coordinator；中途报错退出也应先把最后进度 progress 落盘再退出
     目标：<要完成什么，验收标准是什么>
     上下文：<工作目录、相关文件路径、已有结论、约束>

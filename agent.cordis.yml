@@ -212,8 +212,10 @@
         toolName: subagent
         modelSelectionSettings: true
         backgroundMode: continuable
-        # 递归熔断（方案 B）：专家（depth 1）不得再派子代理，超深宿主抛 SubagentDepthError
-        maxDepth: 2
+        # 递归防护（v2.3 工具层）：spawn 出的子代理拒发召唤工具与派生工具——
+        # 替代 maxDepth 深度控制成为主防护（子代理无法再派生任何子代理）
+        toolFilter:
+          deny: [list_experts, summon_expert, summon_experts, subagent, subagent_fork, workflow]
 
     # Fork omits model selection so provider/model stay equal to the parent and
     # the inherited history remains eligible for KV Cache reuse. This preset
@@ -225,8 +227,9 @@
         provider: fork
         toolName: subagent_fork
         backgroundMode: continuable
-        # 同上：fork 通道同 cap，防递归派生
-        maxDepth: 2
+        # 递归防护同上：fork 出的子代理同样拒发召唤工具与派生工具
+        toolFilter:
+          deny: [list_experts, summon_expert, summon_experts, subagent, subagent_fork, workflow]
 
     # Production dsh does not install these optional providers. Install the
     # matching Bundle in this Profile and restart the Host, then copy this
@@ -239,7 +242,6 @@
         provider: codex
         toolName: subagent_codex
         backgroundMode: one-shot
-        maxDepth: 2
 
     - id: tool-subagent-claude-code
       name: '@deepseek-ai/dsh-tool-subagent'
@@ -248,7 +250,6 @@
         provider: claude-code
         toolName: subagent_claude_code
         backgroundMode: one-shot
-        maxDepth: 2
 
     - id: workflow-ptc
       name: '@deepseek-ai/dsh-workflow-ptc'

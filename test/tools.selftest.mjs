@@ -1,10 +1,10 @@
 // test/tools.selftest.mjs — lib/tools.js 纯函数自测（node:test，零依赖）。
 // 覆盖：sanitizePersona / loadRoster / loadAliases / resolveExpert（解析链全
-// 分支）/ rosterCandidates（花名册归一）。文件系统用例使用 os.tmpdir() 临时
+// 分支）/ rosterCandidates（花名册归一）/ P1 经验池（expertLessonSlug /
+// loadExpertLessons / withLessonHint）。文件系统用例使用 os.tmpdir() 临时
 // 目录，结束后清理，不触碰仓库内任何数据。
 //
 // ── 预留用例位置（后续工作包追加，本文件不实现对应函数）：
-//   P1 loadExpertLessons：截断 2K / 缺文件静默 / sanitize 复用；
 //   P2 splitPersona：cut 标记切分 / 无标记全文 / method 缺失回退全文。
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,11 +13,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   EXPERT_TOOLS_DENY_LIST,
+  expertLessonSlug,
   loadAliases,
+  loadExpertLessons,
   loadRoster,
   resolveExpert,
   rosterCandidates,
   sanitizePersona,
+  withLessonHint,
 } from '../lib/tools.js'
 
 const PERSONA_LIMIT = 100000 // 与 tools.js MAX_PERSONA_CHARS 一致
@@ -177,5 +180,48 @@ test('EXPERT_TOOLS_DENY_LIST: 递归防护清单冻结且含派生工具', () =>
   }
 })
 
-// ── 预留：P1 loadExpertLessons 用例（截断 2K / 缺文件静默）——P1 工作包追加。
+// ── P1 每专家经验池：slug 派生 / loadExpertLessons / withLessonHint ───────
+test('expertLessonSlug: source/file 派生稳定，跨源重名天然消歧', () => {
+  assert.equal(expertLessonSlug('bundled-core', 'backend-engineer.md'), 'bundled-core--backend-engineer')
+  // 同名专家不同来源 → slug 必然不同
+  assert.notEqual(expertLessonSlug('bundled-core', 'backend-engineer.md'), expertLessonSlug('agency-agents-zh', 'backend-engineer.md'))
+  // 路径分隔符与不安全字符归一为 '-'；.md 后缀剥除
+  assert.equal(expertLessonSlug('Weird Source', 'Sub Dir/Name.md'), 'Weird-Source--Sub-Dir-Name')
+  // 确定性：同输入同输出
+  const once = expertLessonSlug('custom', '我的专家.md')
+  assert.equal(expertLessonSlug('custom', '我的专家.md'), once)
+  // slug 对空 file 仍可用（防御）：尾随连字符被归一
+  assert.equal(expertLessonSlug('custom', ''), 'custom')
+})
+
+test('loadExpertLessons: 正常加载（sanitize 复用剥 frontmatter）/ 缺文件静默 / 2K 截断', () => {
+  const lessonsDir = join(dir, 'expert-lessons')
+  mkdirSync(lessonsDir, { recursive: true })
+  writeFileSync(join(lessonsDir, 'bundled-core--backend-engineer.md'), '---\ntitle: x\n---\n要点一\n要点二')
+  const ok = loadExpertLessons(dir, 'bundled-core--backend-engineer')
+  assert.equal(ok, '要点一\n要点二') // frontmatter 已剥
+  // 缺文件 → 静默 null（不抛出）
+  assert.equal(loadExpertLessons(dir, 'custom--不存在'), null)
+  assert.equal(loadExpertLessons(dir.replace(/.$/, ''), 'x'), null) // dst 目录不存在也静默
+  // 2000 字符截断
+  writeFileSync(join(lessonsDir, 'long.md'), 'y'.repeat(2000) + 'OVERFLOW')
+  const long = loadExpertLessons(dir, 'long')
+  assert.equal(long.length, 2000)
+  assert.ok(!long.includes('OVERFLOW'))
+  // 空 slug 防御 → null
+  assert.equal(loadExpertLessons(dir, ''), null)
+})
+
+test('withLessonHint: 尾部注入固定格式 / 无命中行为零变化', () => {
+  assert.equal(withLessonHint('任务书', '后端工程师', null), '任务书')
+  assert.equal(withLessonHint('任务书', '后端工程师', ''), '任务书')
+  assert.equal(
+    withLessonHint('任务书', '后端工程师', '要点'),
+    '任务书\n\n【经验提示｜来自 后端工程师 历次任务沉淀】\n要点',
+  )
+  // 固定前缀不被破坏：注入只发生在尾部
+  const out = withLessonHint('任务书', 'X', '提示')
+  assert.ok(out.startsWith('任务书'))
+})
+
 // ── 预留：P2 splitPersona 用例（cut 标记 / 无标记 / method 缺失回退）——P2 工作包追加。

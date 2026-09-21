@@ -23,6 +23,7 @@
   "files": [
     "lib",
     "skills",
+    "expert-lessons",
     "agent.cordis.yml",
     "preset.yml",
     "cordis.patch.yml",

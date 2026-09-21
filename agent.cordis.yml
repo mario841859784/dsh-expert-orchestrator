@@ -212,10 +212,13 @@
         toolName: subagent
         modelSelectionSettings: true
         backgroundMode: continuable
-        # 递归防护（v2.3 工具层）：spawn 出的子代理拒发召唤工具与派生工具——
-        # 替代 maxDepth 深度控制成为主防护（子代理无法再派生任何子代理）
+        # 递归防护（2026-09-19 修复）：deny 拒发召唤工具与派生工具。注意 subagent
+        # 自身名不在宿主全局层，deny 引用未知名会被 tools.restrict() 硬拒（spawn
+        # 全断根因二），故移出 deny，改由 maxDepth:1 硬熔断兜底——子代理深度 1，
+        # 再派生即 SubagentDepthError（spawn/fork in-process provider 均支持 depthLimit）。
+        maxDepth: 1
         toolFilter:
-          deny: [list_experts, summon_expert, summon_experts, subagent, subagent_fork, workflow]
+          deny: [list_experts, summon_expert, summon_experts, subagent_fork, workflow]
 
     # Fork omits model selection so provider/model stay equal to the parent and
     # the inherited history remains eligible for KV Cache reuse. This preset
@@ -227,9 +230,10 @@
         provider: fork
         toolName: subagent_fork
         backgroundMode: continuable
-        # 递归防护同上：fork 出的子代理同样拒发召唤工具与派生工具
+        # 递归防护同上（2026-09-19 修复）：maxDepth:1 硬熔断 + deny 拒发召唤/派生工具
+        maxDepth: 1
         toolFilter:
-          deny: [list_experts, summon_expert, summon_experts, subagent, subagent_fork, workflow]
+          deny: [list_experts, summon_expert, summon_experts, subagent_fork, workflow]
 
     # Production dsh does not install these optional providers. Install the
     # matching Bundle in this Profile and restart the Host, then copy this

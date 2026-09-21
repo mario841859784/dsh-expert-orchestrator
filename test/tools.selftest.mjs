@@ -17,6 +17,7 @@ import {
   loadAliases,
   loadExpertLessons,
   loadRoster,
+  neutralizePromptTemplates,
   registerExpertTools,
   resolveExpert,
   rosterCandidates,
@@ -58,6 +59,39 @@ test('sanitizePersona: 超过 100K 码点截断到上限', () => {
   // 恰好不超不截
   const exact = 'y'.repeat(PERSONA_LIMIT)
   assert.equal(sanitizePersona(exact), exact)
+})
+
+// ── 模板括号中和（P3）：防宿主 interpolate 把 persona 内 {{name}} 当变量 ──
+test('neutralizePromptTemplates: CI 模板片段双花括号全部中和', () => {
+  // 典型现场形态：${{ github.sha }}（名字含点，宿主 VARIABLE_NAME 必拒）；
+  // 括号内空格保留，仅双花括号本身被替换
+  assert.equal(neutralizePromptTemplates('echo ${{ github.sha }}'), 'echo $« github.sha »')
+  assert.equal(neutralizePromptTemplates('echo ${{github.sha}}'), 'echo $«github.sha»')
+  assert.equal(neutralizePromptTemplates('{{a}} {{ b.c }} {{{d}}}'), '«a» « b.c » «{d»}') // 单花括号不动
+  // 孤立 {{（无闭合）同样被中和——宿主对含 }} 者直接 throw
+  assert.equal(neutralizePromptTemplates('孤立 {{ 开头'), '孤立 « 开头')
+  assert.equal(neutralizePromptTemplates('只有 }}'), '只有 »')
+  // 普通单花括号原样；无花括号原样；确定性
+  assert.equal(neutralizePromptTemplates('普通 {a} 与 JSON { "k": 1 }'), '普通 {a} 与 JSON { "k": 1 }')
+  assert.equal(neutralizePromptTemplates('无括号文本'), '无括号文本')
+  assert.equal(neutralizePromptTemplates('{{x}}'), neutralizePromptTemplates('{{' + 'x}}'))
+  // 非字符串透传（不参与 sanitize 归零语义，由 sanitizePersona 统一处理）
+  assert.equal(neutralizePromptTemplates(undefined), undefined)
+})
+
+test('sanitizePersona: 模板括号中和接入全管线（零 {{ }} 残留）', () => {
+  const persona = '---\ntitle: x\n---\nCI 步骤：echo ${{ github.sha }} 与 {{ a.b }}\n单括号 {a} 保留'
+  const out = sanitizePersona(persona)
+  assert.ok(!out.includes('{{'))
+  assert.ok(!out.includes('}}'))
+  assert.ok(out.includes('$« github.sha »'))
+  assert.ok(out.includes('« a.b »'))
+  assert.ok(out.includes('{a}')) // 单花括号不受影响
+  // 孤立 {{（无闭合）也被中和；frontmatter 之外的正文处理正常
+  assert.equal(sanitizePersona('孤立 {{ 片段'), '孤立 « 片段')
+  // 畸形 {{ a.b }}（名字含点）中和后宿主解析器不可能命中
+  const malformed = sanitizePersona('模板 {{ a.b }} 示例')
+  assert.ok(!malformed.includes('{{') && !malformed.includes('}}'))
 })
 
 // ── loadRoster / loadAliases：文件系统语义 ──────────────────────────────

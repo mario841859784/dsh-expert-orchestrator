@@ -1,11 +1,9 @@
 // test/tools.selftest.mjs — lib/tools.js 纯函数自测（node:test，零依赖）。
 // 覆盖：sanitizePersona / loadRoster / loadAliases / resolveExpert（解析链全
 // 分支）/ rosterCandidates（花名册归一）/ P1 经验池（expertLessonSlug /
-// loadExpertLessons / withLessonHint）。文件系统用例使用 os.tmpdir() 临时
-// 目录，结束后清理，不触碰仓库内任何数据。
-//
-// ── 预留用例位置（后续工作包追加，本文件不实现对应函数）：
-//   P2 splitPersona：cut 标记切分 / 无标记全文 / method 缺失回退全文。
+// loadExpertLessons / withLessonHint）/ P2 方法论分层（extractPersonaMethod /
+// splitPersona）。文件系统用例使用 os.tmpdir() 临时目录，结束后清理，不触碰
+// 仓库内任何数据。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
@@ -14,12 +12,14 @@ import { join } from 'node:path'
 import {
   EXPERT_TOOLS_DENY_LIST,
   expertLessonSlug,
+  extractPersonaMethod,
   loadAliases,
   loadExpertLessons,
   loadRoster,
   resolveExpert,
   rosterCandidates,
   sanitizePersona,
+  splitPersona,
   withLessonHint,
 } from '../lib/tools.js'
 
@@ -224,4 +224,55 @@ test('withLessonHint: 尾部注入固定格式 / 无命中行为零变化', () =
   assert.ok(out.startsWith('任务书'))
 })
 
-// ── 预留：P2 splitPersona 用例（cut 标记 / 无标记 / method 缺失回退）——P2 工作包追加。
+// ── P2 persona 方法论分层：extractPersonaMethod / splitPersona ───────────
+test('extractPersonaMethod: frontmatter method 键提取 / 缺失返 null', () => {
+  const raw = '---\ntitle: 后端工程师\nmethod: expert-methods/backend-engineer.md\n---\nBODY'
+  assert.equal(extractPersonaMethod(raw), 'expert-methods/backend-engineer.md')
+  // 无 frontmatter → null（来源包专家典型形态）
+  assert.equal(extractPersonaMethod('# 标题\nBODY'), null)
+  // 有 frontmatter 无 method → null
+  assert.equal(extractPersonaMethod('---\ntitle: x\n---\nBODY'), null)
+  assert.equal(extractPersonaMethod(undefined), null)
+  assert.equal(extractPersonaMethod(''), null)
+  // CRLF 变体
+  assert.equal(extractPersonaMethod('---\r\nmethod: m.md\r\n---\r\nBODY'), 'm.md')
+})
+
+test('splitPersona: 有标记+method → 瘦 persona + abs 指针行；method 文件缺失回退全文', () => {
+  const methodsDir = join(dir, 'expert-methods')
+  mkdirSync(methodsDir, { recursive: true })
+  writeFileSync(join(methodsDir, 'backend-engineer.md'), '# 领域方法论\n- 清单 A')
+  const body = '核心规则\n<!-- methods-cut -->\n深读区清单（不应注入）'
+  const out = splitPersona(dir, body, 'expert-methods/backend-engineer.md')
+  assert.ok(out.startsWith('核心规则'))
+  assert.ok(!out.includes('深读区清单'))
+  // 指针行含 dst 注入构造的绝对路径
+  assert.ok(out.includes(join(dir, 'expert-methods', 'backend-engineer.md')))
+  assert.ok(out.endsWith('任务复杂或触及清单场景时先 read 再动手'))
+  // method 文件缺失 → fail-safe 回退全文
+  const fallback = splitPersona(dir, body, 'expert-methods/missing.md')
+  assert.equal(fallback, body)
+})
+
+test('splitPersona: 无标记 / 无 method / 可疑路径 → 原文（向后兼容）', () => {
+  const body = '核心规则\n<!-- methods-cut -->\n深读区'
+  // 无 cut 标记（即使 method 文件存在）
+  assert.equal(splitPersona(dir, '普通 persona 全文', 'expert-methods/backend-engineer.md'), '普通 persona 全文')
+  // 无 method 键（来源包专家零变化）
+  assert.equal(splitPersona(dir, body, null), body)
+  assert.equal(splitPersona(dir, body, ''), body)
+  // 可疑路径防御：绝对路径 / 越过 dst / 非 expert-methods/ 前缀（评审加固：
+  // 防上游 persona 携带 method 键把 dst 内任意文件路径指给子代理）
+  assert.equal(splitPersona(dir, body, '/etc/passwd'), body)
+  assert.equal(splitPersona(dir, body, '../escape.md'), body)
+  assert.equal(splitPersona(dir, body, 'skills/expert-orchestration/lessons.md'), body)
+  assert.equal(splitPersona(dir, body, 'expert-lessons/long.md'), body)
+})
+
+test('P2 回归锁：来源包风格 persona 经完整管线（sanitize→split）行为零变化', () => {
+  const raw = '---\ntitle: Upstream Expert\n---\n正文 A\n\n正文 B'
+  const method = extractPersonaMethod(raw)
+  assert.equal(method, null) // 无 method 键
+  const sanitized = sanitizePersona(raw)
+  assert.equal(splitPersona(dir, sanitized, method), sanitized) // 全文注入，逐字相等
+})

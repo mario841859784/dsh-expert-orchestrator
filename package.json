@@ -9,6 +9,12 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "test": "node --test \"test/**/*.mjs\""
+  },
+  "engines": {
+    "node": ">=21"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",

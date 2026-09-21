@@ -48,6 +48,7 @@
 | 🛡️ **交付门禁** | 独立评审（同意/部分同意/反对+理由，回炉上限 2 轮）→ PM 检查点，commit 前强制 |
 | 💾 **经验池** | 全局 `lessons.md` + 项目级 `.expert-lessons.md` 双层沉淀，委派任务书自动注入相关教训 |
 | 🧙 **原生专家工具** | `list_experts`（浏览合并花名册，紧凑/展开双模式）、`summon_expert`（白纸精召：persona 经 sanitizePersona 注入，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝，task 8000 码点上限）、`summon_experts`（批量 ≤8、并发 4、部分成功语义）。递归防护：spawn 子代理带六项 toolFilter deny（不可再召唤专家、不可嵌套 subagent/fork、不可 workflow），工具 schema default 3 纵深兜底——单层委派，无失控专家树 |
+| 📚 **每专家经验池 + persona 方法论分层**（v2.4.0） | summon 自动尾部注入 `expert-lessons/<slug>.md` 该专家历史教训（≤2000 字符，按字符截断，2K 上限，无命中零变化）；persona frontmatter `method:` + `<!-- methods-cut -->` 瘦身注入+按需深读指针（Top-5 bundled-core 已分层，fail-safe 全量回退，合入经预注册 A/B 实验门禁，档案见 `docs/internal/experiments/`）；`list_experts` 显式标注跨源 conflict/shadowed，自定义专家删除支持清理。已知限制：设置面板「清空已删除」按钮 UI 待接线（RPC 契约已就位） |
 
 ## 📦 安装
 

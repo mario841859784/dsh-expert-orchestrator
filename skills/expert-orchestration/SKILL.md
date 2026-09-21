@@ -42,6 +42,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 - 逐个子任务召唤执行专家，选人按三级定向查找，**主供给是合并花名册（含 bundled-core 与已启用来源，§6）**：① 先查本技能目录下的 `routing.md`（相对路径基于技能目录），按任务类型取首选/备选专家；② 再按专家 frontmatter（适用任务/禁入任务/典型交付）过滤确认匹配——该过滤适用于自带库/bundled-core 专家（其 frontmatter 字段由本协议约定）；合并花名册（§6）中的外部来源专家为上游原样文件，入册时只登记来源名/文件路径/sha256（`expert-sources/merged/roster.json`，**无 frontmatter 索引**），不适用 frontmatter 字段过滤——定位以『来源名 + 原名』（`merged/<来源ID>/<上游相对路径>`）为准，适用性需读取文件本身判断，跨源重名专家在花名册中显式标注来源、互不覆盖（去重语义见 §6）；已显式停用（disabled）的单个专家不进入候选（§6 per-expert 启停）。③ 兜底才全量浏览合并花名册——用自有 `list_experts`（紧凑/展开双模式，可按 division 过滤），其结果覆盖 bundled-core 与已启用外部来源（来源标注见合并花名册），工具加载失败降级时直接读 `expert-sources/merged/roster.json`。**`summon_expert`/`summon_experts`/`list_experts` 是本插件自有工具，随插件常驻、不依赖 dsh-agency-agents**（该插件已卸载或另装均不影响本协议）；dsh-agency-agents 若另装，其花名册仅视为额外来源。工具加载失败（注册降级为不注册）时回退 `subagent`（§6 自带库路径）。routing.md 与本协议冲突时以 SKILL.md 为准。**召唤前必须核对专家名为花名册真实存在名（用自有 `list_experts` 或读 `expert-sources/merged/roster.json` 核对）——花名册名与自带库 experts/*.md 的 title 是两套命名（如 后端架构师≠后端工程师、安全工程师≠安全审计专家），用错即召唤失败；召唤失败改派或实际执行者与 owner 不符时，任务板 owner 必须立即同步为实际执行者名。**
 - **委派通道分工**（v2.3.0 定稿，自有召唤工具回归为主通道）：`list_experts` 浏览合并花名册（紧凑/展开双模式）→ `summon_expert` 白纸召唤（persona 由工具注入——sanitizePersona 剥 frontmatter/控制字符/100K 上限；单一专家精召，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝；task 8000 码点上限）→ `summon_experts` 批量（≤8、并发 4，部分成功语义）；`subagent`/`subagent_fork` 降级为补充通道（联调/续作/长任务后台）。**递归防护**：spawn 出的子代理经 toolFilter deny 六项（list_experts/summon_expert/summon_experts/subagent/subagent_fork/workflow），活跃 subagent/subagent_fork 行同 deny——子代理不能再召唤专家；maxDepth 已移除，工具 schema default 3 纵深兜底。**历史经验保留**：summon 通道异常（召唤失败/发射失效/工具加载失败降级）时回退 `subagent`/`subagent_fork`（机构教训：工具快照陈旧时召唤发射会失效，勿反复重试）。
+- **每专家经验池自动注入**（v2.4.0）：summon 时若存在 `<部署副本>/expert-lessons/<slug>.md`（slug 由候选的来源+文件派生，跨源重名天然消歧），任务文本**尾部**自动追加『【经验提示｜来自 <专家名> 历次任务沉淀】』块（≤2000 字符，按字符截断，2K 上限；无命中=行为零变化）——编排者免手工转述专家领域教训；全局池 grep 照旧管跨专家教训；教训入库仍由编排者收尾裁剪，工具侧只读不写。
 - 花名册无匹配领域时，转第 6 节使用自带专家提示词库，用 `subagent` 工具委派。
 - **召唤方式与缓存**（上游隐式前缀缓存：请求开头逐字节相同才命中，前部任何变化都会截断公共前缀）：
   - 需要父会话上下文的反复角色（PM 规划、检查点汇报、进度汇报）→ 优先 `subagent_fork`：继承父会话历史=KV 前缀复用，天然带全局上下文；fork 产出同样受 ≤10 行摘要约束。fork 的提示词按 §5 模板全文组装（含 `<专家提示词全文>`）；fork 时 §2「专家看不到对话」前提不适用，§2 默认召唤方式不变。
@@ -120,6 +121,8 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 - **外部来源专家的精确选择**：以『来源名 + 原名』定位（如「agency-agents-zh / 后端工程师.md」）；同名专家跨源并存时必须带来源名消歧，禁止只报原名导致选错来源。
 - **惯用委派名映射**：惯用委派名与合并花名册 persona 的映射见本技能目录 `roster-aliases.json`（28 条，全部 grep `^name:` 实测校准：exact 9 / renamed 6 / nearest 13，unresolved 0；含 9 条替代已停用 legacy-adapted 兜底的最近项；routing.md 引用已对齐为花名册原生 name＋〔惯称 …〕括注）——委派外部来源专家时按『来源名 + path』读取 persona 全文组装任务书。
 - **跨源重名的去重语义**：跨源重名专家由 host 侧去重分组（`dedupGroups`）归组，组内专家并存、互不覆盖，花名册显式标注各自来源。编排者选人时遵循代表规则：默认使用组内**代表成员**——优先级为 ① 用户 override（`dedup.choice`，用户在设置页显式指定的代表，最高优先，编排者尊重之、不得自行改写；仅当其为组成员时生效，已失效的 override 被忽略）→ ② `preferLang` 语言偏好（用户显式设置 > 注册表缺省 > `'zh'`）——**仅对 agency 对子（`agency-agents` / `agency-agents-zh`）成员生效**：组内含该对子来源时，对子中符合偏好语言的版本优先于组内其他成员（含 bundled-core，故 zh 代表可越过 bundled-core 的 rank 0）；组内不含对子来源时本档不参与仲裁 → ③ 按来源确定性顺序取最靠前者（bundled-core=0 < legacy=1 < 注册表顺序 < 自定义来源，同序按文件路径取首个）；只有需要特定来源版本（如某来源独有的 prompt 风格或能力差异）时，才用『来源名 + 原名』显式指定非代表成员。去重只影响默认选人，不影响专家可用性——非代表成员仍可被显式点名召唤。
+- **list_experts 冲突/shadowed 显式标注**（v2.4.0）：bySource 展开模式对跨源重名组逐成员标注 conflict（跨源重名，召唤需消歧）与 shadowed（去重组非代表副本，不可召唤）——用户看得见冲突而非静默遮蔽；仅含 shadowed 的来源组以 count=0 可展开（边界语义）；conflict 随 candidates 动态计算、不落盘。
+- **persona 方法论分层**（v2.4.0）：bundled-core/custom 专家 persona frontmatter 可选键 `method: expert-methods/<slug>.md`（值=相对部署根路径，必须以 `expert-methods/` 为前缀）+ 正文 `<!-- methods-cut -->` 标记——summon 注入=标记之前的瘦 persona + 尾行『领域方法论全文在 <abs 路径>，任务复杂或触及清单场景时先 read 再动手』；fail-safe：无标记/无 method/method 文件缺失/非 expert-methods/ 前缀/路径可疑一律**全量注入**（向后兼容）；来源包专家 sha256 钉定不改，无键=全量。首批 Top-5（backend-engineer/devops-engineer/tech-writer/frontend-engineer/code-reviewer）已分层，对照实验档案见 `docs/internal/experiments/`。
 - **来源未下载或已禁用时的协议行为**：合并花名册不含该来源的专家——不报错、不中断任务，降级到 bundled-core（11 core）完成本子任务，并在最终回复中提示用户「去设置页『专家来源』下载或启用该来源」。
 - **自带 `experts/` 库仍可增删改**（bundled-core 层，格式照现有文件，头部「适用任务」供分诊匹配）；花名册为空、专家被停用或没有匹配领域时使用：
   1. 用文件工具列出 `experts/` 目录，按每个文件头部「适用任务」挑选最匹配的一位；没有匹配的就用 `generalist.md`。PM 规划/重排同理可用 `project-manager.md`。
@@ -147,9 +150,11 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 - 汇总各专家产出，交叉核对相互矛盾的结论；关键结论必须亲自验证（读 diff、跑测试、执行只读命令）。
 - 对照 PM 计划逐项核销验收标准；向用户交付：计划结构 → 各子任务负责专家与结果 → 整合结论与剩余风险；引用具体文件路径。
 - **路由回写接线**：任务板 done 时用 `--rework <次数>` / `--switched` 记录返工与换人（见第 9 节）；项目收口跑 `taskboard.py metrics` 按 owner 聚合任务数/累计返工/换人次数，发现某类任务反复返工/换人时回写 routing.md 调整该条目首选/备选（routing.md 为活文档，与本协议冲突时仍以 SKILL.md 为准）。
+- **实验纪律**（v2.4.0）：引导段/协议文本/persona 类行为改动，合入前跑对照实验——同一批任务书 × A/B 条件 × n≥3，判定标准**预注册先写后跑**，结论入 `docs/internal/experiments/`（TEMPLATE.md 七字段：假设/设置/n/判定标准/原始产出/结论/决策）；行为类断言（如 persona 到达）用「子代理逐字引用首尾行」探针协议（v2.4.0 两轮实验已实测有效）；实验门禁不达标则保留原行为（配置回退），结论照实入档不得外推。
 - **经验沉淀**：仅当出现经验池没有的新坑/新策略时，任务收尾提炼 ≤3 条可复用教训追加到经验池（重复已知教训不写）：
   - 项目级（默认）：工作区 `.expert-lessons.md`（必定可写）。
   - 全局级（本技能目录 `lessons.md`）：会话有写权限时同步追加；格式 `## YYYY-MM-DD 主题` + 要点。
+  - 专家级（v2.4.0）：专家相关新教训**同时**追加 `<部署副本>/expert-lessons/<slug>.md`（追加式，由编排者收尾裁剪执行；该专家下次 summon 自动尾部注入）。
 - **缓存观察**：提示词缓存命中率只能线上经 new-api 聚合 `usage.prompt_tokens_details.cached_tokens / prompt_tokens` 观察，本仓改动只做结构性优化、不承诺缓存率数字；部署副本 `~/.dsh/.agent-presets/expert-orchestrator/` 不自动更新，需用户重新部署 preset 后新会话才生效。thresholdChars 抬高会使 compaction-basic 的整体折叠更早触发（折叠是更大的前缀改写），观察 cached_tokens 趋势而非默认单调改善。
 - 全部子任务完成后把任务板收口（所有条目 done/failed 已处置）、todo 全部完成，不留 in_progress。
 

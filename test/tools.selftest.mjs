@@ -13,9 +13,11 @@ import {
   EXPERT_TOOLS_DENY_LIST,
   expertLessonSlug,
   extractPersonaMethod,
+  filterRestrictableTools,
   loadAliases,
   loadExpertLessons,
   loadRoster,
+  registerExpertTools,
   resolveExpert,
   rosterCandidates,
   sanitizePersona,
@@ -275,4 +277,127 @@ test('P2 回归锁：来源包风格 persona 经完整管线（sanitize→split�
   assert.equal(method, null) // 无 method 键
   const sanitized = sanitizePersona(raw)
   assert.equal(splitPersona(dir, sanitized, method), sanitized) // 全文注入，逐字相等
+})
+
+// ── T9 召唤通道缺陷回归：restrict 名单过滤 + summon_experts 输出 lossless ──
+/** 宿主同款 lossless JSON 判定（零依赖简化版，对齐 dsh-util-values walkJsonValue
+ *  规则：有限非 -0 数 / plain object / 稠密数组 / 无 undefined）。 */
+const isLosslessJson = (v, seen = new Set()) => {
+  if (v === null) return true
+  const t = typeof v
+  if (t === 'string' || t === 'boolean') return true
+  if (t === 'number') return Number.isFinite(v) && !Object.is(v, -0)
+  if (t !== 'object') return false
+  if (seen.has(v)) return false
+  seen.add(v)
+  if (Array.isArray(v)) {
+    if (Object.getOwnPropertyNames(v).length !== v.length + 1) return false // 稠密
+    return v.every((x) => isLosslessJson(x, seen))
+  }
+  const proto = Object.getPrototypeOf(v)
+  if (proto !== Object.prototype && proto !== null) return false
+  return Object.keys(v).every((k) => isLosslessJson(v[k], seen))
+}
+
+test('filterRestrictableTools: 按宿主注册表剔除未知名 / API 缺失或异常时保守', () => {
+  const registry = new Set(['list_experts', 'summon_expert', 'summon_experts', 'subagent_fork', 'workflow']) // 无 subagent（缺陷 A 现场形态）
+  const ctxA = { tools: { get: (n) => (registry.has(n) ? {} : undefined) } }
+  assert.deepEqual(filterRestrictableTools(ctxA, EXPERT_TOOLS_DENY_LIST), ['list_experts', 'summon_expert', 'summon_experts', 'subagent_fork', 'workflow'])
+  // 全部已注册 → 原样（顺序保持）
+  const ctxAll = { tools: { get: () => ({}) } }
+  assert.deepEqual(filterRestrictableTools(ctxAll, EXPERT_TOOLS_DENY_LIST), [...EXPERT_TOOLS_DENY_LIST])
+  // 探测 API 缺失 → 保守原样（退回宿主报错，不静默放宽）
+  assert.deepEqual(filterRestrictableTools({}, EXPERT_TOOLS_DENY_LIST), [...EXPERT_TOOLS_DENY_LIST])
+  // 探测异常 → 保守保留该名（防护优先）
+  const ctxThrow = { tools: { get: () => { throw new Error('boom') } } }
+  assert.deepEqual(filterRestrictableTools(ctxThrow, EXPERT_TOOLS_DENY_LIST), [...EXPERT_TOOLS_DENY_LIST])
+})
+
+test('T9 缺陷 A 回归：summon 传给宿主的 toolFilter.deny 不含未注册名', async () => {
+  const dst = mkdtempSync(join(tmpdir(), 't9-registry-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({ core: [{ source: 'bundled-core', file: 'a.md', name: '测试专家' }] }))
+    const descriptors = []
+    let captured
+    const ctx = {
+      tools: {
+        register: (d) => descriptors.push(d),
+        // 现场形态：注册表无 subagent（其余 deny 名均在）
+        get: (n) => (n === 'subagent' ? undefined : {}),
+      },
+      subagents: {
+        getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+        start: async (_provider, opts) => {
+          captured = opts
+          return { result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }
+        },
+      },
+    }
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+    assert.equal(r.answer, 'ok')
+    assert.ok(!captured.toolFilter.deny.includes('subagent')) // 缺陷 A：未注册名不得传给 restrict
+    for (const n of ['list_experts', 'summon_expert', 'summon_experts', 'subagent_fork', 'workflow']) {
+      assert.ok(captured.toolFilter.deny.includes(n), n)
+    }
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T9 缺陷 B 回归：summon_experts 失败条目无 answer 键，返回值全程 lossless', async () => {
+  const dst = mkdtempSync(join(tmpdir(), 't9-no-roster-')) // 花名册缺失 → 全部失败（缺陷 B 触发形态）
+  try {
+    const descriptors = []
+    const ctx = {
+      tools: { register: (d) => descriptors.push(d) },
+      subagents: {
+        getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+        start: async () => ({ result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }),
+      },
+    }
+    registerExpertTools(ctx, { dst })
+    const t = descriptors.find((d) => d.name === 'summon_experts')
+    const value = await t.execute({ experts: [{ expert: '甲', task: 't' }, { expert: '乙', task: 't' }] }, { agent: {} })
+    assert.equal(value.results.length, 2)
+    for (const entry of value.results) {
+      assert.equal(entry.ok, false)
+      assert.ok(typeof entry.error === 'string' && entry.error.length > 0)
+      assert.ok(!('answer' in entry)) // 缺陷 B 根因：显式 answer: undefined 使宿主快照拒绝
+    }
+    assert.ok(isLosslessJson(value)) // 宿主 snapshotJsonValue 同规则判定
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T9 缺陷 B 补充：混合成功/失败条目形状正确且 lossless', async () => {
+  const dst = mkdtempSync(join(tmpdir(), 't9-mixed-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({ core: [{ source: 'bundled-core', file: 'a.md', name: '测试专家' }] }))
+    const descriptors = []
+    const ctx = {
+      tools: { register: (d) => descriptors.push(d) },
+      subagents: {
+        getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+        start: async () => ({ result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: '子代理回答' }] }), dispose: async () => {} }),
+      },
+    }
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const t = descriptors.find((d) => d.name === 'summon_experts')
+    const value = await t.execute({ experts: [{ expert: '测试专家', task: 't' }, { expert: '不存在', task: 't' }] }, { agent: {} })
+    assert.equal(value.results.length, 2)
+    const okEntry = value.results.find((e) => e.ok === true)
+    assert.equal(okEntry.answer, '子代理回答')
+    assert.ok(!('error' in okEntry))
+    const failEntry = value.results.find((e) => e.ok === false)
+    assert.ok(!('answer' in failEntry))
+    assert.ok(typeof failEntry.error === 'string')
+    assert.ok(isLosslessJson(value))
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
 })

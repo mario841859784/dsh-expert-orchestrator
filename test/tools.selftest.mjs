@@ -24,6 +24,8 @@ import {
   splitPersona,
   withLessonHint,
 } from '../lib/tools.js'
+import { remoteCleanupCustomDeleted, remoteDeleteCustom, remoteSaveCustom } from '../lib/index.js'
+import { readFileSync } from 'node:fs'
 
 const PERSONA_LIMIT = 100000 // 与 tools.js MAX_PERSONA_CHARS 一致
 
@@ -397,6 +399,102 @@ test('T9 缺陷 B 补充：混合成功/失败条目形状正确且 lossless', a
     assert.ok(!('answer' in failEntry))
     assert.ok(typeof failEntry.error === 'string')
     assert.ok(isLosslessJson(value))
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+// ── T6 P7 专家库管理硬化：list_experts 标注 + custom 软删/清理/乐观锁 ──────
+test('T6 list_experts: bySource 展开补 conflict/shadowed 标注，compact 与 total 语义不变', async () => {
+  const dst = mkdtempSync(join(tmpdir(), 't6-list-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({
+      core: [
+        { source: 'bundled-core', file: 'a.md', name: '同名专家', title: 'T1' },
+        { source: 'bundled-core', file: 'b.md', name: '独名专家' },
+      ],
+      sources: [
+        { id: 'zh', files: [
+          { file: 'a.md', name: '同名专家' },
+          { file: 'a2.md', name: '同名专家', shadowed: true },
+        ] },
+      ],
+    }))
+    const descriptors = []
+    registerExpertTools({ tools: { register: (d) => descriptors.push(d) }, subagents: { getProvider: () => ({}), start: async () => ({}) } }, { dst })
+    const t = descriptors.find((d) => d.name === 'list_experts')
+    // compact 形态：无 experts/shadowed 字段，total 只计可召唤候选（shadowed 剔除）
+    const compact = await t.execute({})
+    assert.equal(compact.total, 3)
+    assert.ok(compact.sources.every((g) => !('shadowed' in g)))
+    // bySource：跨源重名 conflict 标注 + shadowed 副本可见
+    const zh = await t.execute({ bySource: 'zh' })
+    const zhGroup = zh.sources.find((g) => g.source === 'zh')
+    assert.equal(zhGroup.experts.length, 1)
+    assert.equal(zhGroup.experts[0].conflict, true)
+    assert.deepEqual(zhGroup.shadowed, [{ name: '同名专家', title: null, file: 'a2.md' }])
+    // bySource：无重名者不打 conflict；无遮蔽者无 shadowed 字段
+    const core = await t.execute({ bySource: 'bundled-core' })
+    const coreGroup = core.sources.find((g) => g.source === 'bundled-core')
+    const dup = coreGroup.experts.find((e) => e.name === '同名专家')
+    const solo = coreGroup.experts.find((e) => e.name === '独名专家')
+    assert.equal(dup.conflict, true)
+    assert.ok(!('conflict' in solo))
+    assert.ok(!('shadowed' in coreGroup))
+    // 未知名来源仍报错
+    await assert.rejects(() => t.execute({ bySource: '不存在' }), /来源不存在或未启用/)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T6 P7 契约锁：deleteCustom 软删+wasEnabled、deleted slug 不可复活、同名可重建', async () => {
+  const dst = mkdtempSync(join(tmpdir(), 't6-softdel-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'sources.json'), JSON.stringify({ version: 1, revision: 0, mirrorPrefixes: null, dedup: { preferLang: null, choice: {} }, sources: [], mergedStateHash: '' }))
+    writeFileSync(join(dst, 'expert-sources', 'custom-experts.json'), JSON.stringify({ customExperts: [{ slug: 'custom-00000001', name: '误删专家', description: 'd', prompt: 'P', enabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }] }))
+    // 软删：deleted 软标 + wasEnabled 记忆（既有契约，回归锁）
+    await remoteDeleteCustom(dst, 'custom-00000001', 0)
+    const db = JSON.parse(readFileSync(join(dst, 'expert-sources', 'custom-experts.json'), 'utf-8'))
+    assert.equal(db.customExperts.length, 1)
+    assert.equal(db.customExperts[0].deleted, true)
+    assert.equal(db.customExperts[0].wasEnabled, true)
+    assert.equal(db.customExperts[0].enabled, false)
+    // deleted slug 不可复活（saveCustom 走 missing 拒绝，Error.key 契约）
+    await assert.rejects(
+      () => remoteSaveCustom(dst, { slug: 'custom-00000001', name: '误删专家', description: 'd', prompt: 'P' }, true, 1),
+      (e) => e.key === 'missing',
+    )
+    // 恢复语义=重建：同名新 slug 可建（duplicate 查重跳过 deleted 记录）
+    await remoteSaveCustom(dst, { slug: 'custom-00000002', name: '误删专家', description: 'd', prompt: 'P' }, true, 1)
+    const db2 = JSON.parse(readFileSync(join(dst, 'expert-sources', 'custom-experts.json'), 'utf-8'))
+    assert.equal(db2.customExperts.length, 2)
+    assert.equal(db2.customExperts.find((r) => r.slug === 'custom-00000002').deleted, undefined)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T6 cleanupCustomDeleted: 清空软删记录 bump revision / 无实变不 bump / 乐观锁拒绝过期', async () => {
+  const dst = mkdtempSync(join(tmpdir(), 't6-cleanup-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'sources.json'), JSON.stringify({ version: 1, revision: 3, mirrorPrefixes: null, dedup: { preferLang: null, choice: {} }, sources: [], mergedStateHash: '' }))
+    writeFileSync(join(dst, 'expert-sources', 'custom-experts.json'), JSON.stringify({ customExperts: [
+      { slug: 'live', name: '活着', description: 'd', prompt: 'P', enabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+      { slug: 'gone', name: '已删', description: 'd', prompt: 'P', enabled: false, deleted: true, wasEnabled: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    ] }))
+    const snap = await remoteCleanupCustomDeleted(dst, 3)
+    assert.equal(snap.revision, 4) // 实变 → bump
+    const db = JSON.parse(readFileSync(join(dst, 'expert-sources', 'custom-experts.json'), 'utf-8'))
+    assert.deepEqual(db.customExperts.map((r) => r.slug), ['live']) // 仅软删记录被清，活记录不动
+    // 无实变 → revision 不 bump（对齐「choice already equal」惯例）
+    const snap2 = await remoteCleanupCustomDeleted(dst, 4)
+    assert.equal(snap2.revision, 4)
+    // 乐观锁：过期 revision 拒绝
+    await assert.rejects(() => remoteCleanupCustomDeleted(dst, 3), /expert sources state changed/)
   } finally {
     rmSync(dst, { recursive: true, force: true })
   }

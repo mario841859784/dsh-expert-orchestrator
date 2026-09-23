@@ -1,7 +1,7 @@
 {
   "name": "dsh-expert-orchestrator",
   "description": "专家编排模式 agent preset — 首席编排者：每条消息先归类分诊、PM 先行规划、合并花名册优先委派、任务板依赖调度、消息总线并行落盘、分级交付门禁、经验池按需沉淀。",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -13,7 +13,8 @@
     "test": "node --test \"test/**/*.mjs\""
   },
   "engines": {
-    "node": ">=21"
+    "node": ">=21",
+    "dsh": ">=0.1.7-alpha.2 <0.2.0-0"
   },
   "license": "MIT",
   "repository": {
@@ -50,6 +51,6 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.6-alpha.1 || 0.1.6-alpha.2"
+    "@deepseek-ai/dsh-tools": ">=0.1.6-alpha.1 <0.2.0-0"
   }
 }

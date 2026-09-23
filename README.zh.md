@@ -73,6 +73,8 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 
 自 DSH **0.1.7-alpha** 起，agent preset 是**由 bundle patch 携带的声明行**：一个 `name: '@deepseek-ai/dsh-agent-preset'`、Loader 行 id 为 `preset-<id>` 的插入行，完整 Cordis 组合内联在其 `config.plugins` 里。旧版目录机制（`~/.dsh/.agent-presets/<id>/` 下放 `preset.yml` + `agent.cordis.yml`）**已无任何读取方**——只部署目录的 preset 永远不会出现在会话预设选择器中。本插件因此把组合内联进自身 bundle patch（`cordis.patch.yml` 的 `preset-expert-orchestrator` 行），正常安装插件即可，重启 DSH 后预设即可见可选。`~/.dsh/.agent-presets/expert-orchestrator/` 目录继续作为 preset 的**运行时数据根**（技能、专家、经验池、专家来源）；声明行里的 `skill-filesystem` 用与部署器相同的 `DSH_HOME || ~/.dsh` 公式解析该目录。
 
+**DSH 版本要求（v2.5.1+）：`engines.dsh >=0.1.7-alpha.2 <0.2.0-0`**——声明行机制仅在 DSH 0.1.7-alpha.2 上验证过；`@deepseek-ai/dsh-tools` peer 放宽为 `>=0.1.6-alpha.1 <0.2.0-0`，覆盖历史上支持的 0.1.6-alpha 线。
+
 ### 部署策略（与其他 preset 插件不同）
 
 - **从不删除**目标目录里的任何文件（你加的技能、自定义专家都安全）；

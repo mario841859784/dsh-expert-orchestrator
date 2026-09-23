@@ -1,7 +1,35 @@
 # dsh-expert-orchestrator plugin registration
-# The agent-plane composition (persona + expert orchestration preset) lives in
-# agent.cordis.yml; this patch registers the deployer so `dsh plugin add`
-# mounts it and the preset lands in ~/.dsh/.agent-presets/expert-orchestrator/.
+# This patch is the plugin's ONLY activation surface, and it carries TWO kinds
+# of rows:
+#
+# 1. Host-plane rows (the deployer and the expert-source Typert remote).
+# 2. The `preset-expert-orchestrator` declaration row (`@deepseek-ai/dsh-agent-preset`):
+#    since DSH 0.1.7-alpha, agent presets are declaration rows carried by bundle
+#    patches — the legacy `~/.dsh/.agent-presets/<id>/` directory is no longer
+#    read by anything. The full composition therefore lives INLINE below, kept
+#    in the `plugins` config of that row; `agent.cordis.yml` remains deployed
+#    only as a pointer document for the runtime data directory.
+#
+# Composition notes (moved here from the old agent.cordis.yml header):
+# - This is an AGENT-PLANE composition. The registry mounts it ONCE under a
+#   standing scope; every session naming it joins by scope parentage, so the
+#   tools and prompt sections registered here cover each joined agent while a
+#   session's own state stays keyed per Session/Agent inside the plugins.
+# - A service row here MUST sit inside a group carrying an `isolate` realm.
+#   Without one it publishes into the root realm, where it is process-global —
+#   another preset publishing the same name collides, and a host reader would
+#   resolve one preset's instance for every session; `dsh-agent-presets`
+#   rejects that at mount. `true` means an entry-local realm: this standing
+#   mount's own private instance, apart from every other preset's. (A shared
+#   label does NOT pool instances — `provide()` throws on the second
+#   registration under the same realm symbol; labels join REALMS, and are not
+#   what this composition needs.)
+# - `skill-filesystem`'s `customSkillDirs` resolves the deployed runtime data
+#   directory (`DSH_HOME || ~/.dsh` + `.agent-presets/expert-orchestrator/skills`)
+#   with the exact formula the deployer (`resolvePresetTargetDir`) uses, so the
+#   bundled expert-orchestration skill resolves wherever the plugin deployed.
+#   `baseUrl` is NOT usable here: under declaration-row mounts it points at the
+#   preset registry's own resolution base, not at this preset.
 - insert:
   - id: dsh-expert-orchestrator
     name: dsh-expert-orchestrator
@@ -17,3 +45,209 @@
   # `dsh-expert-orchestrator/lib/remote.js`.
   - id: expert-sources-remote
     name: ./lib/remote.js
+  # ── agent preset declaration (DSH >= 0.1.7-alpha) ─────────────────────────
+  # The Loader row id follows the `preset-<id>` convention and addresses
+  # Loader edits; `config.id` is the preset identity sessions save. Kept LAST
+  # in this insert list so the deployer row above has laid down the runtime
+  # data directory (skills/, experts/, lessons) before the registry eagerly
+  # mounts the composition on a fresh install.
+  - id: preset-expert-orchestrator
+    name: '@deepseek-ai/dsh-agent-preset'
+    config:
+      id: expert-orchestrator
+      order: 10
+      name: 专家编排模式
+      description: >-
+        PM 先行规划 + 合并花名册优先委派的编排 Agent：每条消息先归类分诊（实施请求或上下文变化才重开全流程），实施一律委派专家；任务板管理依赖与状态，消息总线并行落盘，交付门禁分级（小型实施免独立评审与 PM 检查点、commit 前检查不可豁免），按需沉淀经验池。
+      plugins:
+        - id: persona
+          name: '@deepseek-ai/dsh-persona'
+          config:
+            suffix: Your working directory is {{cwd}}.
+            prefix: |-
+              你是一名专家编排代理 (Expert Orchestrator)。你的核心职能不是亲自完成工作：实施类改动一律委派专家执行，你负责分诊、请 PM 规划、委派、检查点重排、验证与整合。
+
+              铁律：实施请求或上下文发生变化时重开循环；只读追问与继续类消息不重开全流程——有活跃计划先查当前项目板状态再续，无活跃计划按只读处理。用户对在途工作的纠正即时作废对应任务书与委派。实施细则以 expert-orchestration 技能为单一来源。
+
+              工作循环：
+              1. 分诊（每条消息先归类，按三级）：
+                 - 大型任务：跨 ≥2 个领域、或 ≥3 个产出物、或目标模糊需要拆解——先 PM 规划，再逐项委派专家。
+                 - 小型实施：不产生新计划需要的改动，如 ≤3 个文件的聚焦修改——可免 PM，但仍必须委派 1 名执行专家实施，你只做验收。
+                 - 只读操作：问答、检索、读文件、跑测试核对结论——可直接亲自做。
+              2–5（PM 规划、执行编排、交付门禁、整合沉淀）：细则见技能——小型实施免独立评审与 PM 检查点、仅编排者验收；git commit 前的检查为不可豁免硬门禁。
+              涉及实施工作或专家委派的轮次，先加载 expert-orchestration 技能并遵循其完整协议；发现技能与本文不一致时停止该步并在交付说明中上报用户，不得自行取舍。
+              共享协作铁律（对编排者与本 preset 直派的 subagent/fork 子代理成立；Agency 召唤专家由任务书承载）：
+              ① 只读核实先于断言：给出任何结论或执行任何写操作前，先用只读手段核实当前事实。
+              ② 写操作前先核对工作树状态，禁止用 git restore / git checkout 清理非本任务产生的改动。
+              ③ 发现他人未提交改动立即上报，不得覆盖或擅自恢复。
+              ④ 完整产出落盘为文件，给召唤方/协调者的回复只保留精简摘要。
+
+              当前驱动模型：{{model}}。
+
+        - id: agent-instructions
+          name: '@deepseek-ai/dsh-agent-instructions'
+          config:
+            maxBytes: 65536
+
+
+        - id: tool-bash
+          name: '@deepseek-ai/dsh-tool-bash'
+          disabled: !!js process.platform === 'win32'
+
+        - id: tool-pwsh
+          name: '@deepseek-ai/dsh-tool-pwsh'
+          disabled: !!js process.platform !== 'win32'
+
+
+        - id: tool-fs
+          name: '@deepseek-ai/dsh-tool-fs'
+
+        - id: tool-fs-search
+          name: '@deepseek-ai/dsh-tool-fs-search'
+          config:
+            sampleOverCapGlobResults: false
+
+
+        - id: tool-jobs
+          name: '@deepseek-ai/dsh-tool-jobs'
+
+
+        - id: skill-filesystem
+          name: '@deepseek-ai/dsh-skill-filesystem'
+          config:
+            customSkillDirs:
+              - !!js "process.getBuiltinModule('node:path').join(process.env.DSH_HOME || process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.dsh'), '.agent-presets', 'expert-orchestrator', 'skills')"
+
+        - id: tool-skill
+          name: '@deepseek-ai/dsh-tool-skill'
+
+
+        - id: command-goal
+          name: '@deepseek-ai/dsh-command-goal'
+
+        - id: tool-goal
+          name: '@deepseek-ai/dsh-tool-goal'
+
+
+        - id: planning
+          name: cordis:group
+          group: true
+          isolate:
+            planMode: true
+          config:
+            - id: plan-mode
+              name: '@deepseek-ai/dsh-plan-mode'
+              config:
+                section: |
+                      You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                      Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                      The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                      Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                      Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                      When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+
+        - id: compaction
+          name: cordis:group
+          group: true
+          isolate:
+            compaction: true
+            toolResultPruner: true
+          config:
+            - id: compaction-basic
+              name: '@deepseek-ai/dsh-compaction-basic'
+
+            - id: command-compact
+              name: '@deepseek-ai/dsh-command-compact'
+
+            - id: tool-result-pruner
+              name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+              config:
+                thresholdChars: 32768
+                headChars: 4096
+                tailChars: 1024
+
+
+        - id: delegation
+          name: cordis:group
+          group: true
+          isolate:
+            workflowEngine: true
+          config:
+            - id: tool-subagent-control
+              name: '@deepseek-ai/dsh-tool-subagent-control'
+
+            - id: tool-subagent-list-agents
+              name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+            - id: tool-subagent
+              name: '@deepseek-ai/dsh-tool-subagent'
+              config:
+                provider: spawn
+                toolName: subagent
+                modelSelectionSettings: true
+                backgroundMode: continuable
+                maxDepth: 1
+                toolFilter:
+                  deny: [list_experts, summon_expert, summon_experts, subagent_fork, workflow]
+
+            - id: tool-subagent-fork
+              name: '@deepseek-ai/dsh-tool-subagent'
+              config:
+                provider: fork
+                toolName: subagent_fork
+                backgroundMode: continuable
+                maxDepth: 1
+                toolFilter:
+                  deny: [list_experts, summon_expert, summon_experts, subagent_fork, workflow]
+
+            - id: tool-subagent-codex
+              name: '@deepseek-ai/dsh-tool-subagent'
+              disabled: true
+              config:
+                provider: codex
+                toolName: subagent_codex
+                backgroundMode: one-shot
+
+            - id: tool-subagent-claude-code
+              name: '@deepseek-ai/dsh-tool-subagent'
+              disabled: true
+              config:
+                provider: claude-code
+                toolName: subagent_claude_code
+                backgroundMode: one-shot
+
+            - id: workflow-ptc
+              name: '@deepseek-ai/dsh-workflow-ptc'
+              config:
+                provider: spawn
+
+            - id: tool-workflow
+              name: '@deepseek-ai/dsh-tool-workflow'
+
+            - id: tool-ralph
+              name: '@deepseek-ai/dsh-tool-ralph'
+              config:
+                subagentProvider: spawn
+                maxRounds: 64
+
+
+        - id: tool-ask-user
+          name: '@deepseek-ai/dsh-tool-ask-user'
+
+        - id: tool-todo
+          name: '@deepseek-ai/dsh-tool-todo'
+          config:
+            allowParallelInProgress: true
+
+        - id: tool-web
+          name: '@deepseek-ai/dsh-tool-web'
+          config:
+            fetch: true
+            searchTimeoutMs: 60000
+

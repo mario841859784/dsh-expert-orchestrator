@@ -64,11 +64,14 @@ dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator
 
 ```bash
 git clone https://github.com/mario841859784/dsh-expert-orchestrator.git
-mkdir -p ~/.dsh/.agent-presets/expert-orchestrator
-cp -r dsh-expert-orchestrator/{agent.cordis.yml,preset.yml,skills} \
-      ~/.dsh/.agent-presets/expert-orchestrator/
+# 作为 bundle 安装（v2.5.0+ 预设由 bundle patch 声明行挂载，目录部署不再生效）
+dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 # 重启 DSH Web，在预设选择器里选「专家编排模式」
 ```
+
+### preset 注册机制（v2.5.0+ 起）
+
+自 DSH **0.1.7-alpha** 起，agent preset 是**由 bundle patch 携带的声明行**：一个 `name: '@deepseek-ai/dsh-agent-preset'`、Loader 行 id 为 `preset-<id>` 的插入行，完整 Cordis 组合内联在其 `config.plugins` 里。旧版目录机制（`~/.dsh/.agent-presets/<id>/` 下放 `preset.yml` + `agent.cordis.yml`）**已无任何读取方**——只部署目录的 preset 永远不会出现在会话预设选择器中。本插件因此把组合内联进自身 bundle patch（`cordis.patch.yml` 的 `preset-expert-orchestrator` 行），正常安装插件即可，重启 DSH 后预设即可见可选。`~/.dsh/.agent-presets/expert-orchestrator/` 目录继续作为 preset 的**运行时数据根**（技能、专家、经验池、专家来源）；声明行里的 `skill-filesystem` 用与部署器相同的 `DSH_HOME || ~/.dsh` 公式解析该目录。
 
 ### 部署策略（与其他 preset 插件不同）
 

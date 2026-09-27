@@ -2,7 +2,7 @@
 
 # DSH Expert Orchestrator
 
-**PM-first planning · merged-roster delegation · gated delivery · experience pooling**
+**Multi-agent orchestration · PM-first planning · merged-roster expert delegation · dependency-DAG taskboard · gated delivery · experience pooling**
 
 A DeepSeek Harness (DSH) **agent preset plugin**: once installed, DSH gets an "Expert Orchestrator" session mode that never implements changes itself — it triages every request, has a project-management expert plan the work, delegates implementation to the best-fit domain experts, and gates delivery with independent review.
 

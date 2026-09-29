@@ -33,7 +33,7 @@ or manually copy the package into a bundle location and restart DSH, then pick *
 
 ### How the preset is registered (v2.5.0+)
 
-**DSH compatibility (v2.5.1+): `engines.dsh >=0.1.7-alpha.2 <0.2.0-0`** — the declaration-row preset mechanism is only verified against DSH 0.1.7-alpha.2; `@deepseek-ai/dsh-tools` peer accepts `>=0.1.6-alpha.1 <0.2.0-0` to cover the historically supported 0.1.6-alpha line.
+**DSH compatibility (v2.5.1+): `engines.dsh >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0`** — the declaration-row preset mechanism is verified against DSH 0.1.7-alpha.2 and adapted to DSH 0.2.0-rc.1; `@deepseek-ai/dsh-tools` peer accepts `>=0.1.6-alpha.1 <0.1.7-0 || >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0` to cover the historically supported 0.1.6-alpha line.
 
 Since DSH **0.1.7-alpha**, agent presets are **declaration rows carried by bundle patches** — a `preset-<id>` row named `@deepseek-ai/dsh-agent-preset` whose `config.plugins` holds the full Cordis entry list. The legacy `~/.dsh/.agent-presets/<id>/` directory (`preset.yml` + `agent.cordis.yml`) is **no longer read by anything**: a preset deployed only as that directory never appears in the preset picker. This plugin therefore declares the preset inline in its own bundle patch (`cordis.patch.yml`, row `preset-expert-orchestrator`), so a normal plugin install is sufficient — installing the bundle, restarting DSH, and the preset shows up in the session mode picker. The deployed `~/.dsh/.agent-presets/expert-orchestrator/` directory remains the preset's **runtime data root** (skills, experts, lessons, expert sources); the declaration's `skill-filesystem` row resolves it with the same `DSH_HOME || ~/.dsh` formula the deployer uses.
 

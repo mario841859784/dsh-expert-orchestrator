@@ -159,7 +159,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 **任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）：
 
     python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"
-    python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3
+    python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家      # ready -> running
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要"     # 依赖它的任务自动转 ready
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --rework 1 --switched  # --rework 记返工次数，--switched 标记中途换人
@@ -169,6 +169,15 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     python3 <技能目录>/tools/taskboard.py recover               # 会话崩溃后恢复 running -> ready
     python3 <技能目录>/tools/taskboard.py boards                # 列出当前目录全部任务板（防遗留污染）
     python3 <技能目录>/tools/taskboard.py archive --board .expert-taskboards/<项目slug>.json  # 项目收口后归档（有未收口任务需 --force）
+
+并发正确性与失败语义（所有写命令均可选 `--expected-revision <N>`；不传新参数时行为与旧版完全一致）：
+    python3 <技能目录>/tools/taskboard.py create "标题" --expected-revision 3   # CAS 乐观锁：写命令带 --expected-revision，与当前 revision 不符返回 {"error":"stale_revision",...} 并拒绝落盘；重读后携带最新 revision 重试
+  - 进程互斥：板写入经 <board>.lock 文件锁（fcntl.flock）串行化，CAS 校验-写入在锁内原子完成；无 fcntl 平台（如 Windows）降级为唯一 tmp + 原子替换（不互截板文件，强一致仅 POSIX 保证）。
+    python3 <技能目录>/tools/taskboard.py claim T3 执行专家 --attempt <attempt_id>      # 派工代际：attempt_id 由编排者生成并随任务书下发；带新 attempt_id 认领即撤销旧代际
+    python3 <技能目录>/tools/taskboard.py reassign T3 <新attempt_id> --owner 新专家     # 转派：先撤销旧 attempt（记入 attempt_revoked），旧代际的汇报随后被拒；已撤销代际不能经 reassign 复活
+    python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --attempt <attempt_id>     # 执行方汇报必须携带派工时的 attempt_id（fail closed：任务无开放代际时被拒 {"error":"no_attempt",...}）；旧/已撤销代际返回 {"error":"stale_attempt",...}（fail/progress 同）
+    python3 <技能目录>/tools/taskboard.py set_dependencies T3 --dep T1,T2               # 改依赖（整体替换）：写入前全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 并拒绝落盘
+  - 查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（对损坏板逐条标注「（损坏）」）外所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback——此时如实报告编排者，禁止当作空板重建。
 
 **消息总线 bus.py**（信箱 `<cwd>/.expert-bus/`；并行专家协作必用）：
 

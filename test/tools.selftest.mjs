@@ -6,9 +6,11 @@
 // 仓库内任何数据。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawnSync, spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import {
   EXPERT_TOOLS_DENY_LIST,
   expertLessonSlug,
@@ -532,4 +534,299 @@ test('T6 cleanupCustomDeleted: 清空软删记录 bump revision / 无实变不 b
   } finally {
     rmSync(dst, { recursive: true, force: true })
   }
+})
+
+// ── WP-1 任务板并发正确性（v2.6）：taskboard.py 子进程级用例 (a)–(e) ───────
+const TASKBOARD = fileURLToPath(new URL('../skills/expert-orchestration/tools/taskboard.py', import.meta.url))
+const BOARD_REL = join('.expert-taskboards', 'default.json') // 无遗留板时的默认板路径
+
+/** 执行 taskboard.py（cwd 隔离到临时目录）；stdout 单行 JSON 时解析为 json 字段。 */
+const runTb = (cwd, args) => {
+  const r = spawnSync('python3', [TASKBOARD, ...args], { cwd, encoding: 'utf-8' })
+  let json = null
+  try { json = JSON.parse((r.stdout ?? '').trim()) } catch { /* 非错误输出（多行人类可读）不解析 */ }
+  return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', json }
+}
+
+/** 从输出提取（最新一个）revision=N。 */
+const revOf = (out) => {
+  const ms = [...out.matchAll(/revision=(\d+)/g)]
+  assert.ok(ms.length > 0, `输出缺 revision=N：${JSON.stringify(out)}`)
+  return Number(ms[ms.length - 1][1])
+}
+
+const makeBoardDir = (t, label) => {
+  const dir = mkdtempSync(join(tmpdir(), `wp1-taskboard-${label}-`))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  return dir
+}
+
+// (a) CAS revision 乐观锁：并发双写带旧 revision 的第二个写返回具名 stale_revision 且不落盘
+test('WP-1 (a) CAS：旧 revision 的第二个写返回 stale_revision 且不落盘；读返回 revision；不带参数行为不变', (t) => {
+  const dir = makeBoardDir(t, 'cas')
+  let r = runTb(dir, ['create', '任务A'])
+  assert.equal(r.code, 0)
+  const rev0 = revOf(r.stdout)
+  assert.ok(revOf(runTb(dir, ['list']).stdout) >= rev0) // 读命令末行返回 revision
+  // 第一个写（带 rev0）成功
+  r = runTb(dir, ['create', '任务B', '--expected-revision', String(rev0)])
+  assert.equal(r.code, 0)
+  const rev1 = revOf(r.stdout)
+  assert.ok(rev1 > rev0)
+  // 第二个写复用旧 revision → stale_revision，且板文件逐字节未变（不落盘）
+  const boardPath = join(dir, BOARD_REL)
+  const before = readFileSync(boardPath)
+  const stale = runTb(dir, ['claim', 'T1', '某人', '--expected-revision', String(rev0)])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  assert.equal(stale.json.expected, rev0)
+  assert.equal(stale.json.current, rev1)
+  assert.deepEqual(readFileSync(boardPath), before)
+  // 不带 --expected-revision：行为与现状完全一致（照常写入成功）
+  const compat = runTb(dir, ['claim', 'T1', '某人'])
+  assert.equal(compat.code, 0)
+  assert.equal(revOf(compat.stdout), rev1 + 1)
+})
+
+// (b) attempt 代际：旧 attempt_id 的 done/report 被拒并返回具名 stale_attempt
+test('WP-1 (b) attempt 代际：旧代际 done/fail/progress 被拒；reassign 撤销旧代际；不带 --attempt 行为不变', (t) => {
+  const dir = makeBoardDir(t, 'attempt')
+  assert.equal(runTb(dir, ['create', '任务A']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲', '--attempt', 'A1']).code, 0)
+  // 旧/错误代际的 done 被拒且不落盘
+  const before = readFileSync(join(dir, BOARD_REL))
+  const stale = runTb(dir, ['done', 'T1', '旧代际汇报', '--attempt', 'A0'])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_attempt')
+  assert.equal(stale.json.attempt, 'A0')
+  assert.equal(stale.json.current, 'A1')
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before)
+  // 当前代际的 done/progress 正常
+  assert.equal(runTb(dir, ['progress', 'T1', '检查点', '--attempt', 'A1']).code, 0)
+  // 转派：reassign 先撤销旧代际，旧代际 progress 随后被拒
+  assert.equal(runTb(dir, ['reassign', 'T1', 'A2', '--owner', '乙']).code, 0)
+  const rej = runTb(dir, ['progress', 'T1', '旧代际检查点', '--attempt', 'A1'])
+  assert.equal(rej.code, 1)
+  assert.equal(rej.json.error, 'stale_attempt')
+  assert.ok((rej.json.revoked || []).includes('A1'))
+  assert.equal(runTb(dir, ['progress', 'T1', '新代际检查点', '--attempt', 'A2']).code, 0)
+  // 兼容：任务有 attempt_id 但不带 --attempt → 行为与现状一致（照常 done）
+  assert.equal(runTb(dir, ['done', 'T1', '结果', '--by', '甲']).code, 0)
+})
+
+// (c) 查询失败语义：损坏 JSON 后 list/show 返回 unrecoverable，stdout 无空任务列表
+test('WP-1 (c) unrecoverable：损坏/结构非法的任务板 list/show 返回显式错误对象，绝不静默返回空列表', (t) => {
+  const dir = makeBoardDir(t, 'corrupt')
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(dir, BOARD_REL), '{not-json')
+  for (const args of [['list'], ['show', 'T1'], ['status']]) {
+    const r = runTb(dir, args)
+    assert.equal(r.code, 1, args.join(' '))
+    assert.equal(r.json.error, 'unrecoverable')
+    assert.equal(r.json.unrecoverable, true) // 显式标记
+    assert.ok(!r.stdout.includes('任务板为空')) // 绝不静默返回空列表
+    assert.ok(typeof r.json.reason === 'string' && r.json.reason.length > 0)
+  }
+  // 结构合法 JSON 但非任务板（如 []）同样 unrecoverable
+  writeFileSync(join(dir, BOARD_REL), '[]')
+  const structural = runTb(dir, ['list'])
+  assert.equal(structural.json.error, 'unrecoverable')
+  assert.equal(structural.json.unrecoverable, true)
+})
+
+// (d) 依赖写入前全图环检测：A→B→C→A 被拒绝
+test('WP-1 (d) 环检测：set_dependencies 构造 A→B→C→A 被拒且不落盘；无环写入正常', (t) => {
+  const dir = makeBoardDir(t, 'cycle')
+  for (const title of ['A', 'B', 'C']) assert.equal(runTb(dir, ['create', title]).code, 0)
+  assert.equal(runTb(dir, ['set_dependencies', 'T2', '--dep', 'T1']).code, 0)
+  assert.equal(runTb(dir, ['set_dependencies', 'T3', '--dep', 'T2']).code, 0)
+  // 闭环写入被拒，T1 依赖不变
+  const before = readFileSync(join(dir, BOARD_REL))
+  const rej = runTb(dir, ['set_dependencies', 'T1', '--dep', 'T3'])
+  assert.equal(rej.code, 1)
+  assert.equal(rej.json.error, 'dependency_cycle')
+  assert.ok(rej.json.cycle.startsWith('T1->') && rej.json.cycle.endsWith('->T1'), rej.json.cycle) // 完整环路径
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before)
+  assert.ok(!runTb(dir, ['show', 'T1']).stdout.includes('dep=')) // T1 依赖未被写入
+  // 无环写入正常（多依赖合法链）；自依赖同样被拒
+  assert.equal(runTb(dir, ['set_dependencies', 'T3', '--dep', 'T2,T1']).code, 0)
+  const self = runTb(dir, ['set_dependencies', 'T3', '--dep', 'T3'])
+  assert.equal(self.code, 1)
+  assert.equal(self.json.error, 'dependency_cycle')
+})
+
+// (e) 全程无第三方 import：taskboard.py 仅标准库
+test('WP-1 (e) taskboard.py 零第三方 import（import 语句逐一落进标准库白名单）', () => {
+  const src = readFileSync(TASKBOARD, 'utf-8')
+  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'datetime', 'fcntl', 'glob', 'json', 'os', 'sys', 'time', 'uuid'])
+  const found = []
+  for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
+    for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
+  }
+  for (const m of src.matchAll(/^\s*from\s+([\w.]+)\s+import\s/g)) found.push(m[1])
+  assert.ok(found.length >= 8, `应至少解析出既有 8 个标准库 import，实际 ${JSON.stringify(found)}`)
+  for (const name of found) {
+    assert.ok(stdlib.has(name), `非标准库 import：${name}`)
+  }
+})
+
+// WP-1 兼容回归：现有协议文本里的全部 taskboard.py 调用方式（不传新参数）行为零变化
+test('WP-1 兼容回归：SKILL.md 第 9 节既有调用方式不传新参数时全流程行为不变', (t) => {
+  const dir = makeBoardDir(t, 'compat')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '子任务', '--owner', '后端工程师', '--desc', '完成标准')       // T1
+  ok('create', '下游任务', '--dep', 'T1', '--owner', 'DevOps自动化工程师')    // T2（依赖 T1，pending）
+  ok('status'); ok('list'); ok('show', 'T1'); ok('deps', 'T2')
+  ok('claim', 'T1', '后端工程师')
+  ok('progress', 'T1', '已完成X；产物:路径')
+  ok('done', 'T1', '结果摘要')                                              // T2 自动转 ready
+  const st = ok('status').stdout
+  assert.ok(st.includes('可认领: T2'), st)
+  ok('claim', 'T2'); ok('fail', 'T2', '原因'); ok('retry', 'T2'); ok('claim', 'T2'); ok('done', 'T2', '结果摘要', '--rework', '1', '--switched', '--by', 'DevOps自动化工程师')
+  ok('metrics'); ok('recover'); ok('boards')
+})
+
+// (a2) 真并发双写（评审项 🔴2）：两个进程同时写同一板（均携带旧 revision），恰好一成一拒、板文件完好。
+// 说明：两个进程都在任一写入生效前启动并携带 rev0，因此后落盘者必然命中 stale_revision，断言与调度时序无关。
+const spawnTbAsync = (cwd, args) =>
+  new Promise((resolve) => {
+    const p = spawn('python3', [TASKBOARD, ...args], { cwd })
+    let stdout = '', stderr = ''
+    p.stdout.on('data', (d) => { stdout += d })
+    p.stderr.on('data', (d) => { stderr += d })
+    p.on('close', (code) => resolve({ code, stdout, stderr }))
+  })
+
+test('WP-1 (a2) 真并发 CAS 双写：两进程同时写同一板，恰好一个成功一个 stale_revision，板文件完好无截断', async (t) => {
+  const dir = makeBoardDir(t, 'conc-cas')
+  const r0 = runTb(dir, ['create', '任务A'])
+  assert.equal(r0.code, 0)
+  const rev0 = revOf(r0.stdout)
+  const [w1, w2] = await Promise.all([
+    spawnTbAsync(dir, ['create', '并发写1', '--expected-revision', String(rev0)]),
+    spawnTbAsync(dir, ['create', '并发写2', '--expected-revision', String(rev0)]),
+  ])
+  const codes = [w1.code, w2.code].sort((a, b) => a - b)
+  assert.deepEqual(codes, [0, 1], `w1=${w1.code}/${w1.stdout} w2=${w2.code}/${w2.stdout}`)
+  const loser = w1.code === 1 ? w1 : w2
+  assert.equal(JSON.parse(loser.stdout.trim()).error, 'stale_revision')
+  assert.ok(!loser.stderr.includes('Traceback'), loser.stderr) // 具名错误，绝不裸 traceback
+  // 板文件完好：合法 JSON、恰好一次写入生效（revision 精确 +1、恰好 2 个任务）
+  const board = JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  assert.equal(board.revision, rev0 + 1)
+  assert.equal(Object.keys(board.tasks).length, 2)
+})
+
+test('WP-1 (a3) 真并发双写（无 CAS）：两写经锁串行化均成功，revision 精确 +2，板文件完好', async (t) => {
+  const dir = makeBoardDir(t, 'conc-nocas')
+  const r0 = runTb(dir, ['create', '任务A'])
+  assert.equal(r0.code, 0)
+  const rev0 = revOf(r0.stdout)
+  const [w1, w2] = await Promise.all([
+    spawnTbAsync(dir, ['create', '并发写1']),
+    spawnTbAsync(dir, ['create', '并发写2']),
+  ])
+  assert.equal(w1.code, 0, w1.stderr)
+  assert.equal(w2.code, 0, w2.stderr)
+  assert.ok(!w1.stderr.includes('Traceback') && !w2.stderr.includes('Traceback'))
+  const board = JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  assert.equal(board.revision, rev0 + 2) // 两写都落盘且 revision 无丢失更新
+  assert.equal(Object.keys(board.tasks).length, 3)
+})
+
+// (b2) 汇报 fail-closed（评审项 🟡5）+ fail 路径代际校验（💭）+ claim/reassign 拒绝已撤销代际（评审项 🟡3）
+test('WP-1 (b2) attempt fail-closed：无开放代际时带 --attempt 汇报被拒（no_attempt）；fail 旧代际被拒；claim/reassign 复用已撤销代际被拒', (t) => {
+  const dir = makeBoardDir(t, 'attempt-fc')
+  assert.equal(runTb(dir, ['create', '任务A']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲']).code, 0) // 无 attempt_id 认领（兼容路径）
+  const before = readFileSync(join(dir, BOARD_REL))
+  // fail-closed：任务无开放代际，带 --attempt 的汇报一律具名拒绝、不落盘
+  for (const args of [['done', 'T1', 'x', '--attempt', 'A9'], ['fail', 'T1', 'x', '--attempt', 'A9'], ['progress', 'T1', 'x', '--attempt', 'A9']]) {
+    const r = runTb(dir, args)
+    assert.equal(r.code, 1, args.join(' '))
+    assert.equal(r.json.error, 'no_attempt')
+    assert.equal(r.json.attempt, 'A9')
+  }
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before)
+  // 兼容：不带 --attempt 行为与旧版一致
+  assert.equal(runTb(dir, ['done', 'T1', '结果']).code, 0)
+  // 换 T2 验证代际撤销链路：claim 复用已撤销代际被拒；reassign 复活已撤销代际被拒（旧代际汇报 exit 0 缺口）
+  assert.equal(runTb(dir, ['create', '任务B']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T2', '乙', '--attempt', 'B1']).code, 0)
+  assert.equal(runTb(dir, ['reassign', 'T2', 'B2']).code, 0) // 撤销 B1
+  const revive = runTb(dir, ['reassign', 'T2', 'B1'])
+  assert.equal(revive.code, 1)
+  assert.equal(revive.json.error, 'stale_attempt')
+  assert.ok((revive.json.revoked || []).includes('B1'))
+  assert.equal(JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8')).tasks.T2.attempt_id, 'B2') // 未被复活
+  // fail 路径：旧/已撤销代际同样被拒（💭 补 fail 用例）
+  const staleFail = runTb(dir, ['fail', 'T2', '原因', '--attempt', 'B1'])
+  assert.equal(staleFail.code, 1)
+  assert.equal(staleFail.json.error, 'stale_attempt')
+  assert.ok((staleFail.json.revoked || []).includes('B1'))
+  assert.equal(runTb(dir, ['fail', 'T2', '原因', '--attempt', 'B2']).code, 0) // 当前代际正常
+  // retry 后 ready，claim 已撤销代际被拒、当前代际可重新认领
+  assert.equal(runTb(dir, ['retry', 'T2']).code, 0)
+  const claimRevoked = runTb(dir, ['claim', 'T2', '丙', '--attempt', 'B1'])
+  assert.equal(claimRevoked.code, 1)
+  assert.equal(claimRevoked.json.error, 'stale_attempt')
+  assert.equal(runTb(dir, ['claim', 'T2', '丙', '--attempt', 'B2']).code, 0)
+})
+
+// (c2) 深层结构损坏（评审项 🟡4）：tasks 条目非对象等深层损坏，全部命令路径返回 unrecoverable JSON
+test('WP-1 (c2) 深层损坏：tasks 条目非对象/dep 非列表/seq 非整数 → 所有命令 unrecoverable，boards 标注损坏无 traceback', (t) => {
+  const dir = makeBoardDir(t, 'corrupt-deep')
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  const boardPath = join(dir, BOARD_REL)
+  const shapes = [
+    ['tasks 条目为字符串', JSON.stringify({ tasks: { T1: 'not-an-object' }, seq: 1 })],
+    ['dep 非列表', JSON.stringify({ tasks: { T1: { id: 'T1', title: 'x', status: 'running', dep: 'T2' } }, seq: 1 })],
+    ['seq 非整数', JSON.stringify({ tasks: {}, seq: 'x' })],
+    ['任务缺 status', JSON.stringify({ tasks: { T1: { id: 'T1', title: 'x', dep: [] } }, seq: 1 })],
+  ]
+  const cmds = [['list'], ['show', 'T1'], ['status'], ['deps', 'T1'], ['claim', 'T1'], ['done', 'T1'],
+    ['fail', 'T1'], ['progress', 'T1', 'n'], ['retry', 'T1'], ['recover'], ['metrics'],
+    ['set_dependencies', 'T1', '--dep', 'T1'], ['reassign', 'T1', 'A1'], ['archive'], ['create', 'x']]
+  for (const [label, content] of shapes) {
+    writeFileSync(boardPath, content)
+    for (const args of cmds) {
+      const r = runTb(dir, args)
+      assert.equal(r.code, 1, `${label} | ${args.join(' ')} | stdout=${r.stdout}`)
+      assert.equal(r.json.error, 'unrecoverable', `${label} | ${args.join(' ')}`)
+      assert.equal(r.json.unrecoverable, true)
+      assert.ok(!r.stderr.includes('Traceback'), `${label} | ${args.join(' ')} | ${r.stderr}`)
+    }
+  }
+  // boards：对损坏板逐条标注（损坏），exit 0 且不裸 traceback
+  writeFileSync(boardPath, '{"tasks": {"T1": "oops"}, "seq": 1}')
+  const b = runTb(dir, ['boards'])
+  assert.equal(b.code, 0)
+  assert.ok(b.stdout.includes('（损坏）'), b.stdout)
+  assert.ok(!b.stderr.includes('Traceback'), b.stderr)
+})
+
+// (f) 无 fcntl 降级路径（评审项 🔴1 降级要求）：TASKBOARD_DISABLE_FLOCK=1 时功能可用、写入原子、无 tmp/lock 残留
+test('WP-1 (f) 降级路径（TASKBOARD_DISABLE_FLOCK=1）：CAS 仍生效、流程可用、板目录无 *.tmp/*.lock 残留', (t) => {
+  const dir = makeBoardDir(t, 'nolock')
+  const env = { ...process.env, TASKBOARD_DISABLE_FLOCK: '1' }
+  const run = (args) => {
+    const r = spawnSync('python3', [TASKBOARD, ...args], { cwd: dir, encoding: 'utf-8', env })
+    let json = null
+    try { json = JSON.parse((r.stdout ?? '').trim()) } catch { /* 多行人类可读输出 */ }
+    return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', json }
+  }
+  const r0 = run(['create', '任务A'])
+  assert.equal(r0.code, 0)
+  const rev0 = revOf(r0.stdout)
+  // 降级模式下 CAS 校验逻辑本身仍工作（单进程语义不变）：先写入 bump revision，旧 revision 的写被拒
+  assert.equal(run(['claim', 'T1', '甲']).code, 0)
+  const stale = run(['progress', 'T1', 'x', '--expected-revision', String(rev0)])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  const rev1 = revOf(run(['list']).stdout)
+  assert.equal(rev1, rev0 + 1)
+  assert.equal(run(['progress', 'T1', '检查点', '--expected-revision', String(rev1)]).code, 0)
+  // 板目录无 .tmp / .lock 残留（唯一 tmp 名写完即 replace；降级模式不建锁文件）
+  const files = readdirSync(join(dir, '.expert-taskboards'))
+  assert.ok(files.every((f) => !f.endsWith('.tmp') && !f.endsWith('.lock')), JSON.stringify(files))
 })

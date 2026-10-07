@@ -186,3 +186,12 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     python3 <技能目录>/tools/bus.py ack --box coordinator --all
     python3 <技能目录>/tools/bus.py broadcast --from 协调官 --subject "…" --body "…"
     python3 <技能目录>/tools/bus.py stats
+
+投递语义（v2.6，默认开启；上方既有调用方式全部不变，`read --no-attempt-filter` 关闭②③回到旧版读取行为）：
+
+    python3 <技能目录>/tools/bus.py send --from 专家名 --to coordinator --task T3 --attempt <attempt_id> --subject "…" --body "…"   # 携带派工代际（--task/--attempt 必须成对；attempt_id 来自 taskboard claim/reassign）
+    python3 <技能目录>/tools/bus.py read --box coordinator --board .expert-taskboards/<项目slug>.json   # 多板项目显式指定代际对账板（默认解析规则同 taskboard.py）
+读取信箱流程（编排者与专家同规）：
+  ① at-least-once 游标：send 先落发件箱 `_outbox/<发送者>/`（原子写：唯一 tmp + os.replace，崩溃不产生截断毒丸），投递成功（收件箱原子落盘）才推进游标 `cursor.json`——投递中途崩溃重启后同一条消息按同 id 原子重投（幂等，已 ack 的消息重投不复活未读标记）；旧版遗留的发件箱截断残件在投递时自愈（隔离 `.corrupt` 并告警后跳过，该发送者后续 send 不被阻塞）。
+  ② 过代过滤：read 时消息携带的 task+attempt 与任务板当前代际对账，attempt 已撤销/非当前代际/任务无此代际的消息直接归档到 `_archive/<信箱>/`（不进收件箱）；板缺失/损坏/结构非法返回 `{"error":"unrecoverable","unrecoverable":true,...}`，不做静默假设——如实报告编排者，确认后再用 `--no-attempt-filter` 读取。语义边界：过滤是**读取时点快照**，与 `reassign` 并发时，刚被撤销代际的消息可能被放行一次（本轮已进收件箱），下轮读取时再归档——属 at-least-once「多投不丢」的预期行为，接收方对同代际重复汇报按幂等处理。
+  ③ skip-round：信箱本轮可见消息为空（`--unread` 时已读消息不计入可见）且本轮归档了过期消息时输出 `SKIP_ROUND：…`——编排模型据此跳过该轮（省一次模型调用），不得当作「信箱为空」而重派或追问；归档数只统计本轮归档量，可见为空也可能因消息已读，措辞不断言「全部输入已过期」。

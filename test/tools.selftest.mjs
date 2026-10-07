@@ -830,3 +830,332 @@ test('WP-1 (f) 降级路径（TASKBOARD_DISABLE_FLOCK=1）：CAS 仍生效、流
   const files = readdirSync(join(dir, '.expert-taskboards'))
   assert.ok(files.every((f) => !f.endsWith('.tmp') && !f.endsWith('.lock')), JSON.stringify(files))
 })
+
+// ── WP-2 消息总线投递语义升级（v2.6）：bus.py 子进程级用例 (a)–(d) ─────────
+const BUS = fileURLToPath(new URL('../skills/expert-orchestration/tools/bus.py', import.meta.url))
+const BUS_REL = join('.expert-bus')
+
+/** 执行 bus.py（cwd 隔离到临时目录，可注入环境变量）；stdout 单行 JSON 时解析为 json 字段。 */
+const runBus = (cwd, args, env = {}) => {
+  const r = spawnSync('python3', [BUS, ...args], { cwd, encoding: 'utf-8', env: { ...process.env, ...env } })
+  let json = null
+  try { json = JSON.parse((r.stdout ?? '').trim()) } catch { /* 非错误输出（多行人类可读）不解析 */ }
+  return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', json }
+}
+
+const makeBusDir = (t, label) => {
+  const dir = mkdtempSync(join(tmpdir(), `wp2-bus-${label}-`))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  return dir
+}
+
+/** 读取一个信箱的全部消息（id + 全文）。 */
+const boxMsgs = (dir, box) => {
+  const d = join(dir, BUS_REL, box)
+  return readdirSync(d).filter((n) => n.endsWith('.json')).map((n) => JSON.parse(readFileSync(join(d, n), 'utf-8')))
+}
+
+/** 写一个最小合法任务板（供代际对账）。 */
+const writeBusBoard = (dir, tasks) => {
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(dir, '.expert-taskboards', 'default.json'), JSON.stringify({ tasks, seq: 1, revision: 0 }))
+}
+
+const outboxNames = (dir, sender) =>
+  readdirSync(join(dir, BUS_REL, '_outbox', sender)).filter((n) => n.endsWith('.json') && n !== 'cursor.json').sort()
+const cursorOf = (dir, sender) =>
+  JSON.parse(readFileSync(join(dir, BUS_REL, '_outbox', sender, 'cursor.json'), 'utf-8')).cursor
+
+// (a) at-least-once 游标：投递中途崩溃重启后同一条消息按同 id 重投；游标仅在成功回执后前进
+test('WP-2 (a) at-least-once 游标：崩溃重启后同 id 幂等重投、游标仅在成功回执后前进、已 ack 消息重投不复活未读', (t) => {
+  const dir = makeBusDir(t, 'cursor')
+  const send = (subj, env = {}) =>
+    runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', subj, '--body', 'b'], env)
+  // 正常路径：收件箱落盘 + 游标推进到该条目
+  let r = send('s1')
+  assert.equal(r.code, 0)
+  assert.ok(r.stdout.includes('已投递'), r.stdout)
+  assert.equal(outboxNames(dir, '甲').length, 1)
+  assert.equal(cursorOf(dir, '甲'), outboxNames(dir, '甲')[0])
+  // 崩溃注入：收件箱已落盘、游标未前进（投递成功但未收到回执）
+  const crash = send('s2', { BUS_CRASH_AFTER_DELIVER: '1' })
+  assert.equal(crash.code, 70)
+  assert.ok(!crash.stderr.includes('Traceback'), crash.stderr)
+  assert.equal(boxMsgs(dir, 'coordinator').length, 2)
+  assert.equal(cursorOf(dir, '甲'), outboxNames(dir, '甲')[0]) // 游标停在 s1
+  // 重启（全新进程）：s2 按同 id 原子重投（不产生重复消息），游标前进越过 s2
+  r = send('s3')
+  assert.equal(r.code, 0)
+  const ids = boxMsgs(dir, 'coordinator').map((m) => m.id)
+  assert.equal(ids.length, 3)
+  assert.equal(new Set(ids).size, 3) // 同 id 重投幂等
+  assert.equal(cursorOf(dir, '甲'), outboxNames(dir, '甲')[2])
+  // 失败路径：游标未推进期间消息被 ack，重投不复活未读标记
+  const s4 = send('s4', { BUS_CRASH_AFTER_DELIVER: '1' })
+  assert.equal(s4.code, 70)
+  const beforeAck = boxMsgs(dir, 'coordinator').find((m) => m.subject === 's4')
+  assert.equal(runBus(dir, ['ack', '--box', 'coordinator', '--id', beforeAck.id]).code, 0)
+  assert.equal(send('s5').code, 0) // 重启：s4 重投
+  const after = boxMsgs(dir, 'coordinator').find((m) => m.subject === 's4')
+  assert.equal(after.id, beforeAck.id) // 同一条消息
+  assert.equal(after.read, true) // 未被复活为未读
+  assert.equal(cursorOf(dir, '甲'), outboxNames(dir, '甲')[4])
+})
+
+// (b) 过代过滤：携带已撤销/过期 attempt 的消息读取时归档、不进 inbox；板不可读 unrecoverable；开关可关
+test('WP-2 (b) 过代过滤：已撤销/非当前代际消息归档不进 inbox；板缺失/损坏返回 unrecoverable 且不静默处置；--no-attempt-filter 可关', (t) => {
+  const dir = makeBusDir(t, 'attempt')
+  writeBusBoard(dir, {
+    T1: { id: 'T1', title: 'x', status: 'running', dep: [], attempt_id: 'A1', attempt_revoked: ['A0'] },
+    T2: { id: 'T2', title: 'y', status: 'running', dep: [], attempt_id: 'B1', attempt_revoked: [] },
+  })
+  const send = (subj, task, att) => {
+    const extra = task ? ['--task', task, '--attempt', att] : []
+    const r = runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', subj, '--body', 'b', ...extra])
+    assert.equal(r.code, 0, r.stdout) // send 不读板；对账只发生在读取时
+    return r
+  }
+  send('旧代际', 'T1', 'A0') // attempt_revoked → 过期
+  send('当前代际', 'T2', 'B1') // 开放代际 → 保留
+  send('普通消息') // 无代际引用 → 不过滤
+  const r = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.equal(r.code, 0)
+  assert.ok(r.stdout.includes('当前代际') && r.stdout.includes('普通消息'), r.stdout)
+  assert.ok(!r.stdout.includes('旧代际'), r.stdout) // 不进收件箱
+  assert.ok(r.stdout.includes('已归档过期消息'), r.stdout)
+  assert.equal(boxMsgs(dir, 'coordinator').length, 2)
+  const archiveDir = join(dir, BUS_REL, '_archive', 'coordinator')
+  assert.equal(readdirSync(archiveDir).length, 1)
+  const archived = JSON.parse(readFileSync(join(archiveDir, readdirSync(archiveDir)[0]), 'utf-8'))
+  assert.equal(archived.attempt_id, 'A0')
+  // 板损坏：读取返回 unrecoverable（exit 1），消息不归档不丢弃（不做静默假设）
+  const broken = makeBusDir(t, 'attempt-broken')
+  mkdirSync(join(broken, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(broken, '.expert-taskboards', 'default.json'), '{not-json')
+  runBus(broken, ['send', '--from', '丙', '--to', 'coordinator', '--subject', '待对账', '--body', 'b', '--task', 'T1', '--attempt', 'A9'])
+  const bad = runBus(broken, ['read', '--box', 'coordinator'])
+  assert.equal(bad.code, 1)
+  assert.equal(bad.json.error, 'unrecoverable')
+  assert.equal(bad.json.unrecoverable, true)
+  assert.ok(typeof bad.json.reason === 'string' && bad.json.reason.length > 0)
+  assert.ok(!bad.stderr.includes('Traceback'), bad.stderr)
+  assert.equal(boxMsgs(broken, 'coordinator').length, 1) // 未归档未丢弃
+  // 板缺失：同样 unrecoverable（消息引用了代际却不给板，不做静默假设）
+  const noboard = makeBusDir(t, 'attempt-noboard')
+  runBus(noboard, ['send', '--from', '丙', '--to', 'coordinator', '--subject', '待对账', '--body', 'b', '--task', 'T1', '--attempt', 'A9'])
+  const missing = runBus(noboard, ['read', '--box', 'coordinator'])
+  assert.equal(missing.code, 1)
+  assert.equal(missing.json.error, 'unrecoverable')
+  assert.equal(boxMsgs(noboard, 'coordinator').length, 1)
+  // 关闭开关：回到旧版读取行为（不读板、不过滤、不归档）
+  const off = runBus(noboard, ['read', '--box', 'coordinator', '--no-attempt-filter'])
+  assert.equal(off.code, 0)
+  assert.ok(off.stdout.includes('待对账'), off.stdout)
+  // send 侧成对校验：只给其一被拒
+  const half = runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', 'x', '--body', 'b', '--task', 'T1'])
+  assert.equal(half.code, 1)
+  assert.ok(half.stderr.includes('--task 与 --attempt 必须成对提供'), half.stderr)
+})
+
+// (c) skip-round：收件箱仅含过期消息时输出显式 SKIP_ROUND；空信箱与普通无未读行为不变
+test('WP-2 (c) skip-round：信箱本轮可见消息为空且归档了过期消息时输出 SKIP_ROUND；真空信箱保持旧文案', (t) => {
+  const dir = makeBusDir(t, 'skip')
+  writeBusBoard(dir, { T1: { id: 'T1', title: 'x', status: 'running', dep: [], attempt_id: 'A1', attempt_revoked: [] } })
+  // 仅过期消息 → SKIP_ROUND，收件箱归空
+  assert.equal(runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', '过期', '--body', 'b', '--task', 'T1', '--attempt', 'A0']).code, 0)
+  const r = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.equal(r.code, 0)
+  assert.ok(r.stdout.includes('SKIP_ROUND'), r.stdout)
+  assert.ok(r.stdout.includes('可跳过该轮'), r.stdout)
+  // 💭3 措辞与判定对齐：可见为空的原因可能是已读而非全过期，不断言「全部过期」
+  assert.ok(r.stdout.includes('本轮无可见消息'), r.stdout)
+  assert.ok(r.stdout.includes('已归档 1 封过期消息'), r.stdout)
+  assert.ok(!r.stdout.includes('全部过期'), r.stdout)
+  assert.ok(!r.stdout.includes('（信箱 coordinator 无消息）'), r.stdout)
+  assert.equal(readdirSync(join(dir, BUS_REL, 'coordinator')).length, 0)
+  // 归档后再读：真空信箱 → 旧文案，无 SKIP_ROUND
+  const empty = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.ok(empty.stdout.includes('（信箱 coordinator 无消息）'), empty.stdout)
+  assert.ok(!empty.stdout.includes('SKIP_ROUND'), empty.stdout)
+  // --unread：已读正常消息 + 未读过期消息 → 本轮无有效输入 → SKIP_ROUND
+  assert.equal(runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', '正常', '--body', 'b']).code, 0)
+  assert.equal(runBus(dir, ['ack', '--box', 'coordinator', '--all']).code, 0)
+  assert.equal(runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', '过期2', '--body', 'b', '--task', 'T1', '--attempt', 'A0']).code, 0)
+  const ur = runBus(dir, ['read', '--box', 'coordinator', '--unread'])
+  assert.equal(ur.code, 0)
+  assert.ok(ur.stdout.includes('SKIP_ROUND'), ur.stdout)
+  assert.ok(!ur.stdout.includes('正常'), ur.stdout) // 已读消息不展示，也不阻止 skip-round 判定
+  // 💭3：--unread 混合场景（已读消息 + 过期消息）下「全部过期」措辞不准确，须与新判定一致
+  assert.ok(!ur.stdout.includes('全部过期'), ur.stdout)
+  assert.ok(ur.stdout.includes('已归档 1 封过期消息'), ur.stdout)
+})
+
+// (d) 零第三方 import + 既有调用方式回归（SKILL.md 第 9 节 bus.py 全部既有调用不传新参数行为不变）
+test('WP-2 (d) bus.py 零第三方 import（import 落进标准库白名单）+ 既有调用方式全流程回归', (t) => {
+  const src = readFileSync(BUS, 'utf-8')
+  const stdlib = new Set(['argparse', 'json', 'os', 'random', 'sys', 'time'])
+  const found = []
+  for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
+    for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
+  }
+  for (const m of src.matchAll(/^\s*from\s+([\w.]+)\s+import\s/g)) found.push(m[1])
+  assert.ok(found.length >= 6, `应至少解析出既有 6 个标准库 import，实际 ${JSON.stringify(found)}`)
+  for (const name of found) {
+    assert.ok(stdlib.has(name), `非标准库 import：${name}`)
+  }
+  // 既有调用回归：send / read [--box|--unread|--all-boxes] / ack [--id|--all] / broadcast / stats
+  const dir = makeBusDir(t, 'compat')
+  const ok = (...args) => { const r = runBus(dir, args); assert.equal(r.code, 0, `${args.join(' ')}\n${r.stderr}`); return r }
+  ok('send', '--from', '后端工程师', '--to', 'coordinator', '--subject', '登录页完成', '--body', '完整产出', '--file', '产物.md')
+  ok('send', '--from', '后端工程师', '--to', 'coordinator', '--subject', '第二封', '--body', 'b2')
+  const r1 = ok('read', '--box', 'coordinator')
+  assert.ok(r1.stdout.includes('--- ') && r1.stdout.includes('[未读] from=后端工程师 subject=登录页完成'), r1.stdout)
+  assert.ok(r1.stdout.includes('附件: ' + join(dir, '产物.md')), r1.stdout)
+  const r2 = ok('read', '--box', 'coordinator', '--unread') // read 不置已读 → 未读仍在
+  assert.equal((r2.stdout.match(/--- /g) || []).length, 2)
+  const firstId = boxMsgs(dir, 'coordinator').map((m) => m.id)[0]
+  ok('ack', '--box', 'coordinator', '--id', firstId)
+  const r3 = ok('read', '--box', 'coordinator', '--unread')
+  assert.equal((r3.stdout.match(/--- /g) || []).length, 1) // 只剩第二封
+  assert.ok(!r3.stdout.includes('登录页完成'), r3.stdout)
+  ok('ack', '--box', 'coordinator', '--all')
+  const all1 = ok('read', '--all-boxes') // _outbox 等内部目录不得作为信箱列出
+  assert.ok(all1.stdout.includes('== 信箱 coordinator =='), all1.stdout)
+  assert.ok(!all1.stdout.includes('_outbox') && !all1.stdout.includes('_archive'), all1.stdout)
+  ok('broadcast', '--from', '协调官', '--subject', '通告', '--body', '全员可见')
+  assert.equal(boxMsgs(dir, 'coordinator').length, 3) // 广播照常到达既有信箱
+  const st = ok('stats').stdout
+  assert.ok(st.includes('coordinator: 共 3 封，未读 1'), st) // 2 封已 ack + 广播 1 封未读
+  assert.ok(!st.includes('_outbox') && !st.includes('_archive'), st)
+})
+
+// (e) 毒丸自愈（评审项 🔴1）：发件箱截断残件（旧版裸 open('w') 写中间态崩溃窗口的产物）不阻塞后续 send
+test('WP-2 (e) 毒丸自愈：outbox 截断残件与 .tmp 残件均无害，下一次 send 照常成功，残件被隔离 .corrupt', (t) => {
+  const dir = makeBusDir(t, 'poison')
+  // 正常 send 一封建立游标
+  assert.equal(runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', 's1', '--body', 'b']).code, 0)
+  const outbox = join(dir, BUS_REL, '_outbox', '甲')
+  // 注入「崩溃于写中间态」现场：旧版非原子写留下的截断 JSON（合法命名、非法内容，ts 在游标之后）
+  writeFileSync(join(outbox, '9999999999999-mcrash999.json'), '{"id": "mcrash')
+  // 新版唯一 tmp 崩溃窗口同样只留 .tmp 残件：任何后续读取路径都不得被它卡住
+  writeFileSync(join(outbox, '8888888888888-mtmp888.json.12345.abcdef01.tmp'), '{')
+  // 下一次 send 仍成功：截断残件被自愈隔离，新消息正常落盘并投递
+  const r = runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', 's2', '--body', 'b'])
+  assert.equal(r.code, 0, `${r.stdout}\n${r.stderr}`) // 修复前此处 json.load 抛异常 → 该发送者永久 exit 1
+  assert.ok(r.stdout.includes('已投递'), r.stdout)
+  assert.ok(r.stderr.includes('截断残件已隔离'), r.stderr) // 自愈有显式告警，不静默吞
+  assert.equal(boxMsgs(dir, 'coordinator').length, 2) // s1 + s2，截断残件从未进收件箱
+  // 残件已移出 .json 投递队列（.corrupt 后缀），.tmp 残件不动（无害）
+  const names = readdirSync(outbox)
+  assert.ok(names.some((n) => n.endsWith('.corrupt')), JSON.stringify(names))
+  assert.equal(names.filter((n) => n.endsWith('.json') && n !== 'cursor.json').length, 2, JSON.stringify(names))
+  // 再 send 一次：无重复告警（残件只处理一次），通道持续可用
+  const r2 = runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', 's3', '--body', 'b'])
+  assert.equal(r2.code, 0, `${r2.stdout}\n${r2.stderr}`)
+  assert.ok(!r2.stderr.includes('截断'), r2.stderr)
+  assert.equal(boxMsgs(dir, 'coordinator').length, 3)
+})
+
+// (f) flush 补投路径（评审项 🔴1 配套）：发件箱已落盘但投递中断（游标落后）时，下一次 send 触发 flush 按序补投
+test('WP-2 (f) flush 补投：游标落后的挂起条目在下一次 send 时按序补投进收件箱，游标推进到最新且不重复投递', (t) => {
+  const dir = makeBusDir(t, 'flush-redeliver')
+  assert.equal(runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', 's1', '--body', 'b']).code, 0)
+  // 模拟「发件箱已落盘、投递中断」现场：向发件箱直写两条合法挂起条目。
+  // ts 取既有最大条目名之后的连续值（真实场景发件箱按时间戳单调追加，夹具保持同一不变量）
+  const outbox = join(dir, BUS_REL, '_outbox', '乙')
+  const lastTs = Number(outboxNames(dir, '乙').at(-1).split('-')[0])
+  const pending = [
+    { id: 'mpending001', from: '乙', to: 'coordinator', subject: '待补投1', body: 'b', files: [], ts: lastTs + 1, read: false },
+    { id: 'mpending002', from: '乙', to: 'coordinator', subject: '待补投2', body: 'b', files: [], ts: lastTs + 2, read: false },
+  ]
+  for (const m of pending) writeFileSync(join(outbox, `${String(m.ts).padStart(13, '0')}-${m.id}.json`), JSON.stringify(m))
+  // 下一次 send：flush 先按序补投两条挂起消息，再投递本条新消息
+  const r = runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', 's2', '--body', 'b'])
+  assert.equal(r.code, 0, `${r.stdout}\n${r.stderr}`)
+  const msgs = boxMsgs(dir, 'coordinator')
+  assert.deepEqual(msgs.map((m) => m.subject).sort(), ['s1', 's2', '待补投1', '待补投2'], JSON.stringify(msgs.map((m) => m.subject)))
+  assert.equal(new Set(msgs.map((m) => m.id)).size, 4) // 全程无重复投递（含挂起条目自身）
+  // 游标推进到最新条目（补投完成后无积压）
+  assert.equal(cursorOf(dir, '乙'), outboxNames(dir, '乙').at(-1))
+  // 再次 send：已补投条目不重复进收件箱（游标幂等；同发送者新消息照常追加）
+  assert.equal(runBus(dir, ['send', '--from', '乙', '--to', 'coordinator', '--subject', 's3', '--body', 'b']).code, 0)
+  const after = boxMsgs(dir, 'coordinator')
+  assert.ok(after.filter((m) => m.subject === '待补投1').length === 1 && after.filter((m) => m.subject === '待补投2').length === 1)
+  assert.equal(cursorOf(dir, '乙'), outboxNames(dir, '乙').at(-1))
+})
+
+// (g) ack 原子写（评审回炉第2轮 🔴）：cmd_ack 裸 open('w') 写收件箱一旦中途崩溃即截断消息——
+// 收件箱是已投递消息的唯一副本，截断一封即整箱 read/stats 永久 unrecoverable（与毒丸同类）。
+// 修复后 ack 复用 write_json_atomic：注入「ack 写中间态崩溃」后消息文件完好、read/stats 仍可用；
+// 遗留截断残件仍按既有损坏语义显式 unrecoverable（唯一副本不静默丢）；静态守卫锁死全文件无其他裸写点。
+test('WP-2 (g) ack 原子写：ack 写中途崩溃不截断收件箱消息，read/stats 仍可用且可重试 ack；遗留截断残件按既有 unrecoverable 语义处置', (t) => {
+  // 场景 A：注入「ack 写中间态崩溃」——json.dump 写 .tmp 中间文件时 os._exit(70)（模拟进程死亡，跳过一切清理）
+  const dir = makeBusDir(t, 'ack-atomic')
+  assert.equal(runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', 's1', '--body', 'b']).code, 0)
+  assert.equal(runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', 's2', '--body', 'b']).code, 0)
+  const target = boxMsgs(dir, 'coordinator').find((m) => m.subject === 's1')
+  const crashDriver = `
+import json, os, sys
+sys.path.insert(0, ${JSON.stringify(fileURLToPath(new URL('../skills/expert-orchestration/tools/', import.meta.url)))})
+sys.argv = ['bus.py', '--root', ${JSON.stringify(join(dir, BUS_REL))}, 'ack', '--box', 'coordinator', '--id', ${JSON.stringify(target.id)}]
+import bus
+real_dump = json.dump
+once = {'hit': False}
+def crashy_dump(obj, fp, **kw):
+    # 仅拦 ack 回写收件箱的 .tmp 中间文件首次调用：写一半就崩溃（等价旧版裸写最坏中间态）
+    if fp.name.endswith('.tmp') and not once['hit']:
+        once['hit'] = True
+        fp.write('{"id": "trunc')
+        fp.flush()
+        os._exit(70)
+    return real_dump(obj, fp, **kw)
+json.dump = crashy_dump
+bus.main()
+`
+  const crash = spawnSync('python3', ['-c', crashDriver], { cwd: dir, encoding: 'utf-8' })
+  assert.equal(crash.status, 70) // 注入生效：确实死在写中间态
+  assert.ok(!crash.stderr.includes('Traceback'), crash.stderr)
+  // 目标消息文件完好：仍是完整合法 JSON、内容未被截断、read 标记未落盘（ack 可幂等重试）
+  const targetFile = `${String(target.ts).padStart(13, '0')}-${target.id}.json`
+  const afterCrash = JSON.parse(readFileSync(join(dir, BUS_REL, 'coordinator', targetFile), 'utf-8'))
+  assert.equal(afterCrash.id, target.id)
+  assert.equal(afterCrash.read, false)
+  assert.equal(afterCrash.subject, 's1')
+  // read/stats 仍可用（修复前裸写截断后此处整箱永久 exit 1 unrecoverable）
+  const rd = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.equal(rd.code, 0, `${rd.stdout}\n${rd.stderr}`)
+  assert.ok(rd.stdout.includes('subject=s1') && rd.stdout.includes('[未读]'), rd.stdout)
+  const st = runBus(dir, ['stats'])
+  assert.equal(st.code, 0, `${st.stdout}\n${st.stderr}`)
+  assert.ok(st.stdout.includes('coordinator: 共 2 封，未读 2'), st.stdout)
+  // .tmp 残件无害（既有语义：唯一 tmp 崩溃窗口只留残件），ack 重试成功且 read/stats 持续可用
+  const boxFiles = readdirSync(join(dir, BUS_REL, 'coordinator'))
+  assert.ok(boxFiles.some((n) => n.endsWith('.tmp')), JSON.stringify(boxFiles))
+  assert.equal(runBus(dir, ['ack', '--box', 'coordinator', '--id', target.id]).code, 0)
+  const rd2 = runBus(dir, ['read', '--box', 'coordinator', '--unread'])
+  assert.equal(rd2.code, 0)
+  assert.ok(!rd2.stdout.includes('subject=s1'), rd2.stdout) // s1 已读不再展示，s2 仍在
+  assert.ok(rd2.stdout.includes('subject=s2'), rd2.stdout)
+
+  // 场景 B：遗留截断残件（旧版裸写或外部截断的产物）按既有损坏语义处置——显式 unrecoverable，不静默丢、不裸 traceback
+  const broken = makeBusDir(t, 'ack-atomic-legacy')
+  assert.equal(runBus(broken, ['send', '--from', '甲', '--to', 'coordinator', '--subject', 'good', '--body', 'b']).code, 0)
+  writeFileSync(join(broken, BUS_REL, 'coordinator', '9999999999999-mtrunc999.json'), '{"id": "mtrunc')
+  const rdB = runBus(broken, ['read', '--box', 'coordinator'])
+  assert.equal(rdB.code, 1)
+  assert.equal(rdB.json.error, 'unrecoverable')
+  assert.equal(rdB.json.unrecoverable, true)
+  assert.ok(!rdB.stderr.includes('Traceback'), rdB.stderr)
+  const stB = runBus(broken, ['stats'])
+  assert.equal(stB.code, 1)
+  assert.equal(stB.json.unrecoverable, true)
+  assert.ok(!stB.stderr.includes('Traceback'), stB.stderr)
+  assert.equal(readdirSync(join(broken, BUS_REL, 'coordinator')).filter((n) => n.endsWith('.json')).length, 2) // 唯一副本不静默丢
+
+  // 静态守卫：全文件无 write_json_atomic 之外的裸 JSON 落盘点（open(.., 'w'/'wb') 唯一命中 write_json_atomic 内部写唯一 tmp；无 write_bytes/流式 .write( 落盘）
+  const src = readFileSync(BUS, 'utf-8')
+  const bareWrites = [...src.matchAll(/open\(\s*[\w.()[\]]+\s*,\s*['"]w[b+]*['"]/g)].map((m) => m[0])
+  assert.equal(bareWrites.length, 1, JSON.stringify(bareWrites))
+  assert.ok(bareWrites[0].includes('tmp'), '唯一 open(w) 应是 write_json_atomic 写唯一 tmp')
+  assert.ok(!/write_bytes|\.write\(/.test(src), 'bus.py 不得出现 write_bytes 或流式 .write( 落盘')
+})

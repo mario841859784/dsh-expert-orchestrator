@@ -78,7 +78,9 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 ## 4. 交付门禁（强制触发，顺序执行）
 
-满足任一条件进入门禁：里程碑完成、**即将向用户交付 / git commit 之前**（最常见的漏检点）、范围/优先级变更、专家结论冲突、子任务验收不通过、出现计划外风险。用户显式豁免（如「跳过评审直接做」）时可跳过独立评审、交付后补审，豁免决定记入项目板；git commit 前的检查与删除/回滚类 DoD 不可豁免。
+满足任一条件进入门禁：里程碑完成、**即将向用户交付 / git commit 之前**（最常见的漏检点）、范围/优先级变更、专家结论冲突、子任务验收不通过、出现计划外风险。用户显式豁免（如「跳过评审直接做」）时可跳过独立评审、交付后补审，豁免决定记入项目板；删除/回滚类 DoD 不可豁免；git commit 前的检查按门禁执法平面分级：**显式开启 hook 后不可豁免**（commit-msg git 平面执法，绕过编排工具直接 commit 也会被拒，`git commit --no-verify` 仅限紧急单次并须记录）；未开启 hook 时维持模型自觉+降级可见（编排者交付说明必须注明「门禁 hook 未开启，commit 前检查为模型自觉执行」）。
+
+**门禁执法平面（v2.6，默认关闭，显式开启）**：`python3 <技能目录>/tools/taskboard.py --install-hook` 向当前仓库 `.git/hooks/commit-msg` 写入零依赖 hook（POSIX sh 薄壳 + python3 调 taskboard.py `_hook-check`），三查语义：① 提交消息须可解析出任务 id（形如 `T<数字>`）；② 消息中解析出的**全部**任务 id 逐个核对——均须在板内且状态 running，任一不满足即拒（防「T1 T999」夹带未核 id）；③ 各任务声明 scope（`create --scope`）时取 scope **并集**，提交文件须落在任一关联域内。已有同名 hook 报错退出不覆盖（内容一致幂等；内容含本插件指纹标记行视为旧版插件 hook，允许原地升级覆盖）；`--uninstall-hook` 仅移除本插件安装的——凭写入 hook 内的**稳定指纹标记行**辨认（不认模板/全文哈希，模板任何演进都不影响卸载；旧版哈希形态标记行同被认得），无标记行的用户自有 hook 一律拒绝删除；`--board` 可把项目板路径固化进 hook。**降级语义（fail-open，均 stderr 告警放行、不阻塞提交）**：门禁脚本缺失、python3 不可用（hook 头部 `command -v` 检测，装回后门禁自动恢复）、任务板缺失（含 `archive` 归档把板移走——归档收口属预期流程，hook 不再阻塞提交；板缺失时校验平面整体不可用，连无任务 id 消息也一并放行）。取舍说明：hook 是辅助门禁而非数据完整性屏障，板/环境不可用时拒绝会永久卡死所有提交（archive 后必触发板缺失），故统一选择降级可见而非阻塞；板在而三查不过仍 fail closed，紧急单次可用 `git commit --no-verify` 并记录。**未显式 `--install-hook` 前任何命令不触碰 `.git/hooks/`**。
 
 1. **独立评审**（大型任务必过；小型实施可跳过）：召唤一名与实现者**不同领域**的专家（如后端实现→代码审查工程师或安全审计工程师评审），任务书要求只读评审 diff/产出，输出「同意 / 部分同意 / 反对 + 理由 + 必改项」。部分同意或反对→把必改项派回实现专家回炉，**回炉上限 2 轮**，仍不过→上报用户决策。
 2. **PM 检查点**（大型任务必过；小型实施免，见第 1 节）：向 PM（默认「项目推进专员」；范围与拆解类问题可再次召唤「高级项目经理」）汇报：当前进度（已完成/进行中/受阻，附证据）、与原计划的偏差、评审结论；要求返回调整后的计划、风险处置、需用户决策事项。按新计划更新任务板与 todo 后继续。
@@ -158,7 +160,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 **任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）：
 
-    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"
+    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家      # ready -> running
     # 派工即回写（v2.6 auto-claim）：summon_expert/summon_experts 在派发入口（专家 run 前）自动对任务书显式引用的 T<数字>（≤8 个，超取前 8 并提示截断；命令引述与路径形态不解析）执行上述 claim（owner=被召唤专家名；owner 已有/非 ready/非唯一板跳过）——专家拿到任务书时条目已 running，无需手工重复认领；专家失败/召唤失败条目保持 running 不回滚，由编排者按板处置（reassign/fail/recover）；DSH_EXPERT_AUTOCLAIM=0 或空串整体关闭；认领/跳过/失败（taskboard 超时与板不可读分别提示）均以【auto-claim】提示行附在 summon 结果/错误尾部
@@ -170,6 +172,13 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     python3 <技能目录>/tools/taskboard.py recover               # 会话崩溃后恢复 running -> ready
     python3 <技能目录>/tools/taskboard.py boards                # 列出当前目录全部任务板（防遗留污染）
     python3 <技能目录>/tools/taskboard.py archive --board .expert-taskboards/<项目slug>.json  # 项目收口后归档（有未收口任务需 --force）
+
+门禁执法平面与验证回执（v2.6；hook 默认关闭，未显式 --install-hook 前任何命令不触碰 .git/hooks/）：
+    python3 <技能目录>/tools/taskboard.py --install-hook   # 向当前仓库 .git/hooks/commit-msg 安装零依赖三查 hook：①提交消息含任务 id T<数字> ②消息中全部任务 id 均在板内且 running（任一不满足即拒，防夹带）③提交文件落在各任务 scope 并集内（未声明 scope 跳过）；已有同名 hook 报错不覆盖（内容一致幂等；含本插件指纹标记行的旧版 hook 允许原地升级覆盖）；--board 可固化项目板路径进 hook
+    python3 <技能目录>/tools/taskboard.py --uninstall-hook # 仅移除本插件安装的 hook（凭稳定指纹标记行辨认，不认模板/全文哈希——模板演进不影响卸载；用户自有 hook 一律拒绝删除）
+    python3 <技能目录>/tools/taskboard.py verify T3 src/a.py docs/b.md  # 验证回执范围指纹：逐文件 SHA-256 整表 digest 存板；文件一变旧验证/旧评审自动失效
+    python3 <技能目录>/tools/taskboard.py verify T3        # 重算既有回执：输出 fresh/stale 及变更文件清单（show/done 亦自动重算，done 时 stale 告警不阻塞）
+  - hook 降级语义（fail-open，均 stderr 告警放行不阻塞提交）：门禁脚本缺失 / python3 不可用（hook 头部 command -v 检测，装回自动恢复）/ 任务板缺失（含 archive 归档把板移走——归档后 hook 不再阻塞提交，提示重新 --install-hook 或 --uninstall-hook）；板在而三查不过仍拒绝提交（fail closed），紧急单次 git commit --no-verify 并记录。
 
 并发正确性与失败语义（所有写命令均可选 `--expected-revision <N>`；不传新参数时行为与旧版完全一致）：
     python3 <技能目录>/tools/taskboard.py create "标题" --expected-revision 3   # CAS 乐观锁：写命令带 --expected-revision，与当前 revision 不符返回 {"error":"stale_revision",...} 并拒绝落盘；重读后携带最新 revision 重试

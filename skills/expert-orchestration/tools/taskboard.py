@@ -22,8 +22,23 @@
   查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（逐板标注损坏）外
     所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback。
   环检测：create --dep 与 set_dependencies 写入前做全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 且不落盘。
+门禁执法平面（v2.6，默认关闭，显式开启——未 --install-hook 前任何命令不触碰 .git/hooks/）：
+  --install-hook：向当前仓库 .git/hooks/commit-msg 写入零依赖 POSIX sh hook（内嵌 python3 调本工具 _hook-check 三查：
+    ① 提交消息须可解析出任务 id（形如 T<数字>）；② 消息中解析出的全部任务 id 均须在板内且状态 running（任一不满足即拒，
+    防夹带未核 id）；③ 各任务声明 scope 时的并集内提交文件均须落在关联域内）。已有同名 hook 时报错退出不覆盖
+    （内容完全一致视为已安装幂等返回；内容含本插件指纹标记行视为旧版本插件 hook，允许原地升级覆盖）；
+    --board 可把项目板路径固化进 hook。
+  --uninstall-hook：仅移除本插件安装的 hook——凭写入 hook 内的稳定指纹标记行辨认（标记行为固定注释前缀+协议版本，
+    不随模板内容演进变化，模板任何一改旧 hook 仍可用工具卸载；旧版哈希形态的标记行同样被认得），无标记行则拒绝
+    （不破坏用户自有 hook）。
+  降级语义（fail-open，均 stderr 告警放行、不阻塞提交，与门禁辅助定位一致——板/环境不可用时拒绝会永久卡死所有提交）：
+    ① hook 找不到门禁脚本（taskboard.py 被移动/卸载）；② python3 不可用（command -v 检测，hook 头部拦截，
+    装回 python3 后门禁自动恢复）；③ 任务板缺失（含 archive 归档把板移走后——归档收口属预期流程，hook 不再阻塞
+    提交，提示重新 --install-hook 或 --uninstall-hook）。脚本在、python3 在、板在而三查不过则拒绝提交（fail closed）。
+验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
+  verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
 """
-import argparse, collections, contextlib, datetime, glob, json, os, sys, time, uuid
+import argparse, collections, contextlib, datetime, glob, hashlib, json, os, re, subprocess, sys, time, uuid
 
 try:
     # POSIX 标准库；Windows 等无 fcntl 平台降级（见 board_lock）
@@ -240,10 +255,85 @@ def get_task(data, tid):
     return t
 
 
+# ── 验证回执范围指纹（v2.6）：逐文件 SHA-256 整表 hash 存板，文件一变回执即 stale ──
+TASK_ID_RE = re.compile(r'(?<![A-Za-z0-9_/.-])T(\d+)(?![0-9])')  # 独立 token 形态，排除路径片段（build/T3）与更长数字
+
+
+def parse_task_ids(text):
+    """从文本解析独立 token 形态的任务 id（去重保序）；路径形态与更长数字不解析。"""
+    seen, out = set(), []
+    for m in TASK_ID_RE.finditer(text):
+        tid = 'T' + (m.group(1).lstrip('0') or '0')
+        if tid not in seen:
+            seen.add(tid)
+            out.append(tid)
+    return out
+
+
+def _sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_digest(files):
+    """整表 digest：排序后逐行 'path  sha256' 再整体 SHA-256（与文件集合顺序无关，确定可复算）。"""
+    lines = ''.join(f'{p}  {h}\n' for p, h in sorted(files.items()))
+    return hashlib.sha256(lines.encode('utf-8')).hexdigest()
+
+
+def verify_status(t, cwd=None):
+    """重算验证回执：返回 (state, changed, missing)。state ∈ 'none'|'fresh'|'stale'。"""
+    rec = t.get('verify')
+    if not rec:
+        return 'none', [], []
+    cwd = cwd or os.getcwd()
+    cur, missing = {}, []
+    for p in rec.get('files', {}):
+        full = p if os.path.isabs(p) else os.path.join(cwd, p)
+        if os.path.isfile(full):
+            cur[p] = _sha256_file(full)
+        else:
+            missing.append(p)
+    changed = sorted(p for p, h in cur.items() if rec['files'].get(p) != h) + [f'{p}（缺失）' for p in missing]
+    state = 'fresh' if not changed else 'stale'
+    return state, changed, missing
+
+
+def cmd_verify(a, data, path):
+    """verify <id> <文件...>：记录验证回执指纹；verify <id>：重算并输出 fresh/stale。"""
+    t = get_task(data, a.id)
+    if a.files:
+        rels = []
+        for f in a.files:
+            full = f if os.path.isabs(f) else os.path.join(os.getcwd(), f)
+            if not os.path.isfile(full):
+                sys.exit(f'错误：文件不存在或不是普通文件：{f}')
+            rels.append(os.path.relpath(full, os.getcwd()))
+        files = {p: _sha256_file(p if os.path.isabs(p) else os.path.join(os.getcwd(), p)) for p in rels}
+        t['verify'] = {'files': files, 'digest': _verify_digest(files), 'time': now_ms()}
+        t['updated'] = now_ms()
+        save(path, data)
+        print(f"{a.id} 验证回执已记录（{len(files)} 文件，digest={t['verify']['digest'][:16]}）")
+        print(f"  状态: fresh")
+        return
+    if not t.get('verify'):
+        sys.exit(f'错误：{a.id} 没有验证回执；先用 verify {a.id} <文件...> 记录文件清单指纹')
+    state, changed, _ = verify_status(t)
+    print(f"{a.id} 验证回执: {state}")
+    if state == 'stale':
+        print(f'  文件已变更: {", ".join(changed)}')
+        print('  旧验证/旧评审自动失效；重新 verify 后再交付')
+
+
+
 def show(t):
     dep = (' dep=' + ','.join(t['dep'])) if t['dep'] else ''
     owner = (f" owner={t['owner']}") if t['owner'] else ''
-    print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}")
+    scope = (' scope=' + ','.join(t['scope'])) if t.get('scope') else ''
+    print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}{scope}")
 
 
 def cmd_create(a, data, path):
@@ -251,6 +341,7 @@ def cmd_create(a, data, path):
     for d in deps:
         if d not in data['tasks']:
             sys.exit(f"错误：依赖任务 {d} 不存在")
+    scope = [s.strip().rstrip('/') for s in (a.scope or '').split(',') if s.strip()]
     tid = f"T{data['seq'] + 1}"
     ensure_acyclic(data['tasks'], tid, deps)  # 全图环检测（写入前）
     data['seq'] += 1
@@ -259,6 +350,8 @@ def cmd_create(a, data, path):
         'desc': a.desc or '', 'status': 'pending', 'created': now_ms(),
         'updated': now_ms(), 'summary': '', 'fail': '',
     }
+    if scope:
+        data['tasks'][tid]['scope'] = scope
     promoted = refresh(data)
     save(path, data)
     show(data['tasks'][tid])
@@ -300,6 +393,12 @@ def cmd_show(a, data, _):
     exs = t.get('executors') or []
     if exs:
         print('  实际执行者: ' + ', '.join(f"{e['name']}[{e['time']}]" for e in exs))
+    if t.get('verify'):
+        state, changed, _ = verify_status(t)
+        n = len(t['verify'].get('files') or {})
+        print(f"  验证回执: {state}（{n} 文件，digest={t['verify']['digest'][:16]}）")
+        if state == 'stale':
+            print(f'    文件已变更（旧验证/评审失效）: {", ".join(changed)}')
     ok, why = deps_state(t, data['tasks'])
     if t['dep'] and not ok:
         print(f"  依赖未满足（{why}）")
@@ -346,6 +445,10 @@ def cmd_done(a, data, path):
     promoted = refresh(data)
     save(path, data)
     show(t)
+    if t.get('verify'):  # done/deliver 前重算：代码一变旧验证回执自动失效（告警不阻塞）
+        state, changed, _ = verify_status(t)
+        if state == 'stale':
+            print(f"警告：验证回执已 stale（文件已变更: {', '.join(changed)}）——旧验证/旧评审自动失效，建议重新 verify 后再交付")
     if a.by and a.by != t['owner']:
         print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
     elif not a.by and t['owner'] in ('', '编排者'):
@@ -494,6 +597,179 @@ def cmd_metrics(a, data, _):
 
 
 
+# ── 门禁执法平面（v2.6）：commit-msg hook 双平面执法，默认关闭、显式开启 ──────
+# hook 本体选型：POSIX sh 薄壳（无 bash/第三方依赖），校验逻辑内嵌 python3 调本工具
+# _hook-check——任务板解析/校验只此一处（与工具平面同一套裁决，taskboard.py 板格式
+# 演进时 hook 不需重装），比把板解析复制进 shell 更稳。降级：脚本缺失放行并告警。
+HOOK_TEMPLATE = '''#!/bin/sh
+# dsh-expert-orchestrator commit-msg 门禁 hook（由 taskboard.py --install-hook 安装，零依赖：POSIX sh + python3 + git）
+# {FPH}
+# 三查：① 提交消息须可解析出任务 id（形如 T<数字>）；② 消息中解析出的全部任务 id 均须在板内且状态 running；
+#       ③ 各任务 scope 的并集内，提交文件均须落在关联域内。
+# 解除：python3 "{TB}" --uninstall-hook（凭上方指纹标记行辨认本插件 hook，仅移除本插件安装的）
+# 降级（fail-open，均告警放行不阻塞提交）：门禁脚本缺失 / python3 不可用 / 任务板缺失（含 archive 归档后）；
+#       三查不过则拒绝提交（fail closed）。
+TB="{TB}"
+if [ ! -f "$TB" ]; then
+  echo "expert-orchestrator 门禁：脚本缺失（$TB 不存在），本次提交放行；请重装插件后重新 --install-hook，或 --uninstall-hook 移除本 hook" >&2
+  exit 0
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "expert-orchestrator 门禁：python3 不可用，本次提交放行（fail-open，门禁未执行）；安装 python3 后门禁自动恢复，或用 --uninstall-hook 移除本 hook" >&2
+  exit 0
+fi
+python3 "$TB"{BOARD_ARG} _hook-check "$1"
+status=$?
+if [ $status -ne 0 ]; then
+  echo "expert-orchestrator 门禁：提交被拒绝（原因见上方输出）；核对任务板状态/提交消息/文件范围，紧急情况可用 git commit --no-verify 跳过一次" >&2
+  exit 1
+fi
+exit 0
+'''
+# 指纹标记行协议版本：稳定字符串，不随模板内容演进变化——卸载/重装凭标记行前缀辨认本插件 hook，
+# 模板任何一改都不会把已装 hook 变成"无法用工具卸载"的死 hook（评审项 ①）。
+# 旧版（模板整体哈希形态）标记行同样以该前缀开头，天然被认得——即旧版兼容回退。
+_HOOK_PROTOCOL_VERSION = 'v1'
+_HOOK_INSTALL_MARK = '# dsh-expert-orchestrator hook fingerprint:'
+
+
+def _hook_content(board):
+    board_arg = f' --board "{os.path.abspath(board)}"' if board else ''
+    return HOOK_TEMPLATE.replace('{FPH}', _HOOK_INSTALL_MARK + ' ' + _HOOK_PROTOCOL_VERSION) \
+                        .replace('{TB}', os.path.abspath(__file__)) \
+                        .replace('{BOARD_ARG}', board_arg)
+
+
+def find_git_dir():
+    """从 cwd 向上找 .git（目录或 worktree 指针文件）；找不到则退出报错。"""
+    d = os.getcwd()
+    while True:
+        g = os.path.join(d, '.git')
+        if os.path.isdir(g):
+            return g
+        if os.path.isfile(g):
+            try:
+                first = open(g, encoding='utf-8').read().strip()
+            except Exception:
+                first = ''
+            if first.startswith('gitdir:'):
+                p = first[len('gitdir:'):].strip()
+                return p if os.path.isabs(p) else os.path.join(d, p)
+        parent = os.path.dirname(d)
+        if parent == d:
+            sys.exit('错误：当前目录不在 git 仓库内（未找到 .git）；--install-hook/--uninstall-hook 需在仓库内执行')
+        d = parent
+
+
+def cmd_install_hook(a):
+    """写入 .git/hooks/commit-msg：内容一致幂等返回；含本插件指纹标记行视为旧版插件 hook，允许原地升级覆盖；
+    无标记行的外部 hook 报错退出不覆盖。"""
+    target = os.path.join(find_git_dir(), 'hooks', 'commit-msg')
+    content = _hook_content(a.board)
+    if os.path.exists(target):
+        with open(target, encoding='utf-8', errors='replace') as f:
+            cur = f.read()
+        if cur == content:
+            print(f'expert-orchestrator 门禁 hook 已安装（{os.path.relpath(target)}），无需重复操作')
+            return
+        if _HOOK_INSTALL_MARK in cur:
+            # 本插件旧版模板安装的 hook：模板演进后原地升级（卸载/重装不因模板内容变化被锁死，评审项 ① 同源）
+            with open(target, 'w', encoding='utf-8') as f:
+                f.write(content)
+            os.chmod(target, 0o755)
+            print(f'expert-orchestrator 门禁 hook 已升级覆盖（{os.path.relpath(target)}，检测到本插件指纹标记行）')
+            return
+        sys.exit(f'错误：{os.path.relpath(target)} 已存在且非当前插件 hook（内容不一致），拒绝覆盖；'
+                 f'确认后先 --uninstall-hook（仅移除本插件安装的）或手工处理既有 hook')
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, 'w', encoding='utf-8') as f:
+        f.write(content)
+    os.chmod(target, 0o755)
+    print(f'expert-orchestrator 门禁 hook 已安装: {os.path.relpath(target)}')
+    print('  三查：提交消息含任务 id（T<数字>）｜消息中全部任务 id 在板内且 running｜提交文件落在各任务 scope 并集内（未声明 scope 跳过）')
+    print('  降级：门禁脚本缺失 / python3 不可用 / 任务板缺失（含 archive 后）均放行并告警；紧急情况 git commit --no-verify 可跳过一次')
+    if a.board:
+        print(f'  校验板已固化为: {os.path.abspath(a.board)}')
+
+
+def cmd_uninstall_hook(a):
+    """仅移除本插件安装的 hook：凭稳定指纹标记行辨认（不认全文/模板哈希，模板演进不影响卸载；
+    旧版哈希形态标记行同被认得），无标记行则拒绝（不破坏用户自有 hook）。"""
+    target = os.path.join(find_git_dir(), 'hooks', 'commit-msg')
+    if not os.path.exists(target):
+        print(f'未安装 expert-orchestrator 门禁 hook（{os.path.relpath(target)} 不存在）')
+        return
+    with open(target, encoding='utf-8', errors='replace') as f:
+        cur = f.read()
+    if _HOOK_INSTALL_MARK not in cur:
+        sys.exit(f'错误：{os.path.relpath(target)} 存在但非本插件安装（指纹不匹配：未找到本插件指纹标记行 {_HOOK_INSTALL_MARK}），拒绝删除')
+    os.remove(target)
+    print(f'已移除 expert-orchestrator 门禁 hook: {os.path.relpath(target)}')
+
+
+def _staged_files():
+    """commit-msg 时点暂存区文件清单（unborn HEAD 下 git diff --cached 与空树比较，实测可用）；
+    git 异常时返回 None（调用方跳过范围检查并注明，不误伤）。"""
+    try:
+        r = subprocess.run(['git', 'diff', '--cached', '--name-only', '-z'],
+                           capture_output=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return [s.decode('utf-8', 'replace') for s in r.stdout.split(b'\x00') if s]
+
+
+def _scope_match(fname, scope):
+    return any(fname == s or fname.startswith(s + '/') for s in scope)
+
+
+def cmd_hook_check(a, data, path):
+    """commit-msg hook 三查（cwd=仓库根，git 调用；exit 1 = 拒绝提交）。
+    降级（fail-open）：任务板缺失（含 archive 归档把板移走——归档收口属预期流程，hook 不再阻塞提交）
+    时 stderr 告警放行并提示 --install-hook/--uninstall-hook 逃生口；
+    板在而三查不过（含消息含夹带的假 id/非 running id）则 fail closed。"""
+    if not os.path.exists(path):
+        print(f'expert-orchestrator 门禁告警：任务板不存在（{path}），本次提交放行（fail-open）；'
+              f'板已 archive 归档或移走属预期，若仍需门禁请重新 --install-hook，不再需要请 --uninstall-hook 移除本 hook',
+              file=sys.stderr)
+        return
+    try:
+        with open(a.msgfile, 'rb') as f:
+            msg = f.read().decode('utf-8', 'replace')
+    except Exception as e:
+        sys.exit(f'expert-orchestrator 门禁拒绝：提交消息不可读（{e}）')
+    ids = parse_task_ids(msg)
+    if not ids:
+        sys.exit('expert-orchestrator 门禁拒绝：提交消息未解析出任务 id（形如 T<数字>）；'
+                 '在消息中注明任务 id（如 "feat: xxx T3"）')
+    # ② 全部任务 id 逐个核（防夹带）：消息解析出的每个 id 都须在板内且 running，任一不满足即拒
+    for tid in ids:
+        t = data['tasks'].get(tid)
+        if not t:
+            sys.exit(f'expert-orchestrator 门禁拒绝：任务 {tid} 不在任务板内（板: {os.path.relpath(path)}）')
+        if t['status'] != 'running':
+            sys.exit(f'expert-orchestrator 门禁拒绝：任务 {tid} 状态为 {t["status"]}，门禁要求 running（先 claim 再提交）')
+    # ③ scope 取全部引用任务 scope 的并集：多任务同 commit 时文件命中任一任务的 scope 即可
+    scopes = []
+    for tid in ids:
+        for s in (data['tasks'][tid].get('scope') or []):
+            if s not in scopes:
+                scopes.append(s)
+    if scopes:
+        files = _staged_files()
+        if files is None:
+            print('expert-orchestrator 门禁提示：无法获取暂存区文件清单，本次跳过 scope 范围检查')
+        else:
+            bad = [f for f in files if not _scope_match(f, scopes)]
+            if bad:
+                sys.exit(f'expert-orchestrator 门禁拒绝：{len(bad)} 个提交文件超出任务 {",".join(ids)} scope '
+                         f'（并集: {", ".join(scopes)}）: {", ".join(sorted(bad)[:5])}')
+            print(f'expert-orchestrator 门禁通过: {",".join(ids)} running，{len(files)} 个文件均在 scope 并集内')
+            return
+    print(f'expert-orchestrator 门禁通过: {",".join(ids)} running' + ('' if scopes else '（任务未声明 scope，跳过范围检查）'))
+
+
 def default_board():
     """无 --board 时：遗留 .expert-taskboard.json 优先，否则用 .expert-taskboards/default.json。"""
     legacy = os.path.join(os.getcwd(), '.expert-taskboard.json')
@@ -545,8 +821,12 @@ def cmd_archive(a, data, path):
 
 def main():
     ap = argparse.ArgumentParser(description='expert-orchestrator 任务板')
-    ap.add_argument('--board', help='状态文件路径，默认 <cwd>/.expert-taskboard.json')
-    sub = ap.add_subparsers(dest='cmd', required=True)
+    ap.add_argument('--board', help='状态文件路径，默认 <cwd>/.expert-taskboard.json；--install-hook 时可固化项目板进 hook')
+    ap.add_argument('--install-hook', action='store_true',
+                    help='门禁执法平面（默认关闭）：向当前仓库 .git/hooks/commit-msg 安装零依赖三查 hook；已有同名 hook 报错不覆盖')
+    ap.add_argument('--uninstall-hook', action='store_true',
+                    help='仅移除本插件安装的 commit-msg hook（凭稳定指纹标记行辨认，不破坏用户自有 hook）')
+    sub = ap.add_subparsers(dest='cmd')
 
     def add_write_args(p):
         p.add_argument('--expected-revision', type=int, default=None,
@@ -561,6 +841,7 @@ def main():
     p.add_argument('--owner')
     p.add_argument('--dep', help='逗号分隔的依赖任务ID')
     p.add_argument('--desc', help='完成标准')
+    p.add_argument('--scope', help='关联域（逗号分隔路径前缀，如 src,docs）；hook 第三查与验证回执的依据')
     add_write_args(p)
     p.set_defaults(fn=cmd_create)
 
@@ -581,8 +862,21 @@ def main():
     p = sub.add_parser('archive'); p.add_argument('--force', action='store_true'); p.set_defaults(fn=cmd_archive)
     p = sub.add_parser('reassign'); p.add_argument('id'); p.add_argument('attempt_id', help='新派工代际 attempt_id（编排者生成）'); p.add_argument('--owner'); add_write_args(p); p.set_defaults(fn=cmd_reassign)
     p = sub.add_parser('set_dependencies'); p.add_argument('id'); p.add_argument('--dep', required=True, help='逗号分隔的依赖任务ID（整体替换）'); add_write_args(p); p.set_defaults(fn=cmd_set_dependencies)
+    p = sub.add_parser('verify'); p.add_argument('id'); p.add_argument('files', nargs='*', help='文件范围清单；缺省=重算既有回执输出 fresh/stale'); add_write_args(p); p.set_defaults(fn=cmd_verify)
+    p = sub.add_parser('_hook-check', help=argparse.SUPPRESS)  # commit-msg hook 内部入口，非用户命令
+    p.add_argument('msgfile'); p.set_defaults(fn=cmd_hook_check)
 
     a = ap.parse_args()
+    if (a.install_hook or a.uninstall_hook) and a.cmd:
+        ap.error('--install-hook/--uninstall-hook 不与任务板子命令同时使用')
+    if a.install_hook:
+        cmd_install_hook(a)
+        return
+    if a.uninstall_hook:
+        cmd_uninstall_hook(a)
+        return
+    if not a.cmd:
+        ap.error('the following arguments are required: cmd（或 --install-hook / --uninstall-hook）')
     try:
         if a.cmd == 'boards':
             a.fn(a)
@@ -592,7 +886,7 @@ def main():
             data = load(path)
             check_revision(a, data)  # 写命令的 CAS 校验，锁内针对最新落盘状态（读命令无该参数，透传为不校验）
             a.fn(a, data, path)
-            if a.cmd != 'archive':
+            if a.cmd not in ('archive', '_hook-check'):
                 print(f"revision={data.get('revision', 0)}")
     except BoardError as e:
         payload = {'error': e.code}

@@ -6,7 +6,7 @@
 // 仓库内任何数据。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawnSync, spawn } from 'node:child_process'
@@ -661,7 +661,7 @@ test('WP-1 (d) 环检测：set_dependencies 构造 A→B→C→A 被拒且不落
 // (e) 全程无第三方 import：taskboard.py 仅标准库
 test('WP-1 (e) taskboard.py 零第三方 import（import 语句逐一落进标准库白名单）', () => {
   const src = readFileSync(TASKBOARD, 'utf-8')
-  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'datetime', 'fcntl', 'glob', 'json', 'os', 'sys', 'time', 'uuid'])
+  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'datetime', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid'])
   const found = []
   for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
     for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
@@ -1467,4 +1467,302 @@ test('WP-4a (i) 回炉🟡2：任务 id 超过 8 个取前 8 并在提示中说�
   const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
   assert.equal(board.tasks.T1.status, 'running') // 前 8 个中在板者正常认领
   assert.equal(board.tasks.T1.owner, '测试专家')
+})
+
+// ── WP-3 门禁执法平面（v2.6）：commit-msg hook 双平面 + 验证回执范围指纹 (a)–(d) ──
+import { existsSync } from 'node:fs'
+const HOOK_REL = join('.git', 'hooks', 'commit-msg')
+const gitAvailable = spawnSync('git', ['--version']).status === 0
+
+/** 建临时 git 仓库（用户/邮箱已配置），返回 { dir, git }；git 用例结束后随临时目录清理。 */
+const makeGitRepo = (t, label) => {
+  const dir = makeBoardDir(t, label)
+  const git = (args) => {
+    const r = spawnSync('git', args, { cwd: dir, encoding: 'utf-8' })
+    assert.equal(r.status, 0, `git ${args.join(' ')} 失败: ${r.stderr}`)
+    return r
+  }
+  git(['init', '-q'])
+  git(['config', 'user.email', 'test@example.com'])
+  git(['config', 'user.name', 'tester'])
+  return { dir, git }
+}
+
+/** 直接运行 commit（不走 runTb），返回 { code, output }（stdout+stderr 合并，方便断言 hook 文案）。 */
+const runCommit = (cwd, msg) => {
+  const r = spawnSync('git', ['commit', '-m', msg], { cwd, encoding: 'utf-8' })
+  return { code: r.status, output: (r.stdout ?? '') + (r.stderr ?? '') }
+}
+
+// (a) 未显式 --install-hook 前任何命令不触碰 .git/hooks/
+test('WP-3 (a) 未开启零触碰：git 仓库内跑全套 taskboard 命令，.git/hooks/ 不产生 commit-msg', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir } = makeGitRepo(t, 'nohook')
+  for (const args of [
+    ['create', '任务A', '--scope', 'src'], ['list'], ['status'], ['boards'],
+    ['claim', 'T1', '甲'], ['verify', 'T1'], ['show', 'T1'], ['done', 'T1', '完成'], ['metrics'],
+  ]) {
+    runTb(dir, args) // 各命令成败与否不属本断言，只关心 hooks 目录零触碰
+  }
+  assert.equal(existsSync(join(dir, HOOK_REL)), false)
+  assert.equal(existsSync(join(dir, '.git', 'hooks', 'pre-commit')), false)
+})
+
+// (b) 显式开启后：绕过 taskboard 直接 commit 非法消息被拒、合法消息+running 任务放行
+test('WP-3 (b) hook 拦截实测：非法消息/任务非 running/scope 越界被拒，合法消息+running 放行', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir, git } = makeGitRepo(t, 'hook')
+  assert.equal(runTb(dir, ['create', '任务A', '--scope', 'src']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲']).code, 0)
+  assert.equal(runTb(dir, ['--install-hook']).code, 0)
+  assert.equal(existsSync(join(dir, HOOK_REL)), true)
+  mkdirSync(join(dir, 'src'), { recursive: true })
+  writeFileSync(join(dir, 'src', 'a.py'), 'x = 1\n')
+  git(['add', 'src/a.py'])
+  // ① 非法消息（无任务 id）→ 拒绝，HEAD 未产生
+  const bad = runCommit(dir, 'bad message without task id')
+  assert.notEqual(bad.code, 0)
+  assert.ok(bad.output.includes('门禁拒绝'), bad.output)
+  assert.ok(spawnSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: dir }).status !== 0)
+  // ② 合法消息 + running 任务 → 放行
+  const ok = runCommit(dir, 'feat: x T1')
+  assert.equal(ok.code, 0, ok.output)
+  assert.equal(spawnSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: dir }).status, 0)
+  // ③ scope 越界（out.txt 不在 src 关联域）→ 拒绝
+  writeFileSync(join(dir, 'out.txt'), 'y\n')
+  git(['add', 'out.txt'])
+  const scopeBad = runCommit(dir, 'feat: y T1')
+  assert.notEqual(scopeBad.code, 0)
+  assert.ok(scopeBad.output.includes('scope'), scopeBad.output)
+  // ④ 任务非 running（已 done）→ 拒绝
+  assert.equal(runTb(dir, ['done', 'T1', '完成']).code, 0)
+  writeFileSync(join(dir, 'src', 'a.py'), 'x = 2\n')
+  git(['add', 'src/a.py'])
+  const notRunning = runCommit(dir, 'feat: z T1')
+  assert.notEqual(notRunning.code, 0)
+  assert.ok(notRunning.output.includes('running'), notRunning.output)
+})
+
+// hook 安装器语义：幂等重装、--board 固化、外部 hook 不覆盖、uninstall 仅删本插件指纹
+test('WP-3 hook 安装器语义：幂等/--board 固化/外部 hook 拒覆盖/uninstall 指纹匹配才删', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir } = makeGitRepo(t, 'hookmgmt')
+  const boardPath = join(dir, '.expert-taskboards', 'project.json')
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  const r1 = runTb(dir, ['--install-hook', '--board', boardPath])
+  assert.equal(r1.code, 0)
+  const installed = readFileSync(join(dir, HOOK_REL), 'utf-8')
+  // 幂等：内容一致再装 → 仍成功且逐字节未变
+  assert.equal(runTb(dir, ['--install-hook', '--board', boardPath]).code, 0)
+  assert.equal(readFileSync(join(dir, HOOK_REL), 'utf-8'), installed)
+  // --board 固化进 hook
+  assert.ok(installed.includes(boardPath), installed)
+  // 卸载：本插件指纹匹配才删
+  assert.equal(runTb(dir, ['--uninstall-hook']).code, 0)
+  assert.equal(existsSync(join(dir, HOOK_REL)), false)
+  // 外部 hook：装不覆盖、卸不删除
+  writeFileSync(join(dir, HOOK_REL), '#!/bin/sh\necho custom hook\n')
+  const foreignInstall = runTb(dir, ['--install-hook'])
+  assert.equal(foreignInstall.code, 1)
+  assert.ok(foreignInstall.stderr.includes('拒绝覆盖'), foreignInstall.stderr)
+  const foreignUninstall = runTb(dir, ['--uninstall-hook'])
+  assert.equal(foreignUninstall.code, 1)
+  assert.ok(foreignUninstall.stderr.includes('指纹不匹配'), foreignUninstall.stderr)
+  assert.equal(readFileSync(join(dir, HOOK_REL), 'utf-8'), '#!/bin/sh\necho custom hook\n')
+})
+
+// (c) 验证回执范围指纹：记录 fresh → 篡改任一文件再查询 → stale
+test('WP-3 (c) 指纹 stale 实测：verify/show/done 重算，篡改/缺失均判 stale（旧验证自动失效）', (t) => {
+  const dir = makeBoardDir(t, 'verify')
+  assert.equal(runTb(dir, ['create', '任务A']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲']).code, 0)
+  writeFileSync(join(dir, 'a.py'), 'v1\n')
+  let r = runTb(dir, ['verify', 'T1', 'a.py'])
+  assert.equal(r.code, 0)
+  assert.ok(r.stdout.includes('验证回执已记录') && r.stdout.includes('fresh'), r.stdout)
+  r = runTb(dir, ['verify', 'T1'])
+  assert.ok(r.stdout.includes('fresh'), r.stdout)
+  // 篡改 → verify/show 均 stale
+  writeFileSync(join(dir, 'a.py'), 'v2\n')
+  r = runTb(dir, ['verify', 'T1'])
+  assert.ok(r.stdout.includes('stale') && r.stdout.includes('a.py'), r.stdout)
+  r = runTb(dir, ['show', 'T1'])
+  assert.ok(r.stdout.includes('验证回执: stale'), r.stdout)
+  // done 前重算：stale 告警不阻塞
+  r = runTb(dir, ['done', 'T1', '完成'])
+  assert.equal(r.code, 0)
+  assert.ok(r.stdout.includes('警告') && r.stdout.includes('stale'), r.stdout)
+  // 缺失文件同样 stale
+  assert.equal(runTb(dir, ['create', '任务B']).code, 0)
+  writeFileSync(join(dir, 'b.py'), 'x\n')
+  assert.equal(runTb(dir, ['verify', 'T2', 'b.py']).code, 0)
+  rmSync(join(dir, 'b.py'))
+  r = runTb(dir, ['verify', 'T2'])
+  assert.ok(r.stdout.includes('stale') && r.stdout.includes('缺失'), r.stdout)
+  // 无回执时 verify 仅重算会显式报错（不静默 fresh）
+  assert.equal(runTb(dir, ['create', '任务C']).code, 0)
+  r = runTb(dir, ['verify', 'T3'])
+  assert.equal(r.code, 1)
+  assert.ok(r.stderr.includes('没有验证回执'), r.stderr)
+})
+
+// (d) hook 脚本零依赖静态断言：POSIX sh 薄壳 + python3 调 taskboard.py，无第三方运行时
+test('WP-3 (d) hook 脚本零依赖静态断言：#!/bin/sh 薄壳、仅 python3 调本工具、无第三方运行时', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir } = makeGitRepo(t, 'hookdeps')
+  assert.equal(runTb(dir, ['--install-hook']).code, 0)
+  const hook = readFileSync(join(dir, HOOK_REL), 'utf-8')
+  const lines = hook.split('\n')
+  assert.equal(lines[0], '#!/bin/sh') // POSIX sh，非 bash/zsh
+  assert.ok(hook.includes('# dsh-expert-orchestrator hook fingerprint:')) // 卸载辨认指纹
+  assert.ok(hook.includes('_hook-check "$1"')) // 校验逻辑在 taskboard.py（零第三方由 WP-1 (e) 断言）
+  assert.ok(hook.includes('python3 "$TB"'))
+  // 无第三方运行时/下载器/包管理器痕迹
+  for (const banned of ['/bin/bash', 'node ', 'npm ', 'npx ', 'pip ', 'curl ', 'wget ', 'perl ', 'ruby ', 'require(']) {
+    assert.ok(!hook.includes(banned), `hook 不应包含 ${banned}`)
+  }
+  // 命令面收口：去掉注释/空行后的可执行行，命令词只能来自 sh 内建 + python3
+  const cmds = new Set()
+  for (const raw of lines.slice(1)) {
+    const line = raw.replace(/#.*$/, '').trim()
+    if (!line || /^(TB=|status=|fi$)/.test(line)) continue
+    const w = line.split(/\s+/)[0].replace(/[;]$/, '')
+    if (w && w !== 'then') cmds.add(w)
+  }
+  for (const c of cmds) {
+    assert.ok(['if', '[', 'echo', 'exit', 'python3'].includes(c), `hook 命令词越界: ${c}`)
+  }
+})
+
+// ── WP-3 回炉第 1 轮（评审 5 条 🟡）：① 卸载指纹稳定标记行 ② 板缺失 fail-open
+// ③ python3 缺失 fail-open ④ 全部任务 id 逐核。既有用例零删改，以下为新增。 ──
+
+// ① 卸载指纹：凭写入 hook 内的稳定标记行辨认（不再认模板整体哈希）——未来模板任何一改，
+// 旧 hook 仍可用工具卸载/升级；旧版哈希形态标记行同被认得（兼容回退）；无标记行外部 hook 仍拒绝。
+test('WP-3 回炉① 卸载指纹稳定标记行：模板演进/内容追加不锁死卸载，旧版哈希形态兼容，install 可原地升级，外部 hook 仍拒删', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir } = makeGitRepo(t, 'hookmark')
+  const MARK = '# dsh-expert-orchestrator hook fingerprint:'
+  // 模拟「旧版模板安装的 hook」：标记行 + 旧版哈希 token + 旧正文（当前模板已演进，内容与新模板不一致）
+  const legacyHook = [
+    '#!/bin/sh',
+    '# dsh-expert-orchestrator commit-msg 门禁 hook（旧版模板安装）',
+    MARK + ' 0123456789abcdef0123456789abcdef', // 旧版：模板整体哈希形态
+    'TB="/old/path/taskboard.py"',
+    'python3 "$TB" _hook-check "$1"',
+    '',
+  ].join('\n')
+  writeFileSync(join(dir, HOOK_REL), legacyHook)
+  // 旧版插件 hook（内容与新模板不一致）不再被当外部 hook 拒绝覆盖 → 原地升级
+  const up = runTb(dir, ['--install-hook'])
+  assert.equal(up.code, 0, up.stderr)
+  assert.ok(up.stdout.includes('升级覆盖'), up.stdout)
+  const upgraded = readFileSync(join(dir, HOOK_REL), 'utf-8')
+  assert.ok(upgraded.includes(MARK), upgraded) // 稳定标记行仍在
+  // 模板未来演进模拟：标记行版本 token 变化 + 用户追加注释（全文与任何模板都不一致）→ 卸载仍凭标记行认得
+  writeFileSync(join(dir, HOOK_REL), upgraded.replace('hook fingerprint: v1', 'hook fingerprint: v2-future') + '# user tweak\n')
+  assert.equal(runTb(dir, ['--uninstall-hook']).code, 0)
+  assert.equal(existsSync(join(dir, HOOK_REL)), false)
+  // 无标记行的用户自有 hook 仍拒绝删除（既有红线不回退）
+  writeFileSync(join(dir, HOOK_REL), '#!/bin/sh\necho custom\n')
+  const fu = runTb(dir, ['--uninstall-hook'])
+  assert.equal(fu.code, 1)
+  assert.ok(fu.stderr.includes('指纹不匹配'), fu.stderr)
+  assert.equal(readFileSync(join(dir, HOOK_REL), 'utf-8'), '#!/bin/sh\necho custom\n')
+})
+
+// ② 板缺失 fail-open：archive 归档把板移走后 hook 三查不再阻塞提交（stderr 告警 + --install-hook/--uninstall-hook 逃生口）；
+// 板缺失时校验平面整体不可用，连无任务 id 消息也一并放行（非逐条放行）；板在时三查照旧 fail closed。
+test('WP-3 回炉② 板缺失 fail-open：archive 归档后 hook 告警放行并给逃生口；板缺失对无 id 消息同样放行', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir, git } = makeGitRepo(t, 'hookarchive')
+  assert.equal(runTb(dir, ['create', '任务A', '--scope', 'src']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲']).code, 0)
+  assert.equal(runTb(dir, ['--install-hook']).code, 0)
+  mkdirSync(join(dir, 'src'), { recursive: true })
+  writeFileSync(join(dir, 'src', 'a.py'), 'x\n')
+  git(['add', 'src/a.py'])
+  assert.equal(runCommit(dir, 'feat: a T1').code, 0) // 板在：照常放行
+  // 项目收口 archive：板被移走（本工具行为，hook 必然面对板缺失现场）
+  assert.equal(runTb(dir, ['done', 'T1', '完成']).code, 0)
+  assert.equal(runTb(dir, ['archive']).code, 0)
+  assert.equal(existsSync(join(dir, BOARD_REL)), false)
+  writeFileSync(join(dir, 'src', 'a.py'), 'y\n')
+  git(['add', 'src/a.py'])
+  const r = runCommit(dir, 'feat: b T1')
+  assert.equal(r.code, 0, r.output) // fail-open：不再永久卡死提交
+  assert.ok(r.output.includes('门禁告警'), r.output)
+  assert.ok(r.output.includes('放行'), r.output)
+  assert.ok(r.output.includes('--uninstall-hook') && r.output.includes('--install-hook'), r.output) // 逃生口
+  // 板缺失时连「无任务 id」消息也放行（板在时这是拒绝项——对照既有 WP-3 (b) ①）
+  writeFileSync(join(dir, 'src', 'a.py'), 'z\n')
+  git(['add', 'src/a.py'])
+  const noId = runCommit(dir, 'no task id at all')
+  assert.equal(noId.code, 0, noId.output)
+  assert.ok(noId.output.includes('门禁告警'), noId.output)
+})
+
+// ③ python3 缺失 fail-open：hook 头部 command -v python3 检测，缺失则 stderr 告警并放行（与②同方向）；
+// 装回 python3 后门禁自动恢复（直跑 hook 即可观测，不经 taskboard.py）。
+test('WP-3 回炉③ python3 缺失 fail-open：hook 头部拦截告警放行；端到端 git commit 在无 python3 PATH 下照常成功', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir, git } = makeGitRepo(t, 'hooknopy')
+  assert.equal(runTb(dir, ['create', '任务A', '--scope', 'src']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲']).code, 0)
+  assert.equal(runTb(dir, ['--install-hook']).code, 0)
+  const msgFile = join(dir, 'commit-msg.txt')
+  writeFileSync(msgFile, 'feat: x T1\n')
+  // 直跑 hook：PATH 指向空目录（无 python3），hook 仅用 sh 内建 + python3，command -v 检测生效
+  const emptyPath = mkdtempSync(join(tmpdir(), 'wp3-nopy-empty-'))
+  t.after(() => rmSync(emptyPath, { recursive: true, force: true }))
+  const direct = spawnSync(join(dir, HOOK_REL), [msgFile], { cwd: dir, encoding: 'utf-8', env: { PATH: emptyPath } })
+  assert.equal(direct.status, 0, `status=${direct.status} stderr=${direct.stderr}`)
+  assert.ok((direct.stderr ?? '').includes('python3 不可用'), direct.stderr)
+  assert.ok((direct.stderr ?? '').includes('放行'), direct.stderr)
+  assert.ok(!(direct.stderr ?? '').includes('门禁拒绝'), direct.stderr)
+  // 端到端：PATH 只有 git（无 python3）时 git commit 照常成功，告警可见
+  const shimDir = mkdtempSync(join(tmpdir(), 'wp3-nopy-shim-'))
+  t.after(() => rmSync(shimDir, { recursive: true, force: true }))
+  const gitBin = execFileSync('sh', ['-c', 'command -v git']).toString().trim()
+  symlinkSync(gitBin, join(shimDir, 'git'))
+  mkdirSync(join(dir, 'src'), { recursive: true })
+  writeFileSync(join(dir, 'src', 'a.py'), 'x\n')
+  git(['add', 'src/a.py'])
+  const e2e = spawnSync('git', ['commit', '-m', 'feat: x T1'], { cwd: dir, encoding: 'utf-8', env: { ...process.env, PATH: shimDir } })
+  assert.equal(e2e.status, 0, `status=${e2e.status} out=${e2e.stdout} err=${e2e.stderr}`)
+  const output = (e2e.stdout ?? '') + (e2e.stderr ?? '')
+  assert.ok(output.includes('python3 不可用'), output)
+})
+
+// ④ 全部任务 id 逐核：消息解析出的每个 id 都须在板内且 running，任一不满足即拒（防「T1 T999」夹带未核 id）；
+// 多任务同 commit 的 scope 取各任务 scope 并集（文件命中任一关联域即可）。
+test('WP-3 回炉④ 全部任务 id 逐核：夹带假 id/非 running id 拒绝并点名；多任务 scope 并集放行；单 id 行为不变', (t) => {
+  if (!gitAvailable) return t.skip('git 不可用')
+  const { dir, git } = makeGitRepo(t, 'hookallids')
+  assert.equal(runTb(dir, ['create', '任务A', '--scope', 'src']).code, 0) // T1
+  assert.equal(runTb(dir, ['create', '任务B', '--scope', 'docs']).code, 0) // T2
+  assert.equal(runTb(dir, ['claim', 'T1', '甲']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T2', '乙']).code, 0)
+  assert.equal(runTb(dir, ['--install-hook']).code, 0)
+  mkdirSync(join(dir, 'src'), { recursive: true })
+  writeFileSync(join(dir, 'src', 'a.py'), 'x\n')
+  git(['add', 'src/a.py'])
+  // 夹带假 id：T999 不在板 → 拒绝并点名 T999（T1 本身 running 也不放行）
+  const fake = runCommit(dir, 'feat: x T1 T999')
+  assert.notEqual(fake.code, 0)
+  assert.ok(fake.output.includes('T999') && fake.output.includes('不在任务板内'), fake.output)
+  // 多任务全部 running：放行，scope 取并集（src ∪ docs，src 文件命中 T1 关联域即可）
+  const multi = runCommit(dir, 'feat: x T1 T2')
+  assert.equal(multi.code, 0, multi.output)
+  assert.ok(multi.output.includes('T1,T2 running') && multi.output.includes('scope 并集'), multi.output)
+  // 夹带非 running id：T2 done 后同消息被拒并点名 T2
+  assert.equal(runTb(dir, ['done', 'T2', '完成']).code, 0)
+  writeFileSync(join(dir, 'src', 'a.py'), 'y\n')
+  git(['add', 'src/a.py'])
+  const notRunning = runCommit(dir, 'feat: x T1 T2')
+  assert.notEqual(notRunning.code, 0)
+  assert.ok(notRunning.output.includes('T2') && notRunning.output.includes('running'), notRunning.output)
+  // 单 id 行为不变（既有 WP-3 (b) 语义回归）
+  const single = runCommit(dir, 'feat: y T1')
+  assert.equal(single.code, 0, single.output)
 })

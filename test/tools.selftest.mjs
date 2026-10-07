@@ -6,12 +6,13 @@
 // 仓库内任何数据。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { spawnSync, spawn } from 'node:child_process'
+import { execFileSync, spawnSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
+  autoClaimSummonedTasks,
   EXPERT_TOOLS_DENY_LIST,
   expertLessonSlug,
   extractPersonaMethod,
@@ -19,7 +20,9 @@ import {
   loadAliases,
   loadExpertLessons,
   loadRoster,
+  locateAutoClaimBoard,
   neutralizePromptTemplates,
+  parseTaskIds,
   registerExpertTools,
   resolveExpert,
   rosterCandidates,
@@ -1158,4 +1161,310 @@ bus.main()
   assert.equal(bareWrites.length, 1, JSON.stringify(bareWrites))
   assert.ok(bareWrites[0].includes('tmp'), '唯一 open(w) 应是 write_json_atomic 写唯一 tmp')
   assert.ok(!/write_bytes|\.write\(/.test(src), 'bus.py 不得出现 write_bytes 或流式 .write( 落盘')
+})
+
+// ── WP-4a 派工即回写（auto-claim）：派发入口先 claim、后跑专家（回炉第 1 轮）──
+// 单元：parseTaskIds（显式 token + 命令引述/路径形态排除 + 8 上限，宁漏勿错）
+// / locateAutoClaimBoard（唯一板）。
+// 集成：registerExpertTools + mock provider + 真实 taskboard.py 子进程，覆盖
+// (a) 委派成功→自动 running+owner，且时序可观测：provider start 时板已 running
+// （含 owner 已有不覆盖、done 跳过、不存在 id 提示）
+// (b) 无板/板损坏 fail-open (c) DSH_EXPERT_AUTOCLAIM='0'/'' 关闭 (d) 无可解
+// 析 id 零副作用 (e) summon_experts 批量同一 id 只回写一次
+// (f) 专家失败不回滚：条目保持 running，提示附错误尾部
+// (g) claim 失败 fail-open：summon 继续、专家结果返回
+// (h) taskboard 超时提示与「板不可读」区分
+// (i) 任务 id 超过 8 个取前 8 并提示截断。
+test('WP-4a parseTaskIds: 显式 T<数字> token 提取（宁漏勿错，去重保序）', () => {
+  assert.deepEqual(parseTaskIds('完成任务 T7 并顺带核对 T3'), ['T7', 'T3'])
+  assert.deepEqual(parseTaskIds('任务T7已经提到过 T7'), ['T7']) // 中文紧邻可解析 + 去重
+  assert.deepEqual(parseTaskIds('AT7 T7x T77a v2.6 attempt A1 WP-4a'), []) // 非显式片段不解析
+  assert.deepEqual(parseTaskIds('T1.owner 与 T12、T2049'), ['T1', 'T12', 'T2049'])
+  assert.deepEqual(parseTaskIds('下划线紧邻 T7_ 与 T_7 都不算'), [])
+  assert.deepEqual(parseTaskIds(''), [])
+  assert.deepEqual(parseTaskIds(undefined), [])
+})
+
+test('WP-4a parseTaskIds 回炉加固：命令引述/路径形态排除 + 8 个上限截断', () => {
+  // 命令引述形态（taskboard 命令动词 + T<数字>）不解析
+  assert.deepEqual(parseTaskIds('先执行 claim T5 再 show T3'), [])
+  assert.deepEqual(parseTaskIds('完成后 progress T7，并用 deps T2 查看'), [])
+  assert.deepEqual(parseTaskIds('done T4 之后收口'), [])
+  // 同句混合：命令引述排除，真正的派工目标保留
+  assert.deepEqual(parseTaskIds('claim T5，但真正要做的是 T6'), ['T6'])
+  // 路径形态（T<数字> 前邻 / . -）不解析
+  assert.deepEqual(parseTaskIds('参见 build/T3-report.md 与 /a/b/T4-x.md 的说明'), [])
+  assert.deepEqual(parseTaskIds('处理 T9（见 foo-T5 附件）'), ['T9'])
+  // 原有语义不受加固影响
+  assert.deepEqual(parseTaskIds('任务T7 正常引用'), ['T7'])
+  // 上限 8：超出取前 8（宁漏勿错，截断说明由 autoClaimSummonedTasks 提示）
+  const many = Array.from({ length: 12 }, (_, i) => `T${i + 1}`).join('、')
+  assert.deepEqual(parseTaskIds(many), ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'])
+})
+
+test('WP-4a locateAutoClaimBoard: 唯一板命中；0 个/多个/目录异常跳过并说明', (t) => {
+  const dir = makeBoardDir(t, 'locate')
+  assert.equal(locateAutoClaimBoard(dir).ok, false) // 目录不存在 → 0 个
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  assert.equal(locateAutoClaimBoard(dir).ok, false) // 目录存在但无板
+  writeFileSync(join(dir, '.expert-taskboards', 'default.json'), '{"tasks":{},"seq":0}')
+  const r2 = locateAutoClaimBoard(dir)
+  assert.equal(r2.ok, true)
+  assert.equal(r2.board, join(dir, '.expert-taskboards', 'default.json'))
+  writeFileSync(join(dir, '.expert-taskboards', 'other.json'), '{}')
+  const r3 = locateAutoClaimBoard(dir)
+  assert.equal(r3.ok, false)
+  assert.ok(r3.reason.includes('default.json') && r3.reason.includes('other.json'), r3.reason)
+})
+
+/** WP-4a 集成夹具：dst（最小花名册）+ summon ctx（mock provider）。
+ *  可选 boardDir：provider start 触发时读取板文件记录 T1 状态（时序可观测断言
+ *  ——「专家 run 开始前板已 running」）；可选 stopReason/text 定制专家结果。 */
+const makeWp4aDst = (t, label) => {
+  const dst = mkdtempSync(join(tmpdir(), `wp4a-dst-${label}-`))
+  t.after(() => rmSync(dst, { recursive: true, force: true }))
+  mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({ core: [{ source: 'bundled-core', file: 'a.md', name: '测试专家' }] }))
+  return dst
+}
+const makeWp4aCtx = ({ boardDir, stopReason = 'completed', text = 'ok' } = {}) => {
+  const descriptors = []
+  const boardStatusAtStart = [] // 每次 provider start 时 T1 的板内状态快照
+  return {
+    descriptors,
+    boardStatusAtStart,
+    ctx: {
+      tools: { register: (d) => descriptors.push(d) },
+      subagents: {
+        getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+        start: async () => {
+          if (boardDir) {
+            try {
+              const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+              boardStatusAtStart.push(board.tasks.T1?.status ?? null)
+            } catch {
+              boardStatusAtStart.push('unreadable')
+            }
+          }
+          return { result: Promise.resolve({ stopReason, output: [{ type: 'text', text }] }), dispose: async () => {} }
+        },
+      },
+    },
+  }
+}
+
+test('WP-4a (a) 委派成功→任务板自动 running+owner；owner 已有不覆盖；done 跳过；不存在 id 只提示', async (t) => {
+  const dst = makeWp4aDst(t, 'claim')
+  const boardDir = makeBoardDir(t, 'claim')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready（无 owner）
+  assert.equal(runTb(boardDir, ['create', '任务B', '--owner', '前任']).code, 0) // T2 ready + owner 已有
+  assert.equal(runTb(boardDir, ['create', '任务C']).code, 0) // T3 ready
+  assert.equal(runTb(boardDir, ['claim', 'T3', '某人']).code, 0) // T3 → running
+  assert.equal(runTb(boardDir, ['done', 'T3', '已完成']).code, 0) // T3 → done
+  const { descriptors, ctx, boardStatusAtStart } = makeWp4aCtx({ boardDir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // ① 委派成功 → T1 自动 running + owner=测试专家（不手工写板）；T99 不在板 → 只提示不阻塞
+  const r = await summon.execute({ expert: '测试专家', task: '请处理 T1 与 T99' }, { agent: {} })
+  assert.ok(r.answer.startsWith('ok'), r.answer)
+  assert.ok(r.answer.includes('T1 已自动认领（owner=测试专家'), r.answer)
+  assert.ok(r.answer.includes('T99 不在任务板'), r.answer)
+  // 时序可观测（回炉第 1 轮 🔴1）：provider start（专家 run 开始）那一刻板已 running——先 claim 后跑专家
+  assert.deepEqual(boardStatusAtStart, ['running'])
+  let board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'running') // in_progress 语义（板状态机为 running）
+  assert.equal(board.tasks.T1.owner, '测试专家')
+  // ② owner 已有 → 不覆盖，条目保持 ready
+  const r2 = await summon.execute({ expert: '测试专家', task: '请处理 T2' }, { agent: {} })
+  assert.ok(r2.answer.startsWith('ok'), r2.answer)
+  assert.ok(r2.answer.includes('T2 已有 owner=前任，不覆盖'), r2.answer)
+  board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T2.status, 'ready')
+  assert.equal(board.tasks.T2.owner, '前任')
+  // ③ done 状态跳过
+  const r3 = await summon.execute({ expert: '测试专家', task: '请处理 T3' }, { agent: {} })
+  assert.ok(r3.answer.includes('T3 状态为 done（owner=某人），跳过认领'), r3.answer)
+  board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T3.status, 'done')
+})
+
+test('WP-4a (b) 无板/板损坏 fail-open：召唤主流程不受阻，结果附跳过提示', async (t) => {
+  const dst = makeWp4aDst(t, 'failopen')
+  // 无板：显式提示原因，不阻塞
+  const emptyDir = makeBoardDir(t, 'failopen-noboard')
+  {
+    const { descriptors, ctx } = makeWp4aCtx()
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: emptyDir })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+    assert.ok(r.answer.startsWith('ok'), r.answer)
+    assert.ok(r.answer.includes('【auto-claim 跳过】'), r.answer)
+    assert.ok(r.answer.includes('T1 未自动认领'), r.answer)
+  }
+  // 板损坏：show 返回 unrecoverable → 归一为跳过提示，不阻塞
+  const corruptDir = makeBoardDir(t, 'failopen-corrupt')
+  mkdirSync(join(corruptDir, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(corruptDir, BOARD_REL), '{not-json')
+  {
+    const { descriptors, ctx } = makeWp4aCtx()
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: corruptDir })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+    assert.ok(r.answer.startsWith('ok'), r.answer)
+    assert.ok(r.answer.includes('T1 不在任务板或板不可读'), r.answer)
+  }
+})
+
+test("WP-4a (c) DSH_EXPERT_AUTOCLAIM='0'/''：整体关闭，不写板、结果零提示", async (t) => {
+  const dst = makeWp4aDst(t, 'off')
+  const boardDir = makeBoardDir(t, 'off')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready
+  const before = readFileSync(join(boardDir, BOARD_REL))
+  const { descriptors, ctx } = makeWp4aCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  process.env.DSH_EXPERT_AUTOCLAIM = '0'
+  try {
+    const r = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+    assert.equal(r.answer, 'ok') // 零提示、零追加
+    assert.deepEqual(readFileSync(join(boardDir, BOARD_REL)), before) // 板未被动过
+    // 回炉 💭3：空串同样视为关闭；未设置/其他值视为开启（其余用例即未设置态）
+    process.env.DSH_EXPERT_AUTOCLAIM = ''
+    const r2 = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+    assert.equal(r2.answer, 'ok')
+    assert.deepEqual(readFileSync(join(boardDir, BOARD_REL)), before)
+  } finally {
+    delete process.env.DSH_EXPERT_AUTOCLAIM
+  }
+})
+
+test('WP-4a (d) 任务文本无可解析 id：结果与板文件逐字节零变化（零副作用）', async (t) => {
+  const dst = makeWp4aDst(t, 'noid')
+  const boardDir = makeBoardDir(t, 'noid')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0)
+  const before = readFileSync(join(boardDir, BOARD_REL))
+  const { descriptors, ctx } = makeWp4aCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const r = await summon.execute({ expert: '测试专家', task: '普通任务说明，不含任何任务编号' }, { agent: {} })
+  assert.equal(r.answer, 'ok') // 逐字不变
+  assert.deepEqual(readFileSync(join(boardDir, BOARD_REL)), before) // 板逐字节不变
+})
+
+test('WP-4a (e) summon_experts 批量：同一任务 id 只回写一次', async (t) => {
+  const dst = makeWp4aDst(t, 'batch')
+  const boardDir = makeBoardDir(t, 'batch')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready
+  const { descriptors, ctx } = makeWp4aCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const t4a = descriptors.find((d) => d.name === 'summon_experts')
+  const value = await t4a.execute({ experts: [
+    { expert: '测试专家', task: '处理 T1' },
+    { expert: '测试专家', task: '也处理 T1' },
+  ] }, { agent: {} })
+  assert.equal(value.results.length, 2)
+  assert.ok(value.results.every((e) => e.ok === true), JSON.stringify(value.results))
+  assert.equal(value.results.filter((e) => e.answer.includes('已自动认领')).length, 1) // 恰好一次
+  assert.ok(isLosslessJson(value))
+  const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'running')
+  assert.equal(board.tasks.T1.owner, '测试专家')
+})
+
+test('WP-4a (f) 回炉🔴1：专家执行失败不回滚——条目保持 running，提示附错误尾部', async (t) => {
+  const dst = makeWp4aDst(t, 'norollback')
+  const boardDir = makeBoardDir(t, 'norollback')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready
+  const { descriptors, ctx, boardStatusAtStart } = makeWp4aCtx({ boardDir, stopReason: 'failed' })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // 专家 run 开始前板已 running（先 claim 后跑专家，可观测断言）
+  await assert.rejects(
+    () => summon.execute({ expert: '测试专家', task: '处理 T1' }, { agent: {} }),
+    (error) => {
+      assert.ok(/专家执行未正常完成/.test(error.message), error.message)
+      assert.ok(error.message.includes('T1 已自动认领'), error.message) // auto-claim 结果随错误附出
+      return true
+    },
+  )
+  assert.deepEqual(boardStatusAtStart, ['running'])
+  // fail-open 不回滚：条目保持 running + owner，由编排者按板处置
+  const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'running')
+  assert.equal(board.tasks.T1.owner, '测试专家')
+})
+
+test('WP-4a (g) 回炉：claim 失败 fail-open——summon 继续、专家结果返回、板未被误写', async (t) => {
+  const dst = makeWp4aDst(t, 'claimfail')
+  const boardDir = makeBoardDir(t, 'claimfail')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready
+  const before = readFileSync(join(boardDir, BOARD_REL))
+  // PATH shim：show 正常透传真 python3，claim 一律失败——隔离验证 claim 失败路径
+  const realPy = execFileSync('sh', ['-c', 'command -v python3']).toString().trim()
+  const shimDir = mkdtempSync(join(tmpdir(), 'wp4a-shim-claimfail-'))
+  t.after(() => rmSync(shimDir, { recursive: true, force: true }))
+  const shim = join(shimDir, 'python3')
+  writeFileSync(shim, `#!/bin/sh\nfor a in "$@"; do [ "$a" = claim ] && { echo '{"error":"stale_revision"}'; exit 1; }; done\nexec ${realPy} "$@"\n`)
+  chmodSync(shim, 0o755)
+  const oldPath = process.env.PATH
+  process.env.PATH = `${shimDir}:${oldPath}`
+  try {
+    const { descriptors, ctx } = makeWp4aCtx({ boardDir })
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '测试专家', task: '处理 T1' }, { agent: {} })
+    assert.ok(r.answer.startsWith('ok'), r.answer) // 专家照常执行，claim 失败不阻塞派工
+    assert.ok(r.answer.includes('T1 认领失败（已忽略，不阻塞派工）：stale_revision'), r.answer)
+    const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+    assert.equal(board.tasks.T1.status, 'ready') // claim 失败未写板
+    assert.ok(!board.tasks.T1.owner)
+    assert.deepEqual(readFileSync(join(boardDir, BOARD_REL)), before) // 板逐字节不变
+  } finally {
+    process.env.PATH = oldPath
+  }
+})
+
+test('WP-4a (h) 回炉💭3：taskboard 超时提示与「板不可读」区分', async (t) => {
+  const dst = makeWp4aDst(t, 'timeout')
+  const boardDir = makeBoardDir(t, 'timeout')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready（板真实存在，排除板不可读干扰）
+  // PATH shim：python3 假装卡死——配合极短 autoClaimTimeoutMs 触发子进程超时
+  const shimDir = mkdtempSync(join(tmpdir(), 'wp4a-shim-timeout-'))
+  t.after(() => rmSync(shimDir, { recursive: true, force: true }))
+  const shim = join(shimDir, 'python3')
+  writeFileSync(shim, '#!/bin/sh\nsleep 2\n')
+  chmodSync(shim, 0o755)
+  const oldPath = process.env.PATH
+  process.env.PATH = `${shimDir}:${oldPath}`
+  try {
+    const { descriptors, ctx } = makeWp4aCtx({ boardDir })
+    registerExpertTools(ctx, {
+      dst,
+      getExpertContentImpl: () => ({ content: 'persona 正文' }),
+      autoClaimCwd: boardDir,
+      autoClaimTimeoutMs: 100,
+    })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '测试专家', task: '处理 T1' }, { agent: {} })
+    assert.ok(r.answer.startsWith('ok'), r.answer) // 超时 fail-open，不阻塞派工
+    assert.ok(r.answer.includes('认领前置检查超时（taskboard.py 100ms 无响应）'), r.answer)
+    assert.ok(!r.answer.includes('板不可读'), r.answer) // 与板不可读提示语可区分
+  } finally {
+    process.env.PATH = oldPath
+  }
+})
+
+test('WP-4a (i) 回炉🟡2：任务 id 超过 8 个取前 8 并在提示中说明截断', async (t) => {
+  const dst = makeWp4aDst(t, 'cap')
+  const boardDir = makeBoardDir(t, 'cap')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const taskText = Array.from({ length: 10 }, (_, i) => `T${i + 1}`).join('、')
+  const r = await summon.execute({ expert: '测试专家', task: taskText }, { agent: {} })
+  assert.ok(r.answer.includes(`超过上限 8，仅认领前 8 个`), r.answer) // 截断说明
+  const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'running') // 前 8 个中在板者正常认领
+  assert.equal(board.tasks.T1.owner, '测试专家')
 })

@@ -47,7 +47,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
   - 评审专家 → 保留 spawn：评审者≠实现者的独立性优先于缓存收益，fork 会让评审者继承编排者的上下文框定（含实现者的结果汇报）。
   - 无状态一次性实施专家 → 用自有 `summon_expert` 白纸召唤（persona 由工具注入）；
   - 同质大批量召唤（≥4 个且专家提示词文件 ≥150 行）→ 分批串行提交：批量召唤用自有 `summon_experts`（≤8、并发 4、部分成功语义）每批 ≤4、批间等待完成，第二批起可命中首批写入的共享前缀（单次 8 个在并发 4 下已天然分两波）；异质/小批量仍并行（延迟优先）。以上仅给建议，默认行为不变。
-- 委派时把 PM 对该子任务的验收标准写进任务书；认领对应任务板条目（`claim`），完成后 `done` 推进依赖链。
+- 委派时把 PM 对该子任务的验收标准写进任务板条目（`claim`），完成后 `done` 推进依赖链。**派工即回写（v2.6 auto-claim）**：`summon_expert`/`summon_experts` 在**派发入口**（专家 run 开始之前）即解析任务书中显式引用的任务 id（形如 `T<数字>` 的独立 token，且在 cwd 下唯一 `.expert-taskboards/*.json` 板真实存在）并自动 claim（ready→running，owner=被召唤专家名）——**专家拿到任务书时条目已 running**，无需再手工认领；owner 已有（不覆盖）/非 ready（done、failed、依赖未满足）/非唯一板一律跳过。auto-claim 的认领/跳过/失败都以 `【auto-claim】…` 提示行附在 summon 结果尾部；专家执行失败时附在错误信息尾部（降级可见），见跳过或失败时编排者按提示手工 `claim` 补齐。**失败不回滚**：专家执行失败或召唤失败时，已 claim 的条目保持 running，不自动回退 ready——由编排者按板处置：换人/纠正 owner 用 `reassign`，废弃用 `fail`，会话崩溃批量恢复用 `recover`。解析上限：任务书显式任务 id ≤8 个，超出取前 8 并在提示中说明截断。**不解析的形态**：命令引述（`claim/done/progress/show/deps + T<数字>`，如「先 claim T5」是对命令的引述）与路径形态（`T<数字>` 前邻 `/`、`.`、`-`，如 `build/T3-report.md`）。**残余误伤类**：同句提及的其他任务 id（如「对照 T3 的验收标准处理 T7」）仍会被一并认领——宁漏勿错仍为原则，缓解条件=仅 ready 且无 owner 才 claim（非 ready/已有 owner 一律跳过），万一误认领用 `reassign` 纠正。`DSH_EXPERT_AUTOCLAIM` 设为 `0` 或空串整体关闭（未设置或其他值均视为开启）；auto-claim 任何失败都不阻塞召唤主流程。
 - **执行者记录**：done 时编排者核对实际执行者与 owner 一致；多专家共担一个条目时，各自 progress 留痕，编排者把实际执行者写入 summary（或拆条目）——任务板必须能回答『这条实际是谁做的』。
 - **并行专家走消息总线**（第 9 节 bus.py）：任务书里要求专家把完整产出 `send` 到 coordinator 信箱并在工作区落盘产物文件，最终回复只给 ≤10 行摘要；你用 `read --box coordinator` 取全文整合。专家间接力：A `send` 给 B 的信箱，B 的任务书只让它 `read`，你不过手转述。
 - **实施路由细则（按任务性质选角色，不要把某一位当默认实施角色）**：
@@ -161,6 +161,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家      # ready -> running
+    # 派工即回写（v2.6 auto-claim）：summon_expert/summon_experts 在派发入口（专家 run 前）自动对任务书显式引用的 T<数字>（≤8 个，超取前 8 并提示截断；命令引述与路径形态不解析）执行上述 claim（owner=被召唤专家名；owner 已有/非 ready/非唯一板跳过）——专家拿到任务书时条目已 running，无需手工重复认领；专家失败/召唤失败条目保持 running 不回滚，由编排者按板处置（reassign/fail/recover）；DSH_EXPERT_AUTOCLAIM=0 或空串整体关闭；认领/跳过/失败（taskboard 超时与板不可读分别提示）均以【auto-claim】提示行附在 summon 结果/错误尾部
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要"     # 依赖它的任务自动转 ready
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --rework 1 --switched  # --rework 记返工次数，--switched 标记中途换人
     python3 <技能目录>/tools/taskboard.py metrics  # 收口时按 owner 聚合任务数/累计返工/换人次数；反哺 routing.md（第 8 节路由回写）

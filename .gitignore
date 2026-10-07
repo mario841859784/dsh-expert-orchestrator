@@ -12,3 +12,6 @@ node_modules/
 # trim-cli：scripts/ 与 bin/（平台二进制）仅存在于部署副本，不入库
 skills/trim-cli/bin/
 skills/trim-cli/scripts/
+
+# python3 字节码缓存（taskboard.py/bus.py 被子进程调用时产生）
+skills/expert-orchestration/tools/__pycache__/

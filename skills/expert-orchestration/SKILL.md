@@ -49,6 +49,8 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
   - 同质大批量召唤（≥4 个且专家提示词文件 ≥150 行）→ 分批串行提交：批量召唤用自有 `summon_experts`（≤8、并发 4、部分成功语义）每批 ≤4、批间等待完成，第二批起可命中首批写入的共享前缀（单次 8 个在并发 4 下已天然分两波）；异质/小批量仍并行（延迟优先）。以上仅给建议，默认行为不变。
 - 委派时把 PM 对该子任务的验收标准写进任务板条目（`claim`），完成后 `done` 推进依赖链。**派工即回写（v2.6 auto-claim）**：`summon_expert`/`summon_experts` 在**派发入口**（专家 run 开始之前）即解析任务书中显式引用的任务 id（形如 `T<数字>` 的独立 token，且在 cwd 下唯一 `.expert-taskboards/*.json` 板真实存在）并自动 claim（ready→running，owner=被召唤专家名）——**专家拿到任务书时条目已 running**，无需再手工认领；owner 已有（不覆盖）/非 ready（done、failed、依赖未满足）/非唯一板一律跳过。auto-claim 的认领/跳过/失败都以 `【auto-claim】…` 提示行附在 summon 结果尾部；专家执行失败时附在错误信息尾部（降级可见），见跳过或失败时编排者按提示手工 `claim` 补齐。**失败不回滚**：专家执行失败或召唤失败时，已 claim 的条目保持 running，不自动回退 ready——由编排者按板处置：换人/纠正 owner 用 `reassign`，废弃用 `fail`，会话崩溃批量恢复用 `recover`。解析上限：任务书显式任务 id ≤8 个，超出取前 8 并在提示中说明截断。**不解析的形态**：命令引述（`claim/done/progress/show/deps + T<数字>`，如「先 claim T5」是对命令的引述）与路径形态（`T<数字>` 前邻 `/`、`.`、`-`，如 `build/T3-report.md`）。**残余误伤类**：同句提及的其他任务 id（如「对照 T3 的验收标准处理 T7」）仍会被一并认领——宁漏勿错仍为原则，缓解条件=仅 ready 且无 owner 才 claim（非 ready/已有 owner 一律跳过），万一误认领用 `reassign` 纠正。`DSH_EXPERT_AUTOCLAIM` 设为 `0` 或空串整体关闭（未设置或其他值均视为开启）；auto-claim 任何失败都不阻塞召唤主流程。
 - **执行者记录**：done 时编排者核对实际执行者与 owner 一致；多专家共担一个条目时，各自 progress 留痕，编排者把实际执行者写入 summary（或拆条目）——任务板必须能回答『这条实际是谁做的』。
+- **断点续跑（v2.7，WP-4b ④；用户裁决 2026-10-07 Q2=2A：仅新一代宿主启用）**：`summon_expert`/`summon_experts` 在新一代宿主（seam 探测通过：宿主 subagents 带 continuation 生命周期 startContinuable/sendMessage + provider 声明 continuable 创建能力 prepareContinuable + 结算观察面可用）下把专家 run 建为持久 continuable 子代理——中断（stopReason=error/max-tokens）后由**工具自动**经宿主冷恢复投递**恰好一个续跑 turn**（不产生第二个续跑代理/第二次续跑），续跑 prompt 折入断点数据=任务板最新检查点（`progress` 落盘 checkpoints 的最新一条——`show` 只输出最新检查点而非全轨迹；事件流持久不丢）+ bus 汇报（coordinator 信箱中该专家落款的消息，先全量署名过滤再取最新尾部若干条，`task=` 命中任务书引用任务 id 的消息优先，`--no-attempt-filter` 纯读零副作用）+ 中断前部分产出（内嵌换行/行首清单标记在折入前净化）；续跑后完成则正常返回（answer 尾附【断点续跑】注记），续跑后再中断按一次性纪律抛错交编排者处置。取消（aborted）与拒绝（refusal）不续跑。**旧宿主 0.1.7-alpha.2 seam 探测失败，维持 one-shot 现状**（专家中断=报错，编排者按检查点+续跑任务书重派全新代理，见 §3.1）；`DSH_EXPERT_RESUME=0` 或空串强制关闭回退现状（排障用）。**编排者职责不变**：派工时仍须要求长任务专家落检查点——续跑 prompt 的进度清单正是从检查点与 bus 汇报折叠而来，无检查点=续跑只能盲续（prompt 会显式要求先补检查点再继续）。
+- **长任务存活纪律（v2.7 heartbeat/watchdog）**：对长任务/多阶段委派，任务书检查点段必填，并要求专家「每完成一阶段落 `progress` 检查点并 bus 同步 coordinator；无法产出阶段产出时至少 `heartbeat` 报活」。编排者**按需显式**跑 `taskboard.py watchdog`（滑动无进展窗口：窗口内无 activity（progress/heartbeat/新代际 claim 均重臂）先 nudge 计数+重臂一个窗口，连续 `--max-nudges` 次无响应才升级——升级时先在落盘信箱（收件箱/归档/发件箱）找本任务本 attempt 本 owner 的完成报告，有证据 adopt 为 done（工作比它的 agent 活得久），无证据 reclaim（撤销代际回 ready））；**watchdog 是编排者显式调用而非自动轮询**，且 **nudge 只是板内静默计数（写检查点轨迹），没有任何消息送达通道**——专家不会收到提醒，运维勿误读为通知机制，专家侧响应 nudge 的唯一方式是落检查点/heartbeat。**完成汇报 subject 以 `[交付]` 开头**（如「[交付] T12 完成」）——watchdog adopt 的强证据（直接采纳，免词汇启发）；无该前缀的完成报告须**同时满足三条件**才被采纳（防中途汇报误标 done）：subject 含「完成」＋ body 无「继续/进行中/下一步/开始/即将/计划/待」等过程词汇 ＋ subject+body 含交付词汇（产物/改动/交付/文件/路径）。**`[交付]` 前缀仅限终态汇报发送（硬纪律）**——提前交付后中断的组合会让 watchdog 在续跑进行中把中途汇报 adopt 为 done，板上 done 与实际续跑并存。**summon 等待期内编排者勿并行 reclaim 同任务**（watchdog 操作纪律边界：续跑等待期任务无 activity 可能被 nudge→reclaim；reclaim 本身不损数据，旧代际的迟到汇报会被过代过滤归档/拒收，但编排者不应主动制造该窗口）。
 - **并行专家走消息总线**（第 9 节 bus.py）：任务书里要求专家把完整产出 `send` 到 coordinator 信箱并在工作区落盘产物文件，最终回复只给 ≤10 行摘要；你用 `read --box coordinator` 取全文整合。专家间接力：A `send` 给 B 的信箱，B 的任务书只让它 `read`，你不过手转述。
 - **实施路由细则（按任务性质选角色，不要把某一位当默认实施角色）**：
   - 修复/收口/小改/版本收尾 → 低风险变更工程师（最小改动偏好是它的长处）；
@@ -60,13 +62,13 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 - **删除/恢复/回滚类任务必须写最终状态 DoD**（如"完成定义：git ls-files 中不存在该文件，且工作树无此文件"），验收按 DoD 逐条执行；不写 DoD 不得派发此类任务。
 - 你是唯一的召唤者：专家会话被禁止再召唤专家，所有协调通过你完成。
 - **实施类写入（改代码/改配置/改文档/git commit）一律不得亲自执行**；你的手只碰只读操作（读 diff、跑测试、grep 核对）。
-- 专家失败或结论可疑：换专家重试、改用自带库，或进第 4 节请 PM 重排，不要反复硬试同一调用；任务板对应条目 `fail` 记录原因；长任务/多阶段委派的续跑按一次性纪律以全新代理重跑。
+- 专家失败或结论可疑：换专家重试、改用自带库，或进第 4 节请 PM 重排，不要反复硬试同一调用；任务板对应条目 `fail` 记录原因；中断专家的续跑按第 3 节断点续跑两态处置（新一代宿主 summon 通道自动续跑恰好一个 turn；其余按一次性纪律以检查点+全新代理重跑）。
 
 ### 3.1 子代理一次性纪律
 
 - 每个子代理只用一次：一份任务书一次委派，完成即止；禁止向已完成/在途子代理 send_message 续派新任务，禁止跨子任务复用同一 child。
 - 下一个子任务 = 全新子代理 + 自包含任务书；前序成果以文件路径/任务板/检查点传递，不依赖原会话记忆。
-- 断点恢复按一次性纪律以全新代理重跑：检查点 + 续跑任务书（要点：原任务书全文 + 已完成阶段清单 + 剩余目标，勿重做已完成阶段），不唤醒原会话。
+- 断点恢复分宿主两态（v2.7，Q2=2A；本节其余一次性纪律不变——工具自动续跑是唯一例外，属同会话同任务延续，非新任务续派）：**新一代宿主 summon 通道**——中断后由工具自动按持久会话恢复恰好一个续跑 turn，进度清单（任务板最新检查点 + bus 汇报 + 中断前部分产出）自动折入续跑 prompt，编排者无需重派；续跑再失败才走全新代理重跑。**旧宿主 0.1.7-alpha.2 与 summon 通道之外**（subagent/fork 后台通道）——维持检查点 + 续跑任务书以全新代理重跑：要点=原任务书全文 + 已完成阶段清单 + 剩余目标，勿重做已完成阶段，不唤醒原会话；断点数据来源与自动续跑同源——先 `taskboard.py show <id>` 读最新检查点（show 只输出最新一条，非全轨迹）、再 bus `read` 收该专家汇报，禁止无检查点直接从头重跑。
 - 后台子代理完成通知回交照常（等待纪律不变）；其会话在注册表残留属平台事实，编排者不得再向其派工。
 
 **等待纪律**（后台委派后的回合处置）：
@@ -158,7 +160,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 技能目录 = 本文件所在目录；两个脚本零依赖，python3 直接跑。
 
-**任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）：
+**任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）。**任务板权威定义（v2.7 事件溯源化）**：状态权威 = append-only JSONL 事件流 `<板文件>.events.jsonl`，JSON 板文件只是**折叠视图**缓存（对外只增 event_seq/event_state_hash 簿记，既有字段零删改，list/status/show 输出结构不变）——视图被手改/损坏 → stderr 报警并按事件流权威重建覆盖（stdout 零污染）；**事件流被清空而视图含簿记、视图含未知顶层键、事件链 hash 断链或末事件 state_hash 对账失配 → `{"error":"unrecoverable","unrecoverable":true,...}`**（绝不静默返回空数据，绝不裸 traceback——如实报告编排者，禁止当作空板重建）。崩溃恢复自动进行（残尾截断/缺行尾换行自愈 + stderr 告警，已落账事件不回滚）；`replay` 可显式重放重建视图（幂等，崩溃演练/人工核对用）；旧 v2.6 板首次写命令自动收编为事件流（数据零丢失，revision 延续）。**A2 残余风险注记：「剥簿记+清日志」（簿记字段与事件流同时剥除）是原理性残余**——数据侧无从证明曾有过板，**备份是最后兜底：定期备份 `.expert-taskboards/`（建议连同 `.expert-bus/` 一并备份）**：
 
     python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
@@ -168,7 +170,10 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --rework 1 --switched  # --rework 记返工次数，--switched 标记中途换人
     python3 <技能目录>/tools/taskboard.py metrics  # 收口时按 owner 聚合任务数/累计返工/换人次数；反哺 routing.md（第 8 节路由回写）
     python3 <技能目录>/tools/taskboard.py fail T3 "原因" ; retry T3
-    python3 <技能目录>/tools/taskboard.py progress T3 "已完成X；产物:路径；agent_id:xxx"  # 长任务每阶段记检查点；重试前编排者先 show 读取（按一次性纪律以全新代理重跑）
+    python3 <技能目录>/tools/taskboard.py progress T3 "已完成X；产物:路径；agent_id:xxx"  # 长任务每阶段记检查点（事件流持久，中断/崩溃不丢）；重试前编排者先 show 读取（按一次性纪律以全新代理重跑）
+    python3 <技能目录>/tools/taskboard.py heartbeat T3 --attempt <attempt_id>    # 长任务报活（v2.7）：重臂滑动无进展窗口并清零 nudge 计数（不产检查点；仅 running 可心跳；带 --attempt 走代际校验）
+    python3 <技能目录>/tools/taskboard.py watchdog [--window-sec 1800] [--max-nudges 2] [--bus-root <cwd>/.expert-bus]  # 编排者显式调用（v2.7，非自动轮询）：扫描 running 任务滑动无进展窗口——activity=max(updated,heartbeat_at,nudged_at)，progress/heartbeat/新代际 claim 均重臂（健康的长任务永不因跑得久被杀）；窗口到期 nudge（板内静默计数+重臂，无送达通道），连续 --max-nudges 次无响应升级：先检索落盘完成报告（[交付] subject 前缀=强证据直接采纳）有则 adopt 为 done（记 executors 审计），无则 reclaim（撤代际回 ready）；--expected-revision 可走 CAS
+    python3 <技能目录>/tools/taskboard.py --board .expert-taskboards/<项目slug>.json replay  # 显式按事件流重放重建折叠视图（v2.7，幂等；崩溃演练/人工核对用——视图损坏的报警重建已自动，无需此步）
     python3 <技能目录>/tools/taskboard.py recover               # 会话崩溃后恢复 running -> ready
     python3 <技能目录>/tools/taskboard.py boards                # 列出当前目录全部任务板（防遗留污染）
     python3 <技能目录>/tools/taskboard.py archive --board .expert-taskboards/<项目slug>.json  # 项目收口后归档（有未收口任务需 --force）
@@ -192,16 +197,18 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 **消息总线 bus.py**（信箱 `<cwd>/.expert-bus/`；并行专家协作必用）：
 
     python3 <技能目录>/tools/bus.py send --from 专家名 --to coordinator --subject "…" --body "…" [--file 产物路径]
+    python3 <技能目录>/tools/bus.py send --from 专家名 --to coordinator --task T3 --attempt <attempt_id> --subject "[交付] T3 完成" --body "…"   # 完成汇报范型（v2.7）：subject 以 [交付] 开头=watchdog adopt 强证据（免词汇启发）；--task/--attempt 成对携带=过代对账身份约束；中间过程汇报不加 [交付] 前缀（防被误标 done）
     python3 <技能目录>/tools/bus.py read --box coordinator [--unread] | read --all-boxes
     python3 <技能目录>/tools/bus.py ack --box coordinator --all
     python3 <技能目录>/tools/bus.py broadcast --from 协调官 --subject "…" --body "…"
     python3 <技能目录>/tools/bus.py stats
 
-投递语义（v2.6，默认开启；上方既有调用方式全部不变，`read --no-attempt-filter` 关闭②③回到旧版读取行为）：
+投递语义（v2.6 基础 + v2.7 增补④，默认开启；上方既有调用方式全部不变，`read --no-attempt-filter` 关闭②③回到旧版读取行为）：
 
     python3 <技能目录>/tools/bus.py send --from 专家名 --to coordinator --task T3 --attempt <attempt_id> --subject "…" --body "…"   # 携带派工代际（--task/--attempt 必须成对；attempt_id 来自 taskboard claim/reassign）
     python3 <技能目录>/tools/bus.py read --box coordinator --board .expert-taskboards/<项目slug>.json   # 多板项目显式指定代际对账板（默认解析规则同 taskboard.py）
 读取信箱流程（编排者与专家同规）：
   ① at-least-once 游标：send 先落发件箱 `_outbox/<发送者>/`（原子写：唯一 tmp + os.replace，崩溃不产生截断毒丸），投递成功（收件箱原子落盘）才推进游标 `cursor.json`——投递中途崩溃重启后同一条消息按同 id 原子重投（幂等，已 ack 的消息重投不复活未读标记）；旧版遗留的发件箱截断残件在投递时自愈（隔离 `.corrupt` 并告警后跳过，该发送者后续 send 不被阻塞）。
-  ② 过代过滤：read 时消息携带的 task+attempt 与任务板当前代际对账，attempt 已撤销/非当前代际/任务无此代际的消息直接归档到 `_archive/<信箱>/`（不进收件箱）；板缺失/损坏/结构非法返回 `{"error":"unrecoverable","unrecoverable":true,...}`，不做静默假设——如实报告编排者，确认后再用 `--no-attempt-filter` 读取。语义边界：过滤是**读取时点快照**，与 `reassign` 并发时，刚被撤销代际的消息可能被放行一次（本轮已进收件箱），下轮读取时再归档——属 at-least-once「多投不丢」的预期行为，接收方对同代际重复汇报按幂等处理。
+  ② 过代过滤三态裁决（v2.6 默认开启，T11 定稿；`read --no-attempt-filter` 关闭②③回到旧版纯读）：read 时消息携带的 task+attempt 与任务板当前代际对账，三种去向——**放行**（主解析板或任一候选板确认 attempt 为当前开放代际——修复多板共存下陈旧兄弟板误杀，跨板救援附 stderr 提示）；**归档**（权威板=显式 `--board` 或默认解析选中的主解析板确认 attempt 已撤销/非当前代际/任务无此代际 → 移入 `_archive/<信箱>/` 不进收件箱）；**保留**（主解析板缺失、仅兄弟板在场的降级中间态只确认不归档——无权威板在场，兄弟板不具归档权威，留待权威板恢复后的全量读处置）。板缺失/损坏/结构非法返回 `{"error":"unrecoverable","unrecoverable":true,...}`，不做静默假设——如实报告编排者，确认后再用 `--no-attempt-filter` 读取。**仲裁面边界**：能写工作区文件的攻击者本就可伪造兄弟板确认或直改主板——伪造板确认=与直改主板同信任级别，接受为非目标；本机制防的是陈旧快照误杀，不防主动篡改。语义边界：过滤是**读取时点快照**，与 `reassign` 并发时，刚被撤销代际的消息可能被放行一次（本轮已进收件箱），下轮读取时再归档——属 at-least-once「多投不丢」的预期行为，接收方对同代际重复汇报按幂等处理。
   ③ skip-round：信箱本轮可见消息为空（`--unread` 时已读消息不计入可见）且本轮归档了过期消息时输出 `SKIP_ROUND：…`——编排模型据此跳过该轮（省一次模型调用），不得当作「信箱为空」而重派或追问；归档数只统计本轮归档量，可见为空也可能因消息已读，措辞不断言「全部输入已过期」。
+  ④ seq 增量推送（v2.7）：`send` 给每条消息写发件人单调 seq（发件箱锁内分配，并发不重号；投递游标同步记账，崩溃 seq 不回退）；`read --box coordinator --since-seq N` 增量读取——只显示 seq>N 的消息（旧版无 seq 消息按 0 计，仅全量读可见），消息头展示 `seq=` 供游标推进；无新消息输出「无 seq>N 的新消息」（区别于真空信箱文案）；可与 `--unread`/过代过滤/skip-round 叠加，需与 `--box` 搭配（seq 按发送者单调，跨信箱无全局序）；seq≤N 的旧消息本轮不参与对账归档（过滤是读取时点快照，留待全量读处置）。长任务专家/编排者长程轮询用它做游标消费，免全量重读。

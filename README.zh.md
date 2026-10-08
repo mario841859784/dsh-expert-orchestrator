@@ -50,6 +50,14 @@
 | 🧙 **原生专家工具** | `list_experts`（浏览合并花名册，紧凑/展开双模式）、`summon_expert`（白纸精召：persona 经 sanitizePersona 注入，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝，task 8000 码点上限）、`summon_experts`（批量 ≤8、并发 4、部分成功语义）。递归防护：spawn 子代理带六项 toolFilter deny（不可再召唤专家、不可嵌套 subagent/fork、不可 workflow），工具 schema default 3 纵深兜底——单层委派，无失控专家树 |
 | 📚 **每专家经验池 + persona 方法论分层**（v2.4.0） | summon 自动尾部注入 `expert-lessons/<slug>.md` 该专家历史教训（≤2000 字符，按字符截断，2K 上限，无命中零变化）；persona frontmatter `method:` + `<!-- methods-cut -->` 瘦身注入+按需深读指针（Top-5 bundled-core 已分层，fail-safe 全量回退，合入经预注册 A/B 实验门禁，档案见 `docs/internal/experiments/`）；`list_experts` 显式标注跨源 conflict/shadowed，自定义专家删除支持清理。已知限制：设置面板「清空已删除」按钮 UI 待接线（RPC 契约已就位） |
 
+## 🆕 v2.7 新特性
+
+| 特性 | 说明 |
+|------|------|
+| 🗂️ **崩溃安全的编排状态**（WP-4b） | 任务板改为事件溯源（append-only 事件流为权威、双层完整性哈希、崩溃后确定性重放）；消息总线按派工代际过滤并给出三态裁决，支持增量读取（`--since-seq`）；watchdog 会在孤儿专家的完成证据已在总线上时将其收养。`summon_expert` 可在新代宿主上把中断的专家运行恢复为持久续跑（裁决 Q2=2A——旧代宿主保持一次性行为；`DSH_EXPERT_RESUME=0` 可关闭） |
+| 🚦 **质量门禁**（WP-5） | PM 规划阶段先落 `draft`、批准后方生效（`create --draft` / `approve`）；`--kind review` 子任务要求显式裁决——含 findings 校验、自动回炉路由与 `escalated` 终态；多评审任务（`--quorum-m`，默认 3，裁决 Q3=3A）仅在 ≥m 票同向且零反向票时达成裁决，每条回到 `ready` 的路径都重置票数 |
+| 📄 **文件层专家与零 token 手势**（WP-6） | 专家 persona 按项目层 > 全局层 > 内置的 `.md` 文件层解析（裁决 Q4=4A）并支持运行时重读；`/expert-<name>` 手势以零模型调用注入 11 位核心专家（见下文「零 token 专家手势」小节） |
+
 ## 🆕 v2.6 新特性
 
 | 特性 | 说明 |

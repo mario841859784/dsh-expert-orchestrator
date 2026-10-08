@@ -6,7 +6,7 @@
 // 仓库内任何数据。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, symlinkSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, renameSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawnSync, spawn } from 'node:child_process'
@@ -661,7 +661,7 @@ test('WP-1 (d) 环检测：set_dependencies 构造 A→B→C→A 被拒且不落
 // (e) 全程无第三方 import：taskboard.py 仅标准库
 test('WP-1 (e) taskboard.py 零第三方 import（import 语句逐一落进标准库白名单）', () => {
   const src = readFileSync(TASKBOARD, 'utf-8')
-  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'datetime', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid'])
+  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'copy', 'datetime', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid'])
   const found = []
   for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
     for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
@@ -1943,4 +1943,537 @@ test('WP-8 (e) autoClaim 旋钮：enabled:false 关闭、Volatile 引用按 get(
   registerExpertTools(c2, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir, autoClaim: { get: () => true } })
   const r2 = await d2.find((d) => d.name === 'summon_expert').execute({ expert: '测试专家', task: '请处理 T2' }, { agent: {} })
   assert.ok(r2.answer.includes('T2 已自动认领'), r2.answer)
+})
+
+// ── WP-4b/S1 事件溯源化核心（v2.7）：事件流权威 + 折叠视图 + hash 防手改 + 崩溃重放 ──
+import { appendFileSync } from 'node:fs'
+const eventsRelOf = (boardRel) => `${boardRel}.events.jsonl`
+const readBoard = (p) => JSON.parse(readFileSync(p, 'utf-8'))
+const eventLines = (p) => readFileSync(p, 'utf-8').split('\n').filter((l) => l.trim())
+
+test('WP-4b (a) 状态权威=append-only 事件流：每次写命令恰追加一个链式事件，视图=折叠缓存且只增簿记字段', (t) => {
+  const dir = makeBoardDir(t, 'evlog')
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  assert.equal(runTb(dir, ['create', '任务A', '--owner', '甲']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲', '--attempt', 'A1']).code, 0)
+  assert.equal(runTb(dir, ['progress', 'T1', '阶段1']).code, 0)
+  assert.equal(runTb(dir, ['create', '任务B', '--dep', 'T1']).code, 0)
+  // 事件流逐行合法 JSON：seq 严格递增、prev 串链、hash/state_hash 齐备、args 记录命令意图
+  const evs = eventLines(evPath).map((l) => JSON.parse(l))
+  assert.equal(evs.length, 4)
+  evs.forEach((ev, i) => {
+    assert.equal(ev.seq, i + 1)
+    assert.equal(ev.prev, i === 0 ? '' : evs[i - 1].hash)
+    assert.ok(/^[0-9a-f]{64}$/.test(ev.hash), `事件 ${i + 1} hash 形态`)
+    assert.ok(/^[0-9a-f]{64}$/.test(ev.state_hash), `事件 ${i + 1} state_hash 形态`)
+    assert.ok(typeof ev.type === 'string' && ev.ts > 0 && typeof ev.after === 'object')
+  })
+  assert.deepEqual(evs.map((e) => e.type), ['create', 'claim', 'progress', 'create'])
+  assert.equal(evs[1].args.attempt, 'A1')
+  assert.deepEqual(evs[3].args.dep, ['T1'])
+  // 读命令零事件追加
+  assert.equal(runTb(dir, ['list']).code, 0)
+  assert.equal(eventLines(evPath).length, 4)
+  // 折叠视图：v2.6 既有字段零删改 + 只增簿记字段，revision 与事件数一致
+  const view = readBoard(join(dir, BOARD_REL))
+  assert.equal(view.revision, 4)
+  assert.equal(view.event_seq, 4)
+  assert.ok(typeof view.event_state_hash === 'string' && view.event_state_hash.length === 64)
+  assert.equal(view.tasks.T1.status, 'running')
+  assert.deepEqual(Object.keys(view).filter((k) => !['tasks', 'seq', 'revision', 'event_seq', 'event_state_hash'].includes(k)), [])
+})
+
+test('WP-4b (b) 崩溃重放：视图丢失/落后于事件流时按事件流重放，折叠状态与崩溃前逐字段一致且静默', (t) => {
+  const dir = makeBoardDir(t, 'replay')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('progress', 'T1', 'c1')
+  ok('create', '任务B', '--dep', 'T1')
+  ok('done', 'T1', '结果', '--by', '甲')
+  const before = readBoard(boardPath) // 崩溃前折叠状态
+  assert.equal(before.tasks.T1.status, 'done')
+  assert.equal(before.tasks.T2.status, 'ready') // done 联动依赖推进同样可重放
+  // 场景1：视图文件整体丢失（模拟杀进程时视图未落/被清）→ 任意命令静默重放，状态逐字段一致
+  rmSync(boardPath)
+  const r1 = ok('list')
+  assert.ok(!r1.stderr.includes('不一致'), `崩溃恢复不应报警：${r1.stderr}`)
+  assert.deepEqual(readBoard(boardPath), before)
+  // 场景2：视图落后于事件流（事件已追加、视图未及写的崩溃间隙）→ 静默重放到最新
+  ok('claim', 'T2', '乙')
+  writeFileSync(boardPath, JSON.stringify(JSON.parse(JSON.stringify(before)), null, 2)) // 旧视图快照
+  const r2 = ok('status')
+  assert.ok(!r2.stderr.includes('不一致'), `崩溃间隙不应报警：${r2.stderr}`)
+  const after2 = readBoard(boardPath)
+  assert.equal(after2.event_seq, before.event_seq + 1)
+  assert.equal(after2.tasks.T2.status, 'running')
+  assert.equal(after2.tasks.T2.owner, '乙')
+  // 场景3：追加途中被杀留下残尾 → 截断修复告警、状态完好，后续写 seq 连续衔接
+  appendFileSync(evPath, '{"seq": 99, "type": "create", "titl')
+  const r3 = ok('list')
+  assert.ok(r3.stderr.includes('未完成写入'), `残尾应告警：${r3.stderr}`)
+  const goodCount = eventLines(evPath).length
+  assert.equal(goodCount, before.event_seq + 1)
+  ok('progress', 'T2', '续写正常')
+  const evs2 = eventLines(evPath).map((l) => JSON.parse(l))
+  assert.equal(evs2.length, goodCount + 1)
+  assert.equal(evs2[evs2.length - 1].seq, goodCount + 1) // 残尾修复后追加 seq 连续
+  // replay 命令：显式重放幂等重建，输出 event_seq/revision/state_hash
+  const rp = ok('replay')
+  assert.ok(rp.stdout.includes(`event_seq=${goodCount + 1}`) && rp.stdout.includes('state_hash='), rp.stdout)
+  assert.equal(readBoard(boardPath).revision, evs2[evs2.length - 1].revision)
+})
+
+test('WP-4b (c) 手改报警：状态文件被手改后加载时 hash 校验报警（stderr），并按事件流权威重建覆盖手改', (t) => {
+  const dir = makeBoardDir(t, 'tamper')
+  const boardPath = join(dir, BOARD_REL)
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A', '--desc', '完成标准')
+  ok('claim', 'T1', '甲')
+  const clean = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  // 手改1：改任务语义字段（标题+状态）→ 加载即报警，show 展示事件流权威状态，视图被重建覆盖
+  const tampered = JSON.parse(JSON.stringify(clean))
+  tampered.tasks.T1.title = '被手改的标题'
+  tampered.tasks.T1.status = 'done'
+  writeFileSync(boardPath, JSON.stringify(tampered, null, 2))
+  const r = ok('show', 'T1')
+  assert.ok(r.stderr.includes('不一致'), `手改应报警：${r.stderr}`)
+  assert.ok(r.stdout.includes('任务A') && !r.stdout.includes('被手改的标题'), r.stdout) // 权威状态覆盖手改
+  assert.deepEqual(readBoard(boardPath), clean) // 视图已重建回权威状态（含 status=running）
+  // 手改2：注入簿记外未知字段 → 同样报警并被清除
+  const withEvil = JSON.parse(JSON.stringify(clean))
+  withEvil.evil = true
+  writeFileSync(boardPath, JSON.stringify(withEvil, null, 2))
+  const r2 = ok('list')
+  assert.ok(r2.stderr.includes('不一致'), r2.stderr)
+  assert.ok(!('evil' in readBoard(boardPath)), '未知字段应被权威重建清除')
+  // 手改3：视图损坏为非法 JSON → 损坏报警（区别于手改文案），仍按事件流重建
+  writeFileSync(boardPath, '{not-json')
+  const r3 = ok('list')
+  assert.ok(r3.stderr.includes('损坏'), r3.stderr)
+  assert.deepEqual(readBoard(boardPath), clean)
+})
+
+test('WP-4b (d) 对外视图向后兼容：v2.6 板级/任务级字段只增不删不改，命令输出结构与错误载荷不变', (t) => {
+  const dir = makeBoardDir(t, 'compat-es')
+  const boardPath = join(dir, BOARD_REL)
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '子任务', '--owner', '后端工程师', '--desc', '完成标准')
+  ok('create', '下游任务', '--dep', 'T1', '--owner', 'DevOps自动化工程师')
+  ok('status'); ok('list'); ok('show', 'T1'); ok('deps', 'T2')
+  ok('claim', 'T1', '后端工程师')
+  ok('progress', 'T1', '已完成X；产物:路径')
+  ok('done', 'T1', '结果摘要') // T2 自动转 ready
+  const st = ok('status').stdout
+  assert.ok(st.includes('可认领: T2') && st.includes('状态统计: done=1'), st) // 输出结构零变化
+  const showOut = ok('show', 'T1').stdout
+  assert.ok(showOut.includes('T1 [done] 子任务 owner=后端工程师') && showOut.includes('结果: 结果摘要'), showOut)
+  const depsOut = ok('deps', 'T2').stdout
+  assert.ok(depsOut.includes('T2 [ready] 下游任务') && depsOut.includes('T1 [done] 子任务'), depsOut)
+  // 板级与任务级字段：v2.6 既有字段全在，新增仅簿记两字段
+  const view = readBoard(boardPath)
+  for (const k of ['tasks', 'seq', 'revision']) assert.ok(k in view, `board.${k}`)
+  for (const tid of ['T1', 'T2']) {
+    for (const k of ['id', 'title', 'owner', 'dep', 'desc', 'status', 'created', 'updated', 'summary', 'fail'])
+      assert.ok(k in view.tasks[tid], `${tid}.${k} 应保留`)
+  }
+  assert.ok(Array.isArray(view.tasks.T1.checkpoints) && view.tasks.T1.checkpoints.length === 1) // 检查点形状不变
+  // 具名错误 JSON 载荷键零删改（stale_revision 既有消费方兼容）
+  const stale = runTb(dir, ['claim', 'T1', 'x', '--expected-revision', '999'])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  assert.ok('expected' in stale.json && 'current' in stale.json && 'hint' in stale.json)
+})
+
+test('WP-4b (e) v2.6 语义共存：CAS/attempt 代际/环检测/收编在事件流板上全部保持，拒写零落盘零事件追加', (t) => {
+  const dir = makeBoardDir(t, 'coes')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲', '--attempt', 'A1')
+  // CAS：旧 revision 拒绝且零副作用（视图字节不变、事件流零追加）
+  const rev1 = revOf(ok('list').stdout)
+  const snap1 = readFileSync(boardPath)
+  const nEvs1 = eventLines(evPath).length
+  const stale = runTb(dir, ['claim', 'T1', '乙', '--expected-revision', String(rev1 - 1)])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  assert.deepEqual(readFileSync(boardPath), snap1)
+  assert.equal(eventLines(evPath).length, nEvs1)
+  // attempt 代际：旧代际汇报拒绝且零副作用
+  const rej = runTb(dir, ['progress', 'T1', '旧代际', '--attempt', 'A0'])
+  assert.equal(rej.code, 1)
+  assert.equal(rej.json.error, 'stale_attempt')
+  assert.deepEqual(readFileSync(boardPath), snap1)
+  assert.equal(eventLines(evPath).length, nEvs1)
+  // 环检测：成环写入拒绝且零副作用（T1 running 撞状态守卫属 v2.6 既有语义，改用 pending 的 T2 自环）
+  ok('create', '任务B')
+  ok('set_dependencies', 'T2', '--dep', 'T1')
+  const snap2 = readFileSync(boardPath)
+  const nEvs2 = eventLines(evPath).length
+  const cyc = runTb(dir, ['set_dependencies', 'T2', '--dep', 'T2'])
+  assert.equal(cyc.code, 1)
+  assert.equal(cyc.json.error, 'dependency_cycle')
+  assert.deepEqual(readFileSync(boardPath), snap2)
+  assert.equal(eventLines(evPath).length, nEvs2)
+  // 事件流中段被篡改 → unrecoverable（权威受损绝不静默），stdout 无任务列表
+  const lines = eventLines(evPath)
+  const evs = lines.map((l) => JSON.parse(l))
+  evs[0].type = 'tampered'
+  writeFileSync(evPath, evs.map((e) => JSON.stringify(e)).join('\n') + '\n')
+  const broken = runTb(dir, ['list'])
+  assert.equal(broken.code, 1)
+  assert.equal(broken.json.error, 'unrecoverable')
+  assert.equal(broken.json.unrecoverable, true)
+  assert.ok(!broken.stdout.includes('任务A'))
+})
+
+test('WP-4b (e2) 旧板收编：v2.6 板首次写自动种子化（数据零丢失、revision 延续），重放仍还原收编前数据', (t) => {
+  const dir = makeBoardDir(t, 'adopt')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  const legacyTask = { id: 'T1', title: '旧任务', owner: '老王', dep: [], desc: '旧标准', status: 'done', created: 1000, updated: 2000, summary: '旧结果', fail: '' }
+  writeFileSync(boardPath, JSON.stringify({ tasks: { T1: legacyTask }, seq: 1, revision: 7 }, null, 2))
+  // 读命令：旧板直读不收编、不报警
+  const r0 = runTb(dir, ['list'])
+  assert.equal(r0.code, 0)
+  assert.ok(!existsSync(evPath), '读命令不应创建事件流')
+  assert.equal(r0.stderr, '')
+  // 首次写：seed + 命令事件，旧数据零丢失、revision 延续 7→8
+  assert.equal(runTb(dir, ['create', '新任务']).code, 0)
+  const evs = eventLines(evPath).map((l) => JSON.parse(l))
+  assert.deepEqual(evs.map((e) => e.type), ['seed', 'create'])
+  assert.equal(evs[0].revision, 7)
+  assert.deepEqual(evs[0].after.T1, legacyTask) // 收编快照与旧板逐字段一致
+  const view = readBoard(boardPath)
+  assert.equal(view.revision, 8)
+  assert.deepEqual(view.tasks.T1, legacyTask)
+  assert.equal(view.tasks.T2.status, 'ready')
+  // 删除视图后重放：种子事件承载旧数据，T1 完整还原
+  rmSync(boardPath)
+  assert.equal(runTb(dir, ['list']).code, 0)
+  assert.deepEqual(readBoard(boardPath).tasks.T1, legacyTask)
+})
+
+test('WP-4b (f) 事件溯源写路径零第三方依赖：hash/折叠/收编全部由标准库承担（白名单断言见 WP-1 (e)）', () => {
+  const src = readFileSync(TASKBOARD, 'utf-8')
+  for (const fn of ['_canonical', '_event_hash', '_state_hash', 'read_events', 'fold_events', 'commit_event', 'save_view', 'cmd_replay']) {
+    assert.ok(src.includes(`def ${fn}(`), `应有 ${fn}`)
+  }
+  assert.ok(src.includes(".events.jsonl'"), '事件流命名约定')
+  assert.ok(!/import\s+(requests|yaml|click|pydantic)/.test(src), '零第三方依赖')
+})
+
+// (b2) B1 回炉：末事件「可解析但链/hash 校验失败」一律 unrecoverable（不再按残尾截断回滚）——
+// 可解析事件是已 fsync 落账的完整命令，按残尾截断等于静默丢弃一次已执行命令，且与中段篡改
+// 结局不对称。真撕裂写（末行不可解析、缺闭合括号）仍走 (b) 场景3 的自动截断恢复语义。
+test('WP-4b (b2) B1 回炉：末事件可解析但校验失败 → unrecoverable 且事件流不回滚；次末行被删断链同语义', (t) => {
+  const dir = makeBoardDir(t, 'tailtamper')
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('progress', 'T1', '阶段1')
+  assert.equal(eventLines(evPath).length, 3)
+  const origLines = eventLines(evPath)
+  // 篡改1：末事件 payload 被改（hash 失配）→ rc=1 unrecoverable，事件流保持 3 事件不回滚
+  //（修复前此处按残尾截断：T1 running 回滚 ready、revision 回退、rc=0 静默丢账）
+  const evs = origLines.map((l) => JSON.parse(l))
+  evs[2].after.T1.status = 'done'
+  writeFileSync(evPath, evs.map((e) => JSON.stringify(e)).join('\n') + '\n')
+  const r1 = runTb(dir, ['list'])
+  assert.equal(r1.code, 1)
+  assert.equal(r1.json.error, 'unrecoverable')
+  assert.equal(r1.json.unrecoverable, true)
+  assert.ok(String(r1.json.reason).includes('校验失败'), r1.json.reason)
+  assert.ok(!r1.stdout.includes('任务A'))
+  assert.equal(eventLines(evPath).length, 3) // 不截断：事件流不回滚
+  // 篡改2：次末行被删 → 末事件 seq/prev 断链（末事件本身逐字段完好）→ 同样 unrecoverable
+  //（修复前末事件被当残尾截断，claim/progress 两次落账被静默丢弃）
+  writeFileSync(evPath, [origLines[0], origLines[2]].join('\n') + '\n')
+  const r2 = runTb(dir, ['list'])
+  assert.equal(r2.code, 1)
+  assert.equal(r2.json.error, 'unrecoverable')
+  assert.equal(r2.json.unrecoverable, true)
+  assert.equal(eventLines(evPath).length, 2) // 剩余两行原样保留，不截断
+})
+
+// (e3) m1 回炉：收编崩溃窗口（种子事件已追加、视图未及写）下视图仍是 v2.6 原生板（无簿记字段）
+// ——内容与折叠权威一致 → 静默重建不误报「疑似手改」；缺簿记但内容不一致的真实手改仍报警。
+test('WP-4b (e3) m1 回炉：收编崩溃窗口（v2.6 原生视图与折叠一致）静默重建，真实手改仍报警', (t) => {
+  const dir = makeBoardDir(t, 'adptgap')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  const legacyTask = { id: 'T1', title: '旧任务', owner: '老王', dep: [], desc: '旧标准', status: 'done', created: 1000, updated: 2000, summary: '旧结果', fail: '' }
+  const legacyBoard = { tasks: { T1: legacyTask }, seq: 1, revision: 7 }
+  writeFileSync(boardPath, JSON.stringify(legacyBoard, null, 2))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  // 构造收编崩溃窗口现场：真实收编（create）后把事件流截回仅种子事件、视图还原为收编前 v2.6 原生板
+  assert.equal(runTb(dir, ['create', '新任务']).code, 0)
+  writeFileSync(evPath, eventLines(evPath)[0] + '\n') // 仅保留 seed 事件（崩溃于收编追加后、视图落盘前）
+  writeFileSync(boardPath, JSON.stringify(legacyBoard, null, 2)) // 视图未及写：无簿记字段
+  const r1 = ok('list')
+  assert.ok(!r1.stderr.includes('不一致'), `收编崩溃窗口不应误报手改：${r1.stderr}`)
+  const rebuilt = readBoard(boardPath)
+  assert.equal(rebuilt.event_seq, 1) // 已按事件流静默重建（簿记字段补齐）
+  assert.equal(rebuilt.revision, 7)
+  assert.deepEqual(rebuilt.tasks.T1, legacyTask)
+  // 真实手改不豁免：缺簿记字段但内容与折叠不一致 → 仍报警并按事件流权威重建
+  const tampered = JSON.parse(JSON.stringify(legacyBoard))
+  tampered.tasks.T1.title = '被手改的标题'
+  writeFileSync(boardPath, JSON.stringify(tampered, null, 2))
+  const r2 = ok('list')
+  assert.ok(r2.stderr.includes('不一致'), `真实手改仍应报警：${r2.stderr}`)
+  assert.equal(readBoard(boardPath).tasks.T1.title, '旧任务')
+})
+
+// (g) M1 回炉：archive 事件流随板归档——归档目录含同名 .events.jsonl、板目录顶层零残留
+//（若漏迁，顶层残留会被同名新板首写直接续链=继承已归档板全部任务的跨板污染）、归档板 replay 仍成功。
+test('WP-4b (g) M1 回炉：archive 迁移事件流——归档目录含 .events.jsonl、顶层零残留、归档板 replay 成功', (t) => {
+  const dir = makeBoardDir(t, 'esarchive')
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('done', 'T1', '收口')
+  const nEvents = eventLines(evPath).length
+  assert.ok(nEvents >= 3)
+  const ar = ok('archive')
+  assert.ok(ar.stdout.includes('事件日志已一并归档'), ar.stdout)
+  const archDir = join(dir, '.expert-taskboards', 'archive')
+  // ① 归档目录含 <name>.events.jsonl 且事件完整迁移
+  const archBoard = readdirSync(archDir).filter((f) => f.endsWith('.json'))
+  assert.equal(archBoard.length, 1)
+  assert.deepEqual(readdirSync(archDir).filter((f) => f.endsWith('.events.jsonl')), [`${archBoard[0]}.events.jsonl`])
+  assert.equal(eventLines(join(archDir, `${archBoard[0]}.events.jsonl`)).length, nEvents)
+  // ② 板目录顶层无残留 events 文件（跨板污染源）
+  assert.deepEqual(readdirSync(join(dir, '.expert-taskboards')).filter((f) => f.endsWith('.events.jsonl')), [])
+  // ③ 对归档板 replay 仍成功：重放还原收口时状态
+  const rp = runTb(dir, ['--board', join(archDir, archBoard[0]), 'replay'])
+  assert.equal(rp.code, 0, rp.stdout + rp.stderr)
+  assert.ok(rp.stdout.includes('event_seq=') && rp.stdout.includes('任务数=1'), rp.stdout)
+  assert.equal(readBoard(join(archDir, archBoard[0])).tasks.T1.status, 'done')
+})
+
+// (h) m2 回炉：事件上下文按写命令白名单武装——读命令（list/show/status/deps/metrics）跳过
+// 全量 tasks deepcopy（pre 快照+收编种子），对外行为零变化：输出契约不变、零事件追加、零收编。
+test('WP-4b (h) m2 回炉：读命令不武装事件上下文（写命令白名单短路），输出与事件流零影响', (t) => {
+  const dir = makeBoardDir(t, 'roarm')
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('create', '任务B', '--dep', 'T1')
+  const nEvents = eventLines(evPath).length
+  assert.equal(nEvents, 3)
+  // 全部读命令：输出契约零变化（含末行 revision=N），零事件追加
+  for (const args of [['list'], ['show', 'T1'], ['status'], ['deps', 'T2'], ['metrics']]) {
+    const r = ok(...args)
+    assert.ok(r.stdout.includes(`revision=${nEvents}`), `${args.join(' ')} 末行 revision`)
+  }
+  assert.equal(eventLines(evPath).length, nEvents)
+  // 静态守卫：_arm_event_ctx 按写命令白名单短路；白名单与 save() 调用方（写命令集）一一对应。
+  //（二轮评审建议1 采纳：不再硬编码 10 命令清单——从源码解析「def cmd_X 块内含 save(path, data)」
+  // 动态求差集比对，新增 cmd 调 save 而漏白名单（或白名单虚列无 save 的 cmd）时本测试变红。）
+  const src = readFileSync(TASKBOARD, 'utf-8')
+  const wm = src.match(/_WRITE_CMDS = frozenset\(\(([^)]*)\)\)/)
+  assert.ok(wm, '应有写命令白名单 _WRITE_CMDS')
+  const armed = [...wm[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort()
+  const cmdSavers = src.split(/\n(?=def )/) // 顶层 def 逐块切分；嵌套 def 缩进不受影响
+    .filter((b) => /^def cmd_[a-z_]+\(a, data/.test(b) && b.includes('save(path, data)'))
+    .map((b) => b.match(/^def cmd_([a-z_]+)\(/)[1])
+    .sort()
+  assert.ok(cmdSavers.length >= 10, `动态解析出的写命令集不应缩水（现 ${cmdSavers.length}）`)
+  assert.deepEqual(armed, cmdSavers) // 白名单 ⇔ 实际调 save 的 cmd_*：双向差集为空
+  assert.ok(/if a\.cmd not in _WRITE_CMDS:/.test(src), '武装入口按白名单短路')
+})
+
+// ── WP-4b 二轮回炉（二轮独立评审 3 重要 + 3 建议 + 收编早失败）──────────────────
+
+// (i1) 重要-1：事件流清空即洗白——「日志被截零」与「日志尚未创建」不可区分时，簿记视图会给
+// 手改零告警放行、下次写命令还会以其为种子重新收编。修复：日志文件存在但为空而视图含簿记字段
+// → unrecoverable（合法空日志仅出现在收编前，视图必无簿记字段，不误伤崩溃恢复，见 (i2)）。
+test('WP-4b (i1) 二轮回炉：清空事件流+改簿记视图 → 读命令 rc=1 拒绝直读、写命令拒绝重新收编（洗白封死）', (t) => {
+  const dir = makeBoardDir(t, 'washout')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  // 攻击现场：清空事件流（截零）+ 手改视图语义字段（簿记字段保留）
+  const view = readBoard(boardPath)
+  view.tasks.T1.title = '被洗白的标题'
+  writeFileSync(boardPath, JSON.stringify(view, null, 2))
+  writeFileSync(evPath, '')
+  const r1 = runTb(dir, ['list'])
+  assert.equal(r1.code, 1)
+  assert.equal(r1.json.error, 'unrecoverable')
+  assert.equal(r1.json.unrecoverable, true)
+  assert.ok(String(r1.json.reason).includes('事件流'), r1.json.reason)
+  assert.ok(!r1.stdout.includes('任务A') && !r1.stdout.includes('被洗白的标题'), 'stdout 零状态泄露')
+  assert.equal(readBoard(boardPath).tasks.T1.title, '被洗白的标题') // 拒绝而非重放覆盖：板文件未被触碰
+  // 写命令同样拒绝：不得以未校验视图为种子重新收编
+  const r2 = runTb(dir, ['progress', 'T1', '洗白后续写'])
+  assert.equal(r2.code, 1)
+  assert.equal(r2.json.error, 'unrecoverable')
+  assert.equal(eventLines(evPath).length, 0, '不得重新收编出任何事件')
+})
+
+// (i2) 重要-1 对照 + 建议3：合法「收编前空日志」（v2.6 原生板无簿记字段 + 空日志文件，如种子撕裂写
+// 被截断至空）不受影响——读 rc=0 零告警、写正常收编（种子按需惰性组装，prev_seq 判定不误伤空日志）。
+test('WP-4b (i2) 二轮回炉：收编前空日志不受洗白防御误伤——读零告警、写正常收编数据零丢失', (t) => {
+  const dir = makeBoardDir(t, 'washlegit')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  const legacyTask = { id: 'T1', title: '旧任务', owner: '老王', dep: [], desc: '旧标准', status: 'done', created: 1000, updated: 2000, summary: '旧结果', fail: '' }
+  writeFileSync(boardPath, JSON.stringify({ tasks: { T1: legacyTask }, seq: 1, revision: 7 }, null, 2))
+  writeFileSync(evPath, '') // 收编前崩溃残留的空日志（视图无簿记字段 → 不触发防御）
+  const r1 = runTb(dir, ['list'])
+  assert.equal(r1.code, 0)
+  assert.equal(r1.stderr, '')
+  assert.equal(runTb(dir, ['create', '新任务']).code, 0)
+  const evs = eventLines(evPath).map((l) => JSON.parse(l))
+  assert.deepEqual(evs.map((e) => e.type), ['seed', 'create']) // 空日志照常收编
+  assert.equal(evs[0].revision, 7) // revision 延续
+  assert.deepEqual(evs[0].after.T1, legacyTask) // 旧数据零丢失
+})
+
+// (w1) 重要-2：旧序 archive 崩溃窗口终态（板已迁、日志未迁→顶层孤儿日志）——读命令不得按孤儿日志
+// 静默复活旧板、同名 create 不得续链；防御依据归档区签名（同名归档板有簿记无日志），视图意外丢失的
+// 正常崩溃恢复（无此签名，既有 (b) 场景1）不受误伤。
+test('WP-4b (w1) 二轮回炉：archive 崩溃窗口孤儿日志——读/create 均拒绝不复活不续链，孤儿日志零改动', (t) => {
+  const dir = makeBoardDir(t, 'archwin1')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('done', 'T1', '收口')
+  const nEvents = eventLines(evPath).length
+  ok('archive') // 新序归档：归档区成对（板+日志）、顶层零残留
+  const archDir = join(dir, '.expert-taskboards', 'archive')
+  const archBoard = readdirSync(archDir).filter((f) => f.endsWith('.json'))[0]
+  assert.ok(archBoard, '归档板存在')
+  // 构造旧序窗口终态：把归档日志移回顶层（= 板已迁、日志未迁完）
+  renameSync(join(archDir, `${archBoard}.events.jsonl`), evPath)
+  const r1 = runTb(dir, ['list'])
+  assert.equal(r1.code, 1)
+  assert.equal(r1.json.error, 'unrecoverable')
+  assert.ok(String(r1.json.reason).includes('孤儿'), r1.json.reason)
+  assert.ok(!existsSync(boardPath), '读命令不得按孤儿日志重建板文件（不复活）')
+  assert.equal(eventLines(evPath).length, nEvents, '孤儿日志零改动')
+  const r2 = runTb(dir, ['create', '劫持任务'])
+  assert.equal(r2.code, 1)
+  assert.equal(r2.json.error, 'unrecoverable') // 同名 create 不续链
+  assert.ok(!existsSync(boardPath))
+  assert.equal(eventLines(evPath).length, nEvents)
+})
+
+// (w2) 重要-2 对照：新序（先迁日志后迁板）崩溃窗口终态——顶层残留的是板而非孤儿日志，读命令按
+// 顶层板直读降级（rc=0）、写命令以视图为种子重新收编，数据零丢失；归档区孤儿日志可接受（无代码枚举消费）。
+test('WP-4b (w2) 二轮回炉：新序 archive 窗口顶层残留板可直读、写命令重新收编数据零丢失', (t) => {
+  const dir = makeBoardDir(t, 'archwin2')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('done', 'T1', '收口')
+  ok('archive')
+  const archDir = join(dir, '.expert-taskboards', 'archive')
+  const archBoard = readdirSync(archDir).filter((f) => f.endsWith('.json'))[0]
+  // 构造新序窗口终态：日志已在归档区（孤儿）、板仍在顶层
+  renameSync(join(archDir, archBoard), boardPath)
+  assert.ok(!existsSync(evPath), '顶层无事件流（已迁入归档区）')
+  const r1 = ok('list')
+  assert.equal(r1.stderr, '') // 直读降级零告警
+  assert.equal(readBoard(boardPath).tasks.T1.status, 'done') // 板数据完好
+  // 写命令：以顶层视图为种子重新收编，旧数据零丢失
+  assert.equal(runTb(dir, ['create', '窗口后续写']).code, 0)
+  const evs = eventLines(evPath).map((l) => JSON.parse(l))
+  assert.deepEqual(evs.map((e) => e.type), ['seed', 'create'])
+  assert.equal(evs[0].revision, 3) // revision 延续
+  assert.deepEqual(Object.keys(readBoard(boardPath).tasks).sort(), ['T1', 'T2'])
+  assert.ok(existsSync(join(archDir, `${archBoard}.events.jsonl`)), '归档区孤儿日志原样保留（可接受）')
+})
+
+// (i3) 重要-3：fsync 后恰损末尾换行——末事件仍完整合法且链校验通过；修复前下次 O_APPEND 粘包成
+// 一行不可解析 → 按撕裂残尾截断，已落账命令一并回滚（实测 4→2）。修复：读路径补写换行自愈。
+test('WP-4b (i3) 二轮回炉：丢尾随换行读命令自愈——rc=0 补写告警、追加不粘包、已落账事件全保留', (t) => {
+  const dir = makeBoardDir(t, 'nonewline')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  ok('progress', 'T1', '阶段1')
+  ok('done', 'T1', '收口')
+  assert.equal(eventLines(evPath).length, 4)
+  const lines = eventLines(evPath)
+  writeFileSync(evPath, lines.join('\n')) // 模拟部分落盘：末事件完整合法但行尾换行丢失
+  const r1 = ok('list')
+  assert.ok(r1.stderr.includes('换行'), `缺换行应自愈告警：${r1.stderr}`)
+  assert.ok(readFileSync(evPath, 'utf-8').endsWith('\n'), '读命令已补写换行')
+  assert.deepEqual(eventLines(evPath), lines) // 已落账 4 事件全保留（不回滚）
+  // 后续追加不粘包：5 行逐行可解析、seq 连续衔接
+  ok('create', '任务B')
+  const evs = eventLines(evPath).map((l) => JSON.parse(l))
+  assert.equal(evs.length, 5)
+  assert.deepEqual(evs.map((e) => e.seq), [1, 2, 3, 4, 5])
+  assert.deepEqual(evs.map((e) => e.type), ['create', 'claim', 'progress', 'done', 'create'])
+  assert.equal(readBoard(boardPath).revision, 5)
+})
+
+// (s2) 建议2：崩溃间隙（视图落后于事件流）静默重建语义不变；视图自称 event_seq=vseq 但内容 hash
+// 与第 vseq 个事件的 state_hash 失配（内容曾被外部改动）→ stderr 补诊断提示，仍 rc=0 按权威重建。
+test('WP-4b (s2) 二轮回炉：崩溃间隙内容失配补 stderr 诊断（行为仍静默重建），良性落后零提示', (t) => {
+  const dir = makeBoardDir(t, 'gapdiag')
+  const boardPath = join(dir, BOARD_REL)
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A')
+  ok('claim', 'T1', '甲')
+  const snap2 = JSON.parse(readFileSync(boardPath, 'utf-8')) // event_seq=2 的合法视图快照
+  ok('progress', 'T1', '阶段1') // 第 3 个事件（此后视图停在 2 = 崩溃间隙现场）
+  // 良性落后：视图内容与自称 event_seq=2 的状态一致 → 静默重建零提示（既有 (b) 场景2 语义不变）
+  writeFileSync(boardPath, JSON.stringify(snap2, null, 2))
+  const r1 = ok('list')
+  assert.equal(r1.stderr, '')
+  assert.equal(readBoard(boardPath).event_seq, 3)
+  // 落后且内容失配：自称 event_seq=2 但任务字段被外部改过 → stderr 提示，仍 rc=0 按事件流权威重建
+  const tampered = JSON.parse(JSON.stringify(snap2))
+  tampered.tasks.T1.title = '间隙中被改过的标题'
+  writeFileSync(boardPath, JSON.stringify(tampered, null, 2))
+  const r2 = ok('list')
+  assert.ok(r2.stderr.includes('失配'), `应补诊断提示：${r2.stderr}`)
+  assert.equal(readBoard(boardPath).tasks.T1.title, '任务A') // 权威状态
+  assert.equal(readBoard(boardPath).event_seq, 3)
+})
+
+// (i5) 收编早失败（评审疑问1 采纳）：含未知顶层键的 v2.6 板放行收编会被折叠模型静默丢弃、错一拍
+// 才暴露——收编时（直读路径）当场 unrecoverable 并给可读原因，事件流零创建、板文件零改动。
+test('WP-4b (i5) 二轮回炉：含未知顶层键的 v2.6 板首个命令收编即拒（当场 unrecoverable 给可读原因）', (t) => {
+  const dir = makeBoardDir(t, 'adoptrej')
+  const boardPath = join(dir, BOARD_REL)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+  const legacyTask = { id: 'T1', title: '旧任务', owner: '老王', dep: [], desc: '旧标准', status: 'done', created: 1000, updated: 2000, summary: '旧结果', fail: '' }
+  writeFileSync(boardPath, JSON.stringify({ tasks: { T1: legacyTask }, seq: 1, revision: 7, evil: { nested: true } }, null, 2))
+  const boardBytes = readFileSync(boardPath)
+  // 首个写命令：收编即拒
+  const r1 = runTb(dir, ['create', '新任务'])
+  assert.equal(r1.code, 1)
+  assert.equal(r1.json.error, 'unrecoverable')
+  assert.ok(String(r1.json.reason).includes('未知顶层键'), r1.json.reason)
+  assert.ok(!existsSync(evPath), '收编未发生：事件流不得被创建')
+  assert.deepEqual(readFileSync(boardPath), boardBytes) // 板文件零改动
+  // 读命令同拒（同一直读路径的结构性校验，早于收编暴露）
+  const r2 = runTb(dir, ['list'])
+  assert.equal(r2.code, 1)
+  assert.equal(r2.json.error, 'unrecoverable')
 })

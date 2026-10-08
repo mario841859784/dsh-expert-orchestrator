@@ -37,8 +37,35 @@
     提交，提示重新 --install-hook 或 --uninstall-hook）。脚本在、python3 在、板在而三查不过则拒绝提交（fail closed）。
 验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
   verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
+事件溯源化核心（v2.7）：
+  状态权威：append-only JSONL 事件流 <板文件>.events.jsonl；JSON 板文件降级为「折叠视图」缓存（对外只增簿记字段
+    event_seq/event_state_hash，既有字段零删改），list/status/show/deps 等命令输出结构不变。
+  写路径：命令在 board_lock 锁内 load（折叠）-> CAS 校验 -> 变更 -> 追加一个事件（O_APPEND+fsync）-> os.replace
+    原子重写视图；事件记录变更任务的全量快照（after）与命令意图（args），折叠=逐事件应用快照，重放与崩溃前
+    逐字段一致；状态迁移逻辑只在命令函数一处，折叠层零业务规则。
+  hash 防手改：事件链式 hash（每事件 hash=SHA-256(canonical(除 hash 外全字段))，prev 串前事件；中段断链/篡改
+    -> unrecoverable），末事件另记 state_hash=SHA-256(canonical({tasks,seq,revision}))；加载时视图按同一
+    state_hash 对账——视图缺失或落后（事件已追加、视图未及写的崩溃间隙）静默重放重建；视图被手改/损坏
+    -> stderr 报警并按事件流权威重建覆盖（stdout 零污染，消费方解析不受扰）。
+  崩溃恢复：事件流尾部残行/末事件校验失败（追加途中被杀）自动截断修复并 stderr 告警，后续追加 seq 连续衔接；
+    末事件完整合法但缺行尾换行（fsync 后恰损换行的部分落盘）→ 读路径补写换行自愈并告警，后续追加不粘包、
+    已落账事件不回滚；replay 命令可显式重放重建视图（幂等，崩溃演练/人工核对用）。
+  旧板收编：无事件流的 v2.6 板首次写命令时以既有折叠状态为种子事件（seed）自动收编，数据零丢失，revision 延续；
+    含 tasks/seq/revision+簿记之外未知顶层键的板当场 unrecoverable（收编早失败——放行则未知键被折叠模型
+    静默丢弃，错一拍才暴露且无对账线索）。
+  防洗白/防劫持（回炉加固）：事件流文件存在但为空而视图含簿记字段 → unrecoverable（簿记证明日志曾有事件，
+    此刻为空必异常；拒绝按未校验视图直读或以其为种子重新收编。合法空日志仅出现在收编前——视图必无簿记字段，
+    不误伤崩溃恢复）；archive 先迁事件流后迁板（两步间被杀顶层残留的是板而非孤儿日志，读命令可直读降级、
+    写命令重新收编）；load 对「板文件缺失但事件流存在，且归档区有同名板的有簿记无日志残留」（旧序 archive
+    崩溃窗口孤儿日志）拒绝复活旧板/续链（unrecoverable），同名 create 同拒。
+  archive：事件流随板文件一并归档（<归档名>.events.jsonl），重放能力不因归档丢失。
+  折叠语义不变量（当前命令集契约，扩展事件模型前必读；违背即重放与末事件 state_hash 失配 → 板 unrecoverable）：
+    ① fold_events 只能逐事件覆盖 after 快照中的任务，无法表达任务删除——当前命令集不存在删除任务的命令；
+       未来新增删除类命令须同步扩展折叠语义（如墓碑事件），否则重放结果多出已删任务，与崩溃前状态不一致。
+    ② commit_event 落视图仅写 {tasks,seq,revision}+簿记（event_seq/event_state_hash），当前命令集不写板
+       顶层其他键；未来新增板顶层键须同步纳入 seed/折叠/state_hash 口径，否则重放折叠缺该键、对账失配。
 """
-import argparse, collections, contextlib, datetime, glob, hashlib, json, os, re, subprocess, sys, time, uuid
+import argparse, collections, contextlib, copy, datetime, glob, hashlib, json, os, re, subprocess, sys, time, uuid
 
 try:
     # POSIX 标准库；Windows 等无 fcntl 平台降级（见 board_lock）
@@ -130,25 +157,215 @@ def _validate_board(data, path):
             raise _unrecoverable(path, f'结构非法：任务 {tid} 的 dep 必须是字符串列表')
 
 
-def load(path):
-    if not os.path.exists(path):
-        return {'tasks': {}, 'seq': 0, 'revision': 0}
+# ── 事件溯源化核心（v2.7）：JSONL 事件流为状态权威，JSON 板文件降级为折叠视图缓存 ──
+# 组织：事件流 <板文件>.events.jsonl（不以 .json 结尾，不干扰板定位的 *.json 枚举与 boards 列举）；
+#   事件=变更任务的全量快照差分（after）+ 命令意图（args），折叠=逐事件应用快照——重放与崩溃前逐字段一致，
+#   状态迁移逻辑只存在于命令函数一处（快照采集自真实落盘状态，折叠层零业务规则，不双写不分叉）。
+# hash 方案：事件链式 hash——每事件 hash=SHA-256(canonical(除 hash 外全部字段))，prev 串前事件 hash；
+#   末事件另记 state_hash=SHA-256(canonical({tasks,seq,revision}))；加载时视图按同一 state_hash 对账。
+#   视图缺失/落后于事件流（「事件已追加、视图未及写」的崩溃间隙，含旧板收编的同类间隙）→ 静默重放
+#   重建；视图被手改/损坏（state_hash 失配或 JSON 解析失败）→ stderr 报警并按事件流权威重建
+#   （stdout 零污染，消费方解析不受扰）。
+# 事件流尾部残行（末行不可解析的撕裂写）→ 自动截断修复并告警；可解析但链/hash 校验失败（含末事件）
+#   与中段损坏/断链 → 一律 unrecoverable（截断已落账的末事件=静默回滚命令，篡改语义对称）。
+# 旧板收编：无事件流的 v2.6 板首次写命令时以既有状态为种子事件（seed）自动收编，数据零丢失，revision 延续。
+BOOKKEEPING_KEYS = ('event_seq', 'event_state_hash')
+
+
+def events_path(path):
+    """事件流文件路径：<板文件>.events.jsonl。"""
+    return path + '.events.jsonl'
+
+
+def _canonical(o):
+    return json.dumps(o, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def _sha_hex(s):
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+
+def _state_hash(d):
+    """折叠状态 hash：排除视图簿记字段后的 canonical JSON 整体 SHA-256（手改任意语义字段即失配）。"""
+    return _sha_hex(_canonical({k: d[k] for k in d if k not in BOOKKEEPING_KEYS}))
+
+
+def _event_hash(ev):
+    return _sha_hex(_canonical({k: v for k, v in ev.items() if k != 'hash'}))
+
+
+def _repair_events(ep, evs):
+    """截断修复事件流：只保留验证通过的事件（唯一 tmp + os.replace 原子替换）。"""
+    d = os.path.dirname(ep)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = f'{ep}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        for ev in evs:
+            f.write(json.dumps(ev, ensure_ascii=False) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, ep)
+
+
+def read_events(path):
+    """读取并校验事件流：逐行解析 + 链式 hash 验证，返回验证通过的事件列表。
+    尾部残行（末行不可解析的结构性残缺——O_APPEND 单行撕裂写缺闭合括号）→ 截断修复并 stderr 告警
+    （崩溃恢复语义）；可解析但 seq/prev/hash/type 校验失败（含末事件被篡改、次末行被删导致的断链）
+    一律 unrecoverable，与中段篡改同语义——可解析事件是已 fsync 落账的完整命令，按残尾截断等于
+    静默回滚一次已执行命令（数据丢失且篡改语义不对称）；中段不可解析 → unrecoverable（权威受损
+    绝不静默）。末事件完整合法但缺行尾换行（fsync 后恰损换行的部分落盘）→ 补写换行自愈并告警，
+    防止下次 O_APPEND 追加与末事件粘包后被误当残尾截断。"""
+    ep = events_path(path)
+    if not os.path.exists(ep):
+        return []
+    with open(ep, encoding='utf-8', errors='replace') as f:
+        raw = f.read()
+    items = [(i + 1, s) for i, s in enumerate(raw.split('\n')) if s.strip()]
+    evs, torn, bad = [], False, None
+    for k, (ln, s) in enumerate(items):
+        try:
+            evs.append(json.loads(s))
+        except Exception:
+            bad = k
+            break
+    if bad is not None:
+        # 解析失败行之后若还存在可解析行 → 中段损坏；否则视为崩溃残尾
+        for _, s2 in items[bad:]:
+            try:
+                json.loads(s2)
+            except Exception:
+                continue
+            raise _unrecoverable(path, f'事件流第 {items[bad][0]} 行损坏（中段不可解析）')
+        torn = True
+        evs = evs[:bad]
+    prev_hash, prev_seq = '', 0
+    for k, ev in enumerate(evs):
+        ok = (isinstance(ev, dict) and ev.get('seq') == prev_seq + 1
+              and ev.get('prev') == prev_hash and ev.get('hash') == _event_hash(ev)
+              and isinstance(ev.get('type'), str))
+        if not ok:
+            # 可解析但链/hash 校验失败：无论位置一律 unrecoverable（含末事件——不按残尾截断，
+            # 截断会静默回滚已落账命令的效果；撕裂写若只是丢了行尾换行（JSON 完整合法）由下方
+            # 缺换行自愈分支处理，不会走到这里）
+            raise _unrecoverable(path, f'事件流第 {k + 1} 个事件校验失败（链/hash 校验失败或被篡改）')
+        prev_hash, prev_seq = ev['hash'], ev['seq']
+    if torn:
+        _repair_events(ep, evs)
+        print(f'警告：事件流尾部存在未完成写入（疑似进程被杀），已截断修复至最后一个完整事件: {ep}', file=sys.stderr)
+    elif raw and not raw.endswith('\n') and evs:
+        # 丢尾随换行自愈（二轮评审重要-3）：fsync 后恰损行尾换行时末事件仍完整合法且链校验通过——
+        # 若直接 O_APPEND 追加，会与末事件粘成一行不可解析，下次读取按撕裂残尾截断，把已落账命令
+        # 一并回滚（实测 4→2）。读路径先补写换行（O_APPEND 单字节 + fsync），保证后续追加不粘包。
+        with open(ep, 'a', encoding='utf-8') as f:
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        print(f'警告：事件流末尾缺失换行符（疑似写入中断残留），已补写自愈: {ep}', file=sys.stderr)
+    return evs
+
+
+def _prev_of_log(path):
+    """取事件流末事件的 (seq, hash)；空/缺失返回 (0, '')（收编判定与 prev 串链用）。"""
+    ep = events_path(path)
+    if not os.path.exists(ep):
+        return 0, ''
+    last = None
+    with open(ep, encoding='utf-8', errors='replace') as f:
+        for ln in f:
+            s = ln.strip()
+            if s:
+                last = s
+    if not last:
+        return 0, ''
     try:
-        with open(path, encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception as e:
-        raise _unrecoverable(path, f'JSON 解析失败: {e}')
-    if not isinstance(data, dict):
-        raise _unrecoverable(path, '结构非法：板文件顶层不是对象')
-    data.setdefault('revision', 0)  # 旧板无 revision 字段兼容
-    _validate_board(data, path)
-    return data
+        ev = json.loads(last)
+        return int(ev.get('seq', 0)), ev.get('hash') or ''
+    except Exception:
+        return 0, ''  # 残尾：load 已在锁内修复；此处防御性归零
 
 
-def save(path, data):
-    """原子落盘：revision 自增后写入唯一 tmp（含 pid+uuid 后缀，多进程共用板不互截），os.replace 原子替换。
-    须在 board_lock 锁内调用（POSIX），保证 CAS 校验-写入原子。"""
-    data['revision'] = int(data.get('revision', 0)) + 1  # CAS：每次写自增
+def _append_event(path, ev):
+    """追加一个事件（O_APPEND 单行写入 + fsync；锁内串行，残尾由 read_events 崩溃恢复语义兜底）。"""
+    ep = events_path(path)
+    d = os.path.dirname(ep)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(ep, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(ev, ensure_ascii=False) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def fold_events(evs):
+    """事件折叠：状态 = 逐事件应用 after 快照（任务级全量快照差分，见文件头「事件溯源化核心」）。"""
+    state = {'tasks': {}, 'seq': 0, 'revision': 0}
+    for ev in evs:
+        after = ev.get('after')
+        if isinstance(after, dict):
+            for tid, t in after.items():
+                state['tasks'][tid] = t
+        if isinstance(ev.get('board_seq'), int) and not isinstance(ev.get('board_seq'), bool):
+            state['seq'] = ev['board_seq']
+        if isinstance(ev.get('revision'), int) and not isinstance(ev.get('revision'), bool):
+            state['revision'] = ev['revision']
+    return state
+
+
+# 写命令事件上下文：main 派发前武装（pre 快照供差分、并按需充当收编种子），save() 据此落事件。
+_EVT_CTX = {'armed': False, 'type': None, 'args': {}, 'pre_tasks': None, 'pre_seq': 0, 'pre_rev': 0, 'ts': 0}
+
+
+def _event_args(a):
+    """事件 args 载荷：记录命令意图（审计用）；状态本体由 after 快照承载。"""
+    c = a.cmd
+    if c == 'create':
+        return {'title': a.title, 'owner': a.owner or '',
+                'dep': [d.strip() for d in (a.dep or '').split(',') if d.strip()],
+                'desc': a.desc or '', 'scope': a.scope or ''}
+    if c == 'claim':
+        return {'owner': a.owner, 'attempt': a.attempt}
+    if c == 'done':
+        return {'summary': a.summary or '', 'rework': a.rework, 'switched': a.switched, 'by': a.by}
+    if c == 'fail':
+        return {'reason': a.reason or ''}
+    if c == 'progress':
+        return {'note': a.note}
+    if c == 'reassign':
+        return {'attempt_id': a.attempt_id, 'owner': a.owner}
+    if c == 'set_dependencies':
+        return {'dep': a.dep}
+    if c == 'verify':
+        return {'files': list(a.files or [])}
+    return {}  # retry/recover 等无附加意图
+
+
+# 写命令白名单：与 save() 调用方一一对应。读命令（list/show/status/deps/metrics）与
+# boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
+_WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
+                         'reassign', 'set_dependencies', 'verify'))
+
+
+def _arm_event_ctx(a, data):
+    """写命令派发前武装事件上下文（pre 快照供差分与按需收编种子），save() 据此落事件；
+    白名单外的命令（读命令及 boards/archive/_hook-check/replay）不落事件，跳过武装。
+    收编种子按需惰性组装（二轮评审建议3）：pre_tasks 快照本身即种子数据，事件流已有有效事件时
+    commit_event 永不需要种子——不再为此对全量 tasks 做第二次深拷贝；日志存在但为空的收编前
+    崩溃恢复仍能收编（判定在 commit_event 锁内按 prev_seq 而非文件存在性，无误伤）。"""
+    if a.cmd not in _WRITE_CMDS:
+        _EVT_CTX.update({'armed': False, 'type': None, 'args': {}, 'pre_tasks': None,
+                         'pre_seq': 0, 'pre_rev': 0, 'ts': 0})
+        return
+    _EVT_CTX.update({
+        'armed': True, 'type': a.cmd, 'args': _event_args(a),
+        'pre_tasks': copy.deepcopy(data['tasks']),
+        'pre_seq': int(data.get('seq', 0)), 'pre_rev': int(data.get('revision', 0)),
+        'ts': now_ms(),
+    })
+
+
+def save_view(path, data):
+    """折叠视图原子落盘：唯一 tmp（pid+uuid 后缀）+ os.replace（同 v2.6 机制）。须在 board_lock 锁内调用。"""
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -158,6 +375,167 @@ def save(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def commit_event(path, data):
+    """写路径落账：必要时先收编（pre 快照为种子）→ 追加本命令事件（fsync）→ 原子重写折叠视图。
+    事件 after=与 pre 快照差分出的变更任务全量快照；revision 随每次写自增（与 v2.6 CAS 语义一致）。"""
+    ctx = _EVT_CTX
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    prev_seq, prev_hash = _prev_of_log(path)
+    if prev_seq == 0 and (ctx['pre_tasks'] or ctx['pre_seq'] or ctx['pre_rev']):
+        # 旧板收编（含「日志文件存在但为空」的收编前崩溃恢复）：以既有折叠状态为种子事件
+        #（revision 不自增，数据零丢失；pre_tasks 是武装时的隔离快照，种子与差分共用一份）
+        seed = {'seq': 1, 'ts': ctx['ts'], 'type': 'seed',
+                'args': {'reason': 'v2.6 旧板收编：以既有折叠状态为种子事件'},
+                'after': ctx['pre_tasks'], 'board_seq': ctx['pre_seq'],
+                'revision': ctx['pre_rev'], 'prev': ''}
+        seed['state_hash'] = _sha_hex(_canonical({'tasks': ctx['pre_tasks'],
+                                                  'seq': ctx['pre_seq'],
+                                                  'revision': ctx['pre_rev']}))
+        seed['hash'] = _event_hash(seed)
+        _append_event(path, seed)
+        prev_seq, prev_hash = 1, seed['hash']
+    new_rev = int(data.get('revision', 0)) + 1
+    data['revision'] = new_rev
+    pre = ctx.get('pre_tasks') or {}
+    after = {tid: t for tid, t in data['tasks'].items() if tid not in pre or pre[tid] != t}
+    ev = {'seq': prev_seq + 1, 'ts': ctx['ts'], 'type': ctx['type'], 'args': ctx['args'],
+          'after': after, 'board_seq': int(data.get('seq', 0)), 'revision': new_rev, 'prev': prev_hash}
+    ev['state_hash'] = _state_hash(data)  # 先算状态 hash，事件 hash 覆盖含 state_hash 的全部其余字段
+    ev['hash'] = _event_hash(ev)
+    _append_event(path, ev)
+    save_view(path, {'tasks': data['tasks'], 'seq': int(data.get('seq', 0)), 'revision': new_rev,
+                     'event_seq': ev['seq'], 'event_state_hash': ev['state_hash']})
+
+
+def _orphan_log_of_archived(path):
+    """旧序 archive 崩溃窗口签名（二轮评审重要-2）：归档区存在与本板同名的归档板文件，其视图含
+    事件簿记字段（曾是事件流板）但对应 .events.jsonl 不在归档区——即「板已迁、日志未迁完」的残留
+    形态，顶层的孤儿事件日志正是其未迁完的日志；此时板已被收口，孤儿日志不得复活旧板或被续链。
+    归档区落点与 cmd_archive 一致（cwd 相对 .expert-taskboards/archive）；无簿记字段的 v2.6 旧归档板
+    本就无日志，不算窗口残留（避免误伤「升级前归档 + 活动板视图丢失」的正常崩溃恢复）。"""
+    arch = os.path.join('.expert-taskboards', 'archive')
+    if not os.path.isdir(arch):
+        return False
+    suffix = '-' + os.path.basename(path)
+    try:
+        names = os.listdir(arch)
+    except OSError:
+        return False
+    for n in sorted(names):
+        if n.endswith('.jsonl') or not n.endswith(suffix):
+            continue
+        ap = os.path.join(arch, n)
+        if os.path.exists(ap + '.events.jsonl'):
+            continue  # 归档板与日志成对在档：正常归档形态，非崩溃窗口
+        try:
+            with open(ap, encoding='utf-8') as f:
+                if 'event_seq' in json.load(f):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def load(path):
+    """加载任务板状态：有事件流 → 折叠（权威）+ 视图对账；无事件流 → v2.6 旧板直读（首次写时收编）。
+    视图对账：缺失/落后 → 静默重放重建（崩溃恢复）；手改/损坏 → stderr 报警并按事件流权威重建。
+    直读分支两道防线：事件流被清空但视图含簿记 → unrecoverable（防清空日志洗白）；含未知顶层键 →
+    unrecoverable（收编早失败）。"""
+    evs = read_events(path)
+    if not evs:
+        if not os.path.exists(path):
+            return {'tasks': {}, 'seq': 0, 'revision': 0}
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            raise _unrecoverable(path, f'JSON 解析失败: {e}')
+        if not isinstance(data, dict):
+            raise _unrecoverable(path, '结构非法：板文件顶层不是对象')
+        if os.path.exists(events_path(path)) and any(k in data for k in BOOKKEEPING_KEYS):
+            # 事件流清空即洗白防御（二轮评审重要-1）：簿记字段证明事件流曾有事件，此刻为空只能是被
+            # 清空/截断——按旧板直读会对手改视图零告警放行，下次写命令还会以其为种子重新收编（手改
+            # 洗白）。合法空日志只出现在收编前（视图必无簿记字段），不误伤崩溃恢复。
+            raise _unrecoverable(path, '事件流文件存在但为空，而视图含事件簿记字段 '
+                                       f'{list(BOOKKEEPING_KEYS)}——事件流疑似被清空或截断（曾有事件，'
+                                       '此时为空必异常）；拒绝按未校验视图直读或重新收编，请从备份恢复事件流')
+        unknown = [k for k in data if k != 'tasks' and k != 'seq' and k != 'revision'
+                   and k not in BOOKKEEPING_KEYS]
+        if unknown:
+            # 收编早失败（二轮评审采纳）：未知顶层键放行收编会被折叠模型静默丢弃，错一拍才暴露；
+            # 当场具名拒绝并给可读原因（与直读路径的结构校验同位，读命令同样早暴露）。
+            raise _unrecoverable(path, f'板文件含未知顶层键 {unknown}（收编前旧板仅允许 '
+                                       'tasks/seq/revision+事件簿记字段）；拒绝收编——未知键无法纳入'
+                                       '事件折叠与 state_hash 口径，请先人工确认并移除该键')
+        data.setdefault('revision', 0)  # 旧板无 revision 字段兼容
+        _validate_board(data, path)
+        return data
+    state = fold_events(evs)
+    _validate_board(state, path)
+    last = evs[-1]
+    actual = _state_hash(state)
+    if last.get('state_hash') != actual:
+        raise _unrecoverable(path, '事件流折叠校验失败：末事件 state_hash 与重放结果不一致')
+    state['event_seq'] = int(last.get('seq', 0))
+    state['event_state_hash'] = last.get('state_hash')
+    v, v_exists = None, os.path.exists(path)
+    if v_exists:
+        try:
+            with open(path, encoding='utf-8') as f:
+                v = json.load(f)
+        except Exception:
+            v = None
+    if v is None:
+        if v_exists:  # 视图在但解析失败（外部损坏；崩溃不会产生半写视图——os.replace 原子）
+            print(f'警告：任务板状态文件损坏（JSON 解析失败），已按事件流（权威）重放重建折叠状态: {path}',
+                  file=sys.stderr)
+        elif _orphan_log_of_archived(path):
+            # archive 崩溃窗口防御（二轮评审重要-2）：板文件缺失而事件流在，且归档区有同名板的
+            # 「有簿记、无日志」残留——顶层事件流是归档迁移未完成的孤儿日志，板已被收口；放行则
+            # 读命令按孤儿日志静默复活旧板、同名 create 续链（跨板劫持）。拒绝并提示人工核查。
+            # （视图意外丢失的正常崩溃恢复无此归档签名，仍走下方静默重建，不误伤。）
+            raise _unrecoverable(path, '板文件缺失但事件流存在，且归档区存在同名归档板的孤儿日志残留'
+                                       '（疑似 archive 迁移中断的崩溃窗口终态）；拒绝按孤儿事件流复活'
+                                       '旧板或续链，请人工核查归档区与事件流后再处理')
+        save_view(path, state)  # 视图整体丢失属崩溃恢复，静默重建
+        return state
+    vseq = v.get('event_seq')
+    if _state_hash(v) == actual and vseq == state['event_seq']:
+        return state  # 干净快路径：视图与事件流一致
+    if isinstance(vseq, int) and not isinstance(vseq, bool) and vseq < state['event_seq']:
+        # 崩溃间隙：事件已追加、视图未及写——静默重放（不报警）。诊断补充（二轮评审建议2）：
+        # 视图自称 event_seq=vseq，其内容 hash 应与第 vseq 个事件的 state_hash 一致；失配说明视图
+        # 内容曾被外部改动（而非单纯落后），stderr 补一条提示——重建行为不变，只补可观测性。
+        ref = evs[vseq - 1].get('state_hash') if 0 < vseq <= len(evs) else None
+        if ref is not None and _state_hash(v) != ref:
+            print(f'提示：任务板视图落后于事件流且内容校验失配（疑似视图曾被外部改动），已按事件流重放重建: {path}',
+                  file=sys.stderr)
+        save_view(path, state)  # 崩溃间隙：事件已追加、视图未及写——静默重放（不报警）
+        return state
+    if not any(k in v for k in BOOKKEEPING_KEYS) and _state_hash(v) == actual:
+        # 旧板收编崩溃间隙：种子事件已追加、视图未及写，仍是收编前的 v2.6 原生板（无簿记字段）。
+        # 内容与折叠权威逐字段一致 → 与上一分支同语义，静默重建（不报警）；缺簿记但内容不一致
+        # 的真实手改不豁免，仍落入下方报警分支。
+        save_view(path, state)
+        return state
+    print(f'警告：任务板状态文件校验不一致（疑似手改或外部修改），已按事件流（权威）重放重建折叠状态: {path}',
+          file=sys.stderr)
+    save_view(path, state)
+    return state
+
+
+def save(path, data):
+    """命令写路径（须在 board_lock 锁内调用）：armed 时落成事件（追加事件流 + 原子重写视图）；
+    未武装的防御路径退化为 v2.6 直写（revision 自增 + 原子替换）。"""
+    if _EVT_CTX.get('armed'):
+        commit_event(path, data)
+        return
+    data['revision'] = int(data.get('revision', 0)) + 1
+    save_view(path, data)
 
 
 def check_revision(a, data):
@@ -808,6 +1186,15 @@ def cmd_boards(a, _data=None):
             print(f'{os.path.relpath(p)} （损坏）')  # 解析失败或深层结构损坏都不裸 traceback
 
 
+def cmd_replay(a, data, path):
+    """replay：显式从事件流重放折叠状态并重写视图文件（幂等）。
+    崩溃恢复的常规路径是任意命令加载时自动重放；本命令用于人工核对与崩溃演练。"""
+    save_view(path, data)
+    print(f"已从事件流重放折叠状态: event_seq={data.get('event_seq', 0)} "
+          f"revision={data.get('revision', 0)} 任务数={len(data['tasks'])} "
+          f"state_hash={str(data.get('event_state_hash', ''))[:16]}")
+
+
 def cmd_archive(a, data, path):
     open_tasks = [t for t in data['tasks'].values() if t['status'] not in ('done', 'failed')]
     if open_tasks and not a.force:
@@ -815,8 +1202,18 @@ def cmd_archive(a, data, path):
         sys.exit(f'拒绝归档：还有未收口任务 {listing}；先 done/fail，或确认放弃用 --force')
     os.makedirs('.expert-taskboards/archive', exist_ok=True)
     name = time.strftime('%Y%m%d-%H%M%S') + '-' + os.path.basename(path)
-    os.replace(path, os.path.join('.expert-taskboards', 'archive', name))
+    target = os.path.join('.expert-taskboards', 'archive', name)
+    ep = events_path(path)
+    moved_log = os.path.exists(ep)
+    if moved_log:
+        # 先迁事件流后迁板（二轮评审重要-2）：两步间被杀时顶层残留的是板（折叠视图）而非孤儿事件流
+        # ——视图仍可直读降级、下次写以视图重新收编，数据零丢失；反序则顶层孤儿日志会被读命令按权威
+        # 静默复活旧板、被同名 create 续链（跨板劫持）。归档区孤儿日志无代码枚举消费，可接受。
+        os.replace(ep, events_path(target))
+    os.replace(path, target)
     print(f'已归档 {os.path.relpath(path)} -> .expert-taskboards/archive/{name}')
+    if moved_log:  # 事件流（状态权威）随板一并归档，重放能力不因归档丢失
+        print(f'事件日志已一并归档: .expert-taskboards/archive/{os.path.basename(events_path(target))}')
 
 
 def main():
@@ -863,6 +1260,8 @@ def main():
     p = sub.add_parser('reassign'); p.add_argument('id'); p.add_argument('attempt_id', help='新派工代际 attempt_id（编排者生成）'); p.add_argument('--owner'); add_write_args(p); p.set_defaults(fn=cmd_reassign)
     p = sub.add_parser('set_dependencies'); p.add_argument('id'); p.add_argument('--dep', required=True, help='逗号分隔的依赖任务ID（整体替换）'); add_write_args(p); p.set_defaults(fn=cmd_set_dependencies)
     p = sub.add_parser('verify'); p.add_argument('id'); p.add_argument('files', nargs='*', help='文件范围清单；缺省=重算既有回执输出 fresh/stale'); add_write_args(p); p.set_defaults(fn=cmd_verify)
+    p = sub.add_parser('replay'); p.set_defaults(fn=cmd_replay,
+                                                 help='显式从事件流重放折叠状态并重写视图文件（幂等；崩溃演练/人工核对）')
     p = sub.add_parser('_hook-check', help=argparse.SUPPRESS)  # commit-msg hook 内部入口，非用户命令
     p.add_argument('msgfile'); p.set_defaults(fn=cmd_hook_check)
 
@@ -885,6 +1284,7 @@ def main():
         with board_lock(path):  # 进程互斥：load -> CAS 校验 -> 写入整体原子（TOCTOU 防护）
             data = load(path)
             check_revision(a, data)  # 写命令的 CAS 校验，锁内针对最新落盘状态（读命令无该参数，透传为不校验）
+            _arm_event_ctx(a, data)  # 事件溯源：写命令派发前武装事件上下文（pre 快照/收编种子）
             a.fn(a, data, path)
             if a.cmd not in ('archive', '_hook-check'):
                 print(f"revision={data.get('revision', 0)}")

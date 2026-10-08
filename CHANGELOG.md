@@ -2,6 +2,16 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.7.1] — 2026-10-09
+
+### Fixed
+
+- Documentation-only patch release (no code changes in 2.7.1 itself): the three v2.6 defect fixes below shipped with the 2.7.0 code but were folded into its Added/Changed narrative — this entry adds their explicit release record, as recommended by the v2.6 defects retrospective (2026-10-09).
+- **bus.py — cross-generation filtering misjudged legitimate reports** (v2.6 D1): a `bus.py read` without `--board` resolved the default board to a stale unrelated board whose task `attempt_id` disagreed with the report's `--attempt`, so valid completion/checkpoint reports were silently archived as "not the current attempt generation" (during the 2.7 cycle this removed two T10 reports from the coordinator inbox). Fixed by the multi-board tri-state verdict in T11 (`5c2538e`): the primary resolution board is strict (missing/corrupt → unrecoverable), same-workspace candidate boards may only confirm and never veto, an explicit `--board` is strictly single-board, and revocation records take precedence; the incident messages were replayed and recovered, with 6 regression scenarios.
+- **taskboard.py — missing board file masked as "task not found"** (v2.6 D2): a `--board` pointing at a nonexistent file was treated as an empty board, so commands reported 「任务不存在」 and left a 0-byte `.lock` remnant behind instead of a board-missing error — sending triage down the wrong path. Fixed by the strict semantics in T11 (`5c2538e`): a missing/corrupt primary resolution board is an unrecoverable error, and an explicit `--board` is validated strictly.
+- **`scripts/gen-preset-declaration.mjs` — dead on arrival in the shipped 2.6.0** (v2.6 D3): after `agent.cordis.yml` became a pointer document the `-id` lines the script parsed no longer existed, so declaration regeneration crashed — a pre-existing broken script with zero test coverage. Revived by T14 (`73a54c1`) with `--roster`/`--empty-roster`/`--check`, an idempotency invariant (empty-roster output byte-identical to HEAD, 13483 B) and negative-sample failure cases for malformed artifacts.
+- Documentation precision (same release): the README upgrade-semantics paragraph now counts the PROTOCOL refresh manifest as **14 items** (previously "11 items" — it omitted `skills/expert-orchestration/source-registry.json`, `skills/expert-orchestration/roster-aliases.json`, and the separately-listed `skills/expert-orchestration/experts/`); the 2.7.0 "Verified" note below now carries the auditable exempt-return enumeration (11 = 6 explicit `return undefined` in lib + 5 `return None` in `skills/expert-orchestration/tools/taskboard.py`), replacing the unauditable "8".
+
 ## [2.7.0] — 2026-10-09
 
 ### Added
@@ -21,7 +31,7 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 
 ### Changed
 
-- **PROTOCOL refresh manifest gains `skills/expert-gestures`** — the version-marker refresh now covers 14 entries. (The README upgrade-semantics paragraph counts "11 items": it omits `source-registry.json`, `roster-aliases.json`, and `skills/expert-orchestration/experts/`, which are listed separately and also refreshed.)
+- **PROTOCOL refresh manifest gains `skills/expert-gestures`** — the version-marker refresh now covers 14 entries. (The README upgrade-semantics paragraph counted "11 items" at this release — omitting `source-registry.json`, `roster-aliases.json`, and `skills/expert-orchestration/experts/`, which are listed separately and also refreshed; corrected to 14 items in 2.7.1.)
 - **engines/peer — no change for 2.7.0**: `engines.dsh` and the `@deepseek-ai/dsh-tools` peer range already carry the `>=0.2.1-0 <0.3.0-0` branch since 2.6.0; re-verified via a static semver membership matrix (9/9 rows: `0.1.7-alpha.2` and `0.2.1-alpha.1` both hit; `0.2.2-alpha.x` correctly does not — each 0.2.x patch prerelease line still needs its own branch appended, as noted in 2.6.0).
 - `lib/index.js` deploy marker `VERSION` literal synced to 2.7.0 (drives the PROTOCOL whole-directory refresh via `.deployed-version`); `package.json` and `dsh.plugin.json` bumped in lockstep.
 
@@ -31,7 +41,7 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 
 ### Verified / not verified this release (user ruling 1B)
 
-- Static-declaration checks were re-run for both host generations: the semver membership matrix above, the refresh drill, the npm pack audit, and the tool return-value scan (no explicit `undefined` reaches any tool JSON return face; 8 internal/fail-open `undefined`/`None` returns documented as exempt). `npm test` green.
+- Static-declaration checks were re-run for both host generations: the semver membership matrix above, the refresh drill, the npm pack audit, and the tool return-value scan (no explicit `undefined` reaches any tool JSON return face; 11 internal/fail-open `undefined`/`None` returns documented as exempt — 6 explicit `return undefined` in lib (`lib/index.js:81/1099/1108`, `lib/host-settings.js:116`, `lib/tools.js:356`, `lib/client.js:136`) plus 5 `return None` in `skills/expert-orchestration/tools/taskboard.py` (`:719`/`:726` cycle-check miss, `:1412` no-owner evidence scan, `:1805`/`:1807` git-failure skip); enumeration re-verified by grep in 2.7.1). `npm test` green.
 - The two-generation **live** verification for the v2.7 gesture surface is recorded in `docs/internal/verification/T14-two-generation-declaration.md` (T14): the parsed product declaration mounted against real host code of both `0.2.1-alpha.1` and `0.1.7-alpha.2` — 14/14 checks on each, 13 skills registered (2 existing + 11 gestures), gestures excluded from the model catalog. Summon resume stays new-generation-gated by design (Q2=2A); the running host remains `0.2.1-alpha.1` — end-to-end checks that require a host restart are deferred until the user restarts (「待用户重启后补测」).
 
 ## [2.6.0] — 2026-10-08

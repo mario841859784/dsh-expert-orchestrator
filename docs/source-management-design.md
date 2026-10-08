@@ -361,3 +361,40 @@ sha256 验签失败（archive pin / pack / MANIFEST 逐文件）维持硬拒不�
 - 顶层 `customExperts[]` 摘要：`{slug, name, description, division, emoji, promptLength, enabled}`；损坏时 `customExpertsError`（降级为空数组，不炸快照）；
 - Remote 方法 9 → **13**：`saveCustom(input, enabled, rev)` / `deleteCustom(slug, rev)` / `getCustom(slug)`（读，无 rev）/ `setExpertEnabled(ref, enabled, rev)`——全部复用 expectedRevision 乐观锁 + withSourcesLock 互斥。
 - 收口追加 **14**：`getExpertContent(ref{sourceId,file}) → {content}`——只读 persona 正文访问器（「从来源专家复制为自定义」预填），无 expectedRevision；`custom` 伪来源拒绝（自有内容走 getCustom）；file 解析前缀断言（同 setExpertEnabled seatbelt，穿越/绝对路径/缺失一律 missing 拒绝）。
+
+## WP-8 设置迁移（宿主 schemastery 命名空间 + 写操作乐观锁具名化 · 后端工程师实施记录）
+
+> SUMMARY #23 / v2.6-plan.md WP-8 第①项。宿主实测环境：0.2.1-alpha.1（本机 /vol2/@appcenter/Harness/server node_modules 实读核对：@deepseek-ai/dsh-settings SettingsForms、cordis-plugin-loader Config 消费、@deepseek-ai/schemastery 3.18.5-alpha.1 方法面）。红线遵守：仅改 lib/、test/tools.selftest.mjs、本节；未 commit；VERSION/package.json/dsh.plugin.json 未动。
+
+### ① 设置页迁宿主「插件配置」页（lib/host-settings.js 新模块）
+
+- **宿主机制（实读源码核对，非推断）**：宿主 `SettingsForms`（@deepseek-ai/dsh-settings）读取每个活动插件 runtime 模块命名空间的 `Config` 导出（schemastery schema），投影为 settings 命名空间（ns = Loader entry id，本插件为部署行 `dsh-expert-orchestrator`）；仅 `volatile` 字段进入活动表单（`volatileForm` 投影，无 volatile 字段则整命名空间不出现）；表单写入落 profile patch 顶层 `id: dsh-expert-orchestrator` config 段——**随插件市场的 profile 备份/恢复走**；volatile 字段编辑不重载插件（`_commitVolatile` 原地更新 Volatile 引用），普通字段编辑走常规重载（apply 以新 config 重跑）。
+- **新增 `lib/host-settings.js`**：
+  - `loadSchemastery()`：动态 import，顺序 = 测试注入 env `DSH_EXPERT_ORCHESTRATOR_SCHEMASTERY` → `@deepseek-ai/schemastery` → `schemastery`（裸包名兜底：市场安装形态下由其他市场插件依赖提升提供，profile node_modules 实测存在 3.18.0）。动态而非静态：静态 import schemastery 会让从仓库路径 import lib/ 的测试直接 ERR_MODULE_NOT_FOUND（expert-team 同款坑）。
+  - `buildConfigSchema(mod)`：逐能力特性探测 + 全失败路径收敛 null（绝不抛）。字段两个：`expertTools.provider`（string，默认 'spawn'，普通字段——工具注册在 apply 期，编辑后随插件重载生效）；`autoClaim`（boolean，默认 true，宿主 schemastery 提供 `.volatile()` 时标记 volatile——即时生效；较旧副本无该方法则降级为普通字段，语义不变仅生效时点后移）。`.description()` 等装饰同样特性探测，抛错退回未装饰字段。
+  - `readSetting(value)`：Volatile 引用（`get()` 快照协议，@deepseek-ai/cosmokit）与普通值双形态读取（鸭子判型，不为读设置引入 cosmokit 依赖）。
+- **lib/index.js**：模块顶部动态构建并导出 `Config`（失败折叠为 `undefined`，宿主视为无设置页，插件照常装载——**注册失败不拖垮插件加载**，坑②）；`apply(ctx, config)` 把 `config.autoClaim` 原样传给 `registerExpertTools`。
+- **lib/tools.js**：`registerExpertTools` 新增可选 `autoClaim` 参数透传；`autoClaimSummonedTasks` 新增可选 `enabled`：`resolveAutoClaimEnabled` 读取（引用/布尔双形态）后 `=== false` 即关闭。开关优先级：`DSH_EXPERT_AUTOCLAIM='0'/''` 恒关（既有语义不变）→ `enabled===false` 关 → 其余开。缺省（旋钮未设置）行为与现状逐字节一致。
+- **schema 校验安全性**：schemastery object 非严格模式 `merge(result, data)` 保留未声明键——既有 `config.targetDir` 等手工配置不会被新 schema 剥离（实读 `Schema.extend("object")` 核对）。
+
+### ② 写操作 expectedRevision 乐观并发具名化（lib/index.js）
+
+- 新增导出 `SourcesRevisionConflictError`（extends Error）：`name='SourcesRevisionConflictError'`、`code='REVISION_CONFLICT'`（与宿主 settings 接缝的 `SettingsConflictError`/`SETTINGS_CONFLICT` 同型）、`expected`/`actual` 镜像宿主字段名；**消息文本逐字不变**（既有 client 与测试按 `/expert sources state changed/` 分支，零破坏）。`assertRevision` stale 分支改抛此具名错误。
+- **向后兼容**：`expectedRevision === undefined`（不传该参数的旧调用方）跳过比较、写操作照常进行；其余非法值（null/负数/非整数）仍按既有契约拒绝（`must be a non-negative integer`）——设置降级值一律 undefined 语义，null 显式报错（经验池教训：null 拖垮整份设置文档）。stale 拒绝依旧不落盘、不 bump（commitSourcesState 仅在通过守卫后可达）。
+- 覆盖面核对（只读 grep）：全部 11 个变更方法（setSourceEnabled/addSource/removeSource/setMirrorPrefixes/setDedupChoice/clearDedupChoice/saveCustom/deleteCustom/cleanupCustomDeleted/setExpertEnabled/downloadSource+updateSource 共用 remoteDownloadSourceLocked）均经 `assertRevision` 守卫，无漏网。
+
+### 自测（test/tools.selftest.mjs，+5 用例，既有 71 用例零删改；76/76 全绿）
+
+| 用例 | 断言要点 |
+|---|---|
+| WP-8 (a) | schemastery 不可解析/桩模块求值即抛/坏形态对象 → `buildConfigSchema` 收敛 null 不抛；子进程实测 `lib/index.js` 在 Config=undefined 时默认导出 apply 完好（注册失败不拖垮插件加载） |
+| WP-8 (b) | 注入桩 schemastery 构建成功：toJSON/字段/default 正确、autoClaim 标记 volatile；无 `.volatile()` 的旧副本降级为普通字段不抛；`.volatile()` 抛错退回未装饰字段 |
+| WP-8 (c) | stale 写返回具名错误（name/code/expected/actual 四要素齐全）、消息文本回归兼容、sources.json 逐字节未变（不落盘） |
+| WP-8 (d) | 旧调用不传 expectedRevision（undefined）→ saveCustom 照常写入并 bump；null 仍拒绝（契约回归） |
+| WP-8 (e) | autoClaim 旋钮消费端：enabled:false 关闭、Volatile 引用按 get() 读取、env 关闭优先级不变、registerExpertTools 透传后 summon 行为正确（关：无认领提示且板未写；引用 true：恢复自动认领） |
+
+### 边界与未验证项（诚实声明）
+
+- **已在仓库内核验**：宿主源码行为（Config 导出→settings 命名空间→profile patch 落盘→Volatile 原地更新链路）逐段实读；插件侧两条降级分支（Config=undefined / 桩构建成功）node 实测。
+- **未在本机实测**：运行中宿主 GUI（127.0.0.1:13080）的「插件配置」页实际渲染与本插件 Config 的端到端联调——需要重启宿主装载新版插件后在 GUI 核验（发布门禁阶段由 DevOps 按执行顺序：设置迁移→发布门禁）。schemastery 在宿主进程内的 bare specifier 解析取决于宿主装载器（profile 内无 @deepseek-ai 命名空间目录），两种解析结果均已覆盖：解析成功走构建分支，失败走降级分支，均不拖垮插件加载。
+- 每版发布门禁（peer 双代实测、PROTOCOL 整目录刷新演练、返回值显式 undefined 扫描）属 T5 第②项，按 T5 检查点裁决由 DevOps 承接。

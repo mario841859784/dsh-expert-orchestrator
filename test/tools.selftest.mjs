@@ -1766,3 +1766,181 @@ test('WP-3 回炉④ 全部任务 id 逐核：夹带假 id/非 running id 拒绝
   const single = runCommit(dir, 'feat: y T1')
   assert.equal(single.code, 0, single.output)
 })
+
+// ── WP-8 设置迁移（v2.6）：宿主 schemastery 命名空间 + 写操作乐观锁具名化 ──
+import { buildConfigSchema, buildPluginConfigSchema, loadSchemastery } from '../lib/host-settings.js'
+import { SourcesRevisionConflictError } from '../lib/index.js'
+
+/** 在临时目录落一个可 import 的 schemastery 桩模块，返回其文件路径。
+ *  withVolatile=false 模拟较旧宿主副本（无 .volatile() 方法）的降级分支；
+ *  volatileThrows=true 模拟装饰方法抛错的防御分支。 */
+const writeSchemasteryStub = (t, label, { withVolatile = true, broken = false, volatileThrows = false } = {}) => {
+  const dir = mkdtempSync(join(tmpdir(), `wp8-stub-${label}-`))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, 'stub-schemastery.mjs')
+  const body = broken
+    ? `throw new Error('stub module always fails')\n`
+    : `function Schema(def) { return new SchemaCls(def) }
+class SchemaCls {
+  constructor(def) { this.type = def.type; this.dict = def.dict; this.inner = def.inner; this.meta = {} }
+  toJSON() { return { type: this.type, meta: this.meta } }
+}
+for (const t of ['object', 'string', 'boolean']) {
+  Schema[t] = t === 'object'
+    ? (dict) => new SchemaCls({ type: 'object', dict })
+    : () => new SchemaCls({ type: t })
+}
+for (const m of ['default', 'description'${withVolatile ? ", 'volatile'" : ''}]) {
+  SchemaCls.prototype[m] = function (v) { this.meta[m] = v ?? true; return this }
+}
+${volatileThrows ? `SchemaCls.prototype.volatile = function () { throw new Error('boom') }\n` : ''}export default Schema
+`
+  writeFileSync(path, body)
+  return path
+}
+
+/** 子进程 import lib/index.js 并打印 Config 状态（Config 在模块求值期定格，
+ *  注入 env 必须发生在 import 之前，故用子进程隔离验证两条降级分支）。 */
+const probeConfigExport = (inject) => {
+  const script = "import('file://" + join(PKG_ROOT_ABS, 'lib', 'index.js').replaceAll('\\\\', '/') + "').then((m) => {" +
+    "console.log(JSON.stringify({ hasConfig: m.Config !== undefined, apply: typeof m.default?.apply === 'function' }))" +
+    '})'
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf-8',
+    env: { ...process.env, ...(inject ? { DSH_EXPERT_ORCHESTRATOR_SCHEMASTERY: inject } : {}) },
+  })
+  assert.equal(r.status, 0, `子进程 import 失败: ${r.stderr}`)
+  return JSON.parse(r.stdout.trim())
+}
+const PKG_ROOT_ABS = fileURLToPath(new URL('..', import.meta.url))
+
+// (a) 注册失败不拖垮插件加载：schemastery 不可解析 → Config=undefined，插件模块照常导出 apply
+test('WP-8 (a) schemastery 不可解析：buildConfigSchema 收敛 null，lib/index.js Config=undefined 且插件照常装载', async (t) => {
+  // 仓库/测试路径上 schemastery 本就不可解析：loadSchemastery 必须收敛 null 而非抛出
+  assert.equal(await loadSchemastery('/nonexistent/stub-does-not-exist.mjs'), null)
+  assert.equal(await buildPluginConfigSchema(), null)
+  // 不可用模块 / 空对象 / 缺方法对象 → 全部 null，绝不抛
+  assert.equal(buildConfigSchema(null), null)
+  assert.equal(buildConfigSchema({}), null)
+  assert.equal(buildConfigSchema({ default: { object: () => {} } }), null)
+  // broken 桩模块（求值即抛）→ loadSchemastery 跳过、buildPluginConfigSchema 收敛 null
+  assert.equal(await buildConfigSchema(await loadSchemastery(writeSchemasteryStub(t, 'broken', { broken: true }))), null)
+  // 子进程证据：Config=undefined 时插件默认导出（apply）完好——注册失败不拖垮插件加载
+  assert.deepEqual(probeConfigExport(null), { hasConfig: false, apply: true })
+})
+
+// (b) 桩 schemastery 构建成功：字段/默认值/volatile 特性探测齐全；缺 volatile 的旧副本降级不抛
+test('WP-8 (b) Config schema 构建：volatile 支持时标记 live 开关；旧副本降级为普通字段；坏输入收敛 null', async (t) => {
+  // 坏形态（非函数/缺方法/缺 toJSON）→ 全部收敛 null，绝不抛
+  assert.equal(buildConfigSchema(null), null)
+  assert.equal(buildConfigSchema({ default: { object: () => {} } }), null)
+  assert.equal(buildConfigSchema({ default: { object: () => {}, string: () => {}, boolean: () => {} } }), null)
+  // 真桩（volatile 支持）：字段齐全、默认值正确、autoClaim 标记 volatile（live 开关）
+  const stubPath = writeSchemasteryStub(t, 'volatile', { withVolatile: true })
+  const mod = { default: (await import('file://' + stubPath.replaceAll('\\\\', '/'))).default }
+  const built = buildConfigSchema(mod)
+  assert.ok(built, '桩 schemastery 下应成功构建')
+  assert.equal(typeof built.toJSON, 'function') // 宿主 SettingsForms.schema 的形态检查
+  assert.deepEqual(Object.keys(built.dict).sort(), ['autoClaim', 'expertTools'])
+  assert.equal(built.dict.autoClaim.meta.volatile, true)
+  assert.equal(built.dict.autoClaim.meta.default, true) // 默认开启（缺省=现行为，环境变量仍可关）
+  assert.equal(built.dict.expertTools.dict.provider.meta.default, 'spawn')
+  // 旧副本（无 .volatile() 方法）：字段降级注册为普通字段，构建不抛
+  const stubOld = writeSchemasteryStub(t, 'novolatile', { withVolatile: false })
+  const modOld = { default: (await import('file://' + stubOld.replaceAll('\\\\', '/'))).default }
+  const builtOld = buildConfigSchema(modOld)
+  assert.ok(builtOld, '无 volatile 的旧副本也应成功构建')
+  assert.ok(!('volatile' in builtOld.dict.autoClaim.meta), '缺 volatile 方法时不得标记 volatile')
+  assert.equal(builtOld.dict.autoClaim.meta.default, true)
+  // 装饰方法抛错（.volatile() 存在但抛错）→ optional() 退回未装饰字段而非构建失败
+  const stubThrow = writeSchemasteryStub(t, 'throwvolatile', { volatileThrows: true })
+  const modThrow = { default: (await import('file://' + stubThrow.replaceAll('\\\\', '/'))).default }
+  const builtThrow = buildConfigSchema(modThrow)
+  assert.ok(builtThrow, '装饰抛错时仍应成功构建')
+  assert.ok(!('volatile' in builtThrow.dict.autoClaim.meta), '装饰抛错时不得带上 volatile 标记')
+})
+
+// (c) 写操作 stale 返回具名错误（SourcesRevisionConflictError / REVISION_CONFLICT）且不落盘
+test('WP-8 (c) 乐观锁 stale 具名化：name/code/expected/actual 齐全，板文件逐字节未变，消息文本保持回归兼容', async (t) => {
+  const dst = mkdtempSync(join(tmpdir(), 'wp8-stale-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'sources.json'), JSON.stringify({ version: 1, revision: 7, mirrorPrefixes: null, dedup: { preferLang: null, choice: {} }, sources: [], mergedStateHash: '' }))
+    const before = readFileSync(join(dst, 'expert-sources', 'sources.json'))
+    // 过期 revision → 具名错误（消息文本不变，既有 client 按 /expert sources state changed/ 分支）
+    await assert.rejects(
+      () => remoteCleanupCustomDeleted(dst, 6),
+      (e) => {
+        assert.equal(e.name, 'SourcesRevisionConflictError')
+        assert.equal(e.code, 'REVISION_CONFLICT')
+        assert.equal(e.expected, 6)
+        assert.equal(e.actual, 7)
+        assert.match(e.message, /expert sources state changed/)
+        return true
+      },
+    )
+    assert.equal(readFileSync(join(dst, 'expert-sources', 'sources.json')).equals(before), true) // stale 拒绝不落盘
+    // 直接构造：错误类可独立实例化（wire 层映射用）
+    const err = new SourcesRevisionConflictError(6, 7)
+    assert.equal(err.name, 'SourcesRevisionConflictError')
+    assert.equal(err.code, 'REVISION_CONFLICT')
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+// (d) 旧调用向后兼容：不传 expectedRevision（undefined）照常写入；非法值（null）仍拒绝
+test('WP-8 (d) expectedRevision 可选回归：undefined 跳过校验写入成功并 bump；null 仍按契约拒绝', async (t) => {
+  const dst = mkdtempSync(join(tmpdir(), 'wp8-compat-'))
+  try {
+    mkdirSync(join(dst, 'expert-sources'), { recursive: true })
+    writeFileSync(join(dst, 'expert-sources', 'sources.json'), JSON.stringify({ version: 1, revision: 3, mirrorPrefixes: null, dedup: { preferLang: null, choice: {} }, sources: [], mergedStateHash: '' }))
+    // 旧调用形态：不传 expectedRevision（锁时代之前的调用方）→ 照常写入，revision 3→4
+    const snap = await remoteSaveCustom(dst, { name: '旧调用专家', description: 'd', prompt: 'P' }, true)
+    assert.equal(snap.revision, 4)
+    assert.equal(snap.customExperts.find((c) => c.name === '旧调用专家')?.enabled, true)
+    // null 不是「未传」：按既有契约拒绝（设置降级值一律 undefined 语义，null 必须显式报错）
+    await assert.rejects(
+      () => remoteSaveCustom(dst, { name: '另一个', description: 'd', prompt: 'P' }, true, null),
+      /expectedRevision must be a non-negative integer/,
+    )
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+// (e) autoClaim 设置旋钮（WP-8 ① 消费端）：显式关闭/env 优先级/Volatile 引用读取/注册透传
+test('WP-8 (e) autoClaim 旋钮：enabled:false 关闭、Volatile 引用按 get() 读取、env 关闭优先级不变、registerExpertTools 透传生效', async (t) => {
+  const oldEnv = process.env.DSH_EXPERT_AUTOCLAIM
+  delete process.env.DSH_EXPERT_AUTOCLAIM
+  t.after(() => { if (oldEnv === undefined) delete process.env.DSH_EXPERT_AUTOCLAIM; else process.env.DSH_EXPERT_AUTOCLAIM = oldEnv })
+  // ① 显式 false：有任务 id 也直接空串（不查板、零副作用）
+  assert.equal(await autoClaimSummonedTasks({ taskText: 'T1', owner: 'x', enabled: false }), '')
+  // ② 宿主 volatile 生效路径：enabled 是 Volatile 引用 → 按 get() 快照判定
+  assert.equal(await autoClaimSummonedTasks({ taskText: 'T1', owner: 'x', enabled: { get: () => false } }), '')
+  // get() 返回 true → 未走关闭分支（板不可定位 → 产出「跳过」提示而非空串）
+  const on = await autoClaimSummonedTasks({ taskText: 'T1', owner: 'x', enabled: { get: () => true }, cwd: t.tmpDir ?? tmpdir() })
+  assert.ok(on.includes('auto-claim'), on)
+  // ③ 环境变量关闭优先级不变（'0' 恒关，与旋钮取值无关）
+  process.env.DSH_EXPERT_AUTOCLAIM = '0'
+  assert.equal(await autoClaimSummonedTasks({ taskText: 'T1', owner: 'x', enabled: true }), '')
+  delete process.env.DSH_EXPERT_AUTOCLAIM
+  // ④ registerExpertTools 透传：autoClaim:false 时 summon 不产生认领提示、板未被写（T1 保持 ready）
+  const dst = makeWp4aDst(t, 'knob')
+  const boardDir = makeBoardDir(t, 'knob')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir, autoClaim: false })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const r = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+  assert.ok(r.answer.startsWith('ok'), r.answer)
+  assert.ok(!r.answer.includes('auto-claim'), r.answer) // 无任何认领提示
+  const board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'ready') // 旋钮关闭 → 不自动认领
+  // ⑤ 同一注册、旋钮为 Volatile 引用 get()=>true：恢复自动认领（回归现行为）
+  assert.equal(runTb(boardDir, ['create', '任务B']).code, 0) // T2 ready
+  const { descriptors: d2, ctx: c2 } = makeWp4aCtx({ boardDir })
+  registerExpertTools(c2, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir, autoClaim: { get: () => true } })
+  const r2 = await d2.find((d) => d.name === 'summon_expert').execute({ expert: '测试专家', task: '请处理 T2' }, { agent: {} })
+  assert.ok(r2.answer.includes('T2 已自动认领'), r2.answer)
+})

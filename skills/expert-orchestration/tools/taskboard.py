@@ -33,6 +33,19 @@ staged 计划草案（v2.7，WP-5/S1）：create --draft 创建 PM 规划草案�
   恢复 prompt 预算同口径，不静默截断）；⑤needs_revision 路径 --rework/--switched/--by 落档（对齐普通
   done 审计）；⑥verify 写路径拒 draft/rejected/escalated；⑦show 对 pass 后旧 findings 只展示归档标注
   （数据与事件流不动）。
+m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind review --quorum-m [N] 声明 N 人陪审团
+  （裸 --quorum-m 即默认 DEFAULT_REVIEW_QUORUM_M=3；未声明或 N=1 为单评审员路径，行为与上一段完全
+  一致）。评审员独立 vote <id> --by <评审员名> --score <0..1> 落票（任务级 votes 字段承载，多代理分别
+  写入：flock+CAS 串行、--attempt 代际校验共存；同一评审员每轮一票，重投 duplicate_vote 具名拒绝）。
+  投票口径：恰 1=pass 票、恰 0=fail 票、(0,1) 中间值=弃权（不计入同向计数，也不构成反向票）。生效规则：
+  ≥m 张同向布尔票且零反向票——pass 生效（状态仍 running，由显式 done --verdict pass 收口；未生效收口
+  被 quorum_not_met 具名拒绝）；fail 生效当场走 needs_revision 路径（复用上段 repair 生成+DAG 重排+
+  回 ready 机制，轮次上限改用 REVIEW_ROUND_LIMIT，超限 escalated），本轮票箱清空、vote_round 进次轮。
+  任一反向票出现即僵局：零反向约束使任一同向永不生效（票不可撤改，等待剩余票不改变结局）——任务当场
+  escalated 交回用户处置。回 ready 重新评审的路径（用户 retry 解除 escalated / failed 任务 retry /
+  watchdog reclaim / recover）都同步清空票箱、重置轮次（_mvote_reset_ballot 一处实现，T20 回炉评审
+  重要-1：旧票跨轮残留会伪造共识——旧同向票+新一轮少量同向票假生效——或伪造僵局）。m 票任务拒单方
+  done --verdict needs_revision（vote_required 具名拒绝）——fail 只能经投票生效，防单方绕过陪审团。
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
 检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
 指标：metrics 按 owner 聚合 任务数/累计返工/换人次数（新字段 rework/switched，旧板无此字段兼容）；done 支持 --rework N / --switched 记录返工与换人，--by 记录实际执行者（新字段 executors，旧板无此字段兼容），供项目收口时反哺专家路由表。
@@ -102,7 +115,7 @@ staged 计划草案（v2.7，WP-5/S1）：create --draft 创建 PM 规划草案�
     ② commit_event 落视图仅写 {tasks,seq,revision}+簿记（event_seq/event_state_hash），当前命令集不写板
        顶层其他键；未来新增板顶层键须同步纳入 seed/折叠/state_hash 口径，否则重放折叠缺该键、对账失配。
 """
-import argparse, collections, contextlib, copy, datetime, glob, hashlib, json, os, re, subprocess, sys, time, uuid
+import argparse, collections, contextlib, copy, datetime, decimal, glob, hashlib, json, os, re, subprocess, sys, time, uuid
 
 try:
     # POSIX 标准库；Windows 等无 fcntl 平台降级（见 board_lock）
@@ -121,12 +134,69 @@ class BoardError(Exception):
 
 
 # repair 重试上限（v2.7 WP-5/S2）：review 任务累计 needs_revision 次数超过该值即转 escalated
-# 终态交回用户处置。预置默认 3（对齐 Q3=3A 预裁决）；轮次参数由 m 票共识任务（T20）统一接配置。
+# 终态交回用户处置。预置默认 3，作用于 m=1 单评审员路径（done --verdict 单票）。
+# m 票路径（quorum_m≥2）改用评审轮次上限 REVIEW_ROUND_LIMIT（见下）——两个上限分路径取用（m 票任务
+# 恒用评审轮次上限：单方 needs_revision 被 vote_required 拒、fail 只能经投票生效，本上限不触发；
+# 仅单票路径取用本值）；
+# 轮次计数同源复用 repair_count（评审轮次=needs_revision 发生次数，同一事实不设第二计数器，杜绝双计数漂移）。
 REPAIR_RETRY_LIMIT = 3
+
+# m 票布尔共识参数（v2.7 WP-5/S3，用户裁决 Q3=3A）：
+DEFAULT_REVIEW_QUORUM_M = 3  # create --kind review 裸声明 --quorum-m 时的默认陪审团规模（m=3）
+REVIEW_ROUND_LIMIT = 2       # m 票评审轮次上限：fail 生效（=needs_revision 发生）超过 2 轮即 escalated
 
 # --findings 长度上限（v2.7 T19 回炉，建议③）：码点数，超限硬拒（零事件零落盘）而非静默截断——
 # 截断会丢评审要点且 repair desc 以 findings 为据；口径与断点恢复 prompt 预算（lib RESUME_PROMPT_MAX_CHARS）对齐。
 FINDINGS_MAX_CHARS = 4000
+
+
+def _mvote_active(t):
+    """任务是否处于 m 票多评审员模式：quorum_m≥2 显式声明才启用；未声明或 m=1 一律单评审员路径
+    （done --verdict 单票，行为与 T19 完全一致——m=1 向后兼容锚点）。"""
+    m = t.get('quorum_m')
+    return isinstance(m, int) and not isinstance(m, bool) and m >= 2
+
+
+def _vote_tally(t):
+    """当前轮票箱统计（唯一口径来源）：恰 1 记 pass 票、恰 0 记 fail 票、(0,1) 中间值记弃权
+    （弃权不计入同向计数，也不构成反向票）。返回 (pass, fail, abstain)。"""
+    votes = t.get('votes') or []
+    p = sum(1 for v in votes if v.get('score') == 1)
+    f = sum(1 for v in votes if v.get('score') == 0)
+    return p, f, len(votes) - p - f
+
+
+def _mvote_reset_ballot(t):
+    """回 ready 重新评审前清空 m 票票箱（quorum_m≥2 任务）：清空 votes、重置 vote_round。
+    全部「回 ready 重新评审」路径（用户 retry 解除 escalated / failed 任务 retry / watchdog
+    reclaim / recover，T20 回炉评审重要-1）共用这一处实现——评审轮次以回 ready 为界，旧票跨轮
+    残留会让「≥m 同向且零反向」跨轮计票：旧同向票+新一轮少量同向票假 pass 生效，旧反向票假僵局
+    （watchdog reclaim 为自动路径，无人操作即可触发）。本函数只改内存态，落盘由调用方既有 save
+    执行（清空动作随所在命令的单事件 after 快照落事件流）。返回是否清空（供检查点措辞）。"""
+    if not _mvote_active(t):
+        return False
+    t.pop('votes', None)
+    t.pop('vote_round', None)
+    return True
+
+
+def _score_arg(s):
+    """--score 解析（T20 回炉裁决③）：布尔票边界「恰 1/恰 0」按十进制字面量精确判定——
+    21 个 9 的 0.999…9 经 float() 会坍缩成恰 1.0 而被误记 pass 票（对称地 0.000…1 坍缩成恰 0
+    误记 fail 票），此类字面量在解析期具名拒绝；其余值转双精度存档（中间值只承载弃权语义，
+    坍缩无实害不拒）。nan/inf 仍交 cmd_vote 既有区间校验具名拒绝（退出语义与旧版一致）。"""
+    try:
+        d = decimal.Decimal(s)
+    except (decimal.InvalidOperation, ValueError):
+        raise argparse.ArgumentTypeError(f'无效十进制数值 {s!r}')
+    if not d.is_finite():
+        return float(d)  # nan/inf：交 cmd_vote 既有 [0,1] 区间校验拒绝
+    v = float(d)
+    if (v == 1.0 and d != 1) or (v == 0.0 and d != 0):
+        raise argparse.ArgumentTypeError(
+            f"{s} 字面量并非恰 {'1' if v == 1.0 else '0'} 但双精度坍缩到恰值——布尔票边界按十进制"
+            "字面量精确判定，请按字面精度给分（pass 票给 1、fail 票给 0）")
+    return v
 
 
 def now_ms():
@@ -366,12 +436,17 @@ def _event_args(a):
     """事件 args 载荷：记录命令意图（审计用）；状态本体由 after 快照承载。"""
     c = a.cmd
     if c == 'create':
-        return {'title': a.title, 'owner': a.owner or '',
+        args = {'title': a.title, 'owner': a.owner or '',
                 'dep': [d.strip() for d in (a.dep or '').split(',') if d.strip()],
                 'desc': a.desc or '', 'scope': a.scope or '', 'draft': bool(a.draft),
                 'kind': getattr(a, 'kind', None)}
+        if getattr(a, 'quorum_m', None) is not None:
+            args['quorum_m'] = a.quorum_m  # m 票声明随事件留档（未声明=单评审员路径，args 形状与旧版一致）
+        return args
     if c == 'claim':
         return {'owner': a.owner, 'attempt': a.attempt}
+    if c == 'vote':
+        return {'by': a.by, 'score': a.score}
     if c == 'done':
         return {'summary': a.summary or '', 'rework': a.rework, 'switched': a.switched, 'by': a.by,
                 'verdict': getattr(a, 'verdict', None), 'findings': getattr(a, 'findings', None),
@@ -398,7 +473,7 @@ def _event_args(a):
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
 _WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
                          'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve',
-                         'reject'))
+                         'reject', 'vote'))
 
 
 def _arm_event_ctx(a, data):
@@ -777,6 +852,11 @@ def show(t):
 def cmd_create(a, data, path):
     if a.kind and a.kind != 'review':
         sys.exit(f"错误：--kind 仅支持 review（得到 {a.kind!r}）；m 票共识等其余 kind 由后续版本提供")
+    if getattr(a, 'quorum_m', None) is not None:
+        if a.kind != 'review':
+            sys.exit('错误：--quorum-m 仅支持 review kind 任务（m 票布尔共识陪审团规模）')
+        if a.quorum_m < 1:
+            sys.exit('错误：--quorum-m 须为 ≥1 的整数（裸声明即默认陪审团 m=3；m=1 单评审员路径无需声明）')
     deps = [d.strip() for d in (a.dep or '').split(',') if d.strip()]
     for d in deps:
         if d not in data['tasks']:
@@ -794,6 +874,8 @@ def cmd_create(a, data, path):
         data['tasks'][tid]['scope'] = scope
     if a.kind:
         data['tasks'][tid]['kind'] = a.kind  # review kind：完成走 --verdict 分叉（缺省不带该字段）
+    if getattr(a, 'quorum_m', None) is not None:
+        data['tasks'][tid]['quorum_m'] = a.quorum_m  # m 票陪审团规模（缺省不带该字段=单评审员路径）
     promoted = refresh(data)
     save(path, data)
     show(data['tasks'][tid])
@@ -823,6 +905,11 @@ def cmd_show(a, data, _):
     if t.get('kind'):
         extra = f"（repair_of={t['repair_of']}）" if t.get('repair_of') else ''
         print(f"  kind: {t['kind']}{extra}")
+    if _mvote_active(t):
+        p, f, ab = _vote_tally(t)
+        detail = '；'.join(f"{v.get('by')}:{v.get('score'):g}" for v in (t.get('votes') or []))
+        print(f"  m 票评审: m={t['quorum_m']}，第 {t.get('vote_round') or 1} 轮；"
+              f"票箱 pass {p}/fail {f}/弃权 {ab}" + (f"（{detail}）" if detail else '（空）'))
     if t.get('verdict'):
         if t['verdict'] == 'pass' and t.get('findings'):
             # 建议②（T19 回炉）：pass 后不再显示旧 findings（消除「通过却挂着发现」的矛盾展示）；
@@ -834,7 +921,10 @@ def cmd_show(a, data, _):
                 line += f"；findings: {t['findings']}"
             print(line)
     if t.get('repair_count'):
-        print(f"  repair 重试: {t['repair_count']}/{REPAIR_RETRY_LIMIT}")
+        if _mvote_active(t):
+            print(f"  评审轮次: {t['repair_count']}/{REVIEW_ROUND_LIMIT}")  # m 票路径轮次上限标签
+        else:
+            print(f"  repair 重试: {t['repair_count']}/{REPAIR_RETRY_LIMIT}")
     if t['summary']:
         print(f"  结果: {t['summary']}")
     if t['fail']:
@@ -929,53 +1019,75 @@ def _validate_done_verdict(a, t):
         if a.verdict == 'pass' and ((a.findings or '').strip() or a.repair_owner):
             sys.exit(f"错误：--verdict pass 不接受 --findings/--repair-owner（评审通过无需修复）；"
                      "评审备注写入 summary")
+        if _mvote_active(t):
+            # m 票评审（WP-5/S3）：收口结论须与票箱一致——pass 生效（≥m 张 pass 票且零 fail 票）才可收口；
+            # fail 不接受单方裁决（须经投票生效，防单方绕过陪审团）。校验发生在任何变更与 save 之前。
+            p, f, ab = _vote_tally(t)
+            if a.verdict == 'pass' and not (p >= t['quorum_m'] and f == 0):
+                raise BoardError('quorum_not_met', task=a.id, quorum_m=t['quorum_m'],
+                                 tally={'pass': p, 'fail': f, 'abstain': ab},
+                                 hint='m 票评审 pass 生效需 ≥m 张 pass 票且零 fail 票（弃权不计同向不构成反向）；'
+                                      '先由评审员 vote 落票，pass 生效后再收口')
+            if a.verdict == 'needs_revision':
+                raise BoardError('vote_required', task=a.id, quorum_m=t['quorum_m'],
+                                 tally={'pass': p, 'fail': f, 'abstain': ab},
+                                 hint='m 票评审的 fail 结论须经投票生效（vote 命令：fail 票 ≥m 且零 pass 票'
+                                      '自动触发 repair 路径）；不接受单方 done --verdict needs_revision')
     elif a.verdict or (a.findings or '').strip() or a.repair_owner:
         sys.exit(f"错误：{a.id} 非 review 任务（kind={kind or '（缺省）'}），"
                  "不支持 --verdict/--findings/--repair-owner")
 
 
-def _done_needs_revision(a, data, path, t):
-    """review 结论 needs_revision（WP-5/S2）：原任务不完成——回 ready 待修复后复审；自动生成
-    repair 任务（引用原任务+findings，不经 draft 直接 ready：来源是工具自动编排而非 PM 规划），
-    原任务的全部下游依赖改挂 repair（DAG 重排）；全部变更经一次 save 落成单事件（多任务 after
-    快照，事件流可追溯）。repair 重试超过 REPAIR_RETRY_LIMIT 不再生成 repair：任务转 escalated
-    终态交回用户处置（不可 claim/done，用户显式 retry 可解除升级）。
+def _review_needs_revision(a, data, path, t, findings, limit, limit_label):
+    """review 结论 needs_revision 共享机制（WP-5/S2 单票路径 + WP-5/S3 m 票 fail 生效路径共用）：
+    原任务不完成——回 ready 待修复后复审；自动生成 repair 任务（引用原任务+findings，不经 draft
+    直接 ready：来源是工具自动编排而非 PM 规划），原任务的全部下游依赖改挂 repair（DAG 重排）；
+    全部变更经一次 save 落成单事件（多任务 after 快照，事件流可追溯）。计数超 limit 不再生成
+    repair：任务转 escalated 终态交回用户处置（不可 claim/done，用户显式 retry 可解除升级）。
+    两路径接线点：单票路径 a=done 命名空间，limit=REPAIR_RETRY_LIMIT（repair 重试上限 3）、
+    findings 取 --findings、审计参数 --rework/--switched/--by 落档；m 票路径 a=None（无审计侧写、
+    repair owner 缺省为空由编排者分配），limit=REVIEW_ROUND_LIMIT（评审轮次上限 2）、findings 由
+    fail 生效票箱合成——轮次计数同源复用 repair_count（评审轮次=needs_revision 发生次数），不设
+    第二计数器杜绝双计数漂移。
     多轮语义（T19 回炉，评审疑-1 编排者裁决「每轮都重排」）：每轮 needs_revision 都生成新 repair，
     依赖原任务或任一旧 repair 的下游一律改挂最新 repair——下游始终只等最新修复；已 ready 的下游
     随之回 pending（其依赖由已满足变为未满足，保持「ready 蕴含依赖已满足」不变量）；running/done
-    下游不打断（在途工作与既成事实不动）。--rework/--switched/--by 与普通 done 审计丰富度对齐落档。"""
-    findings = (a.findings or '').strip()
+    下游不打断（在途工作与既成事实不动）。"""
     count = int(t.get('repair_count') or 0) + 1
     ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
     t['verdict'] = 'needs_revision'
     t['findings'] = findings
     t['repair_count'] = count
-    # 建议④（回炉）：needs_revision 路径 --rework/--switched/--by 落档不丢弃（与普通 done 审计对齐）
-    if a.rework is not None:
-        t['rework'] = a.rework
-    if a.switched:
+    # 建议④（回炉）：单票路径 --rework/--switched/--by 落档不丢弃（与普通 done 审计对齐）；m 票路径 a=None 跳过
+    rework = getattr(a, 'rework', None) if a is not None else None
+    switched = getattr(a, 'switched', False) if a is not None else False
+    by = getattr(a, 'by', None) if a is not None else None
+    repair_owner = getattr(a, 'repair_owner', None) if a is not None else None
+    if rework is not None:
+        t['rework'] = rework
+    if switched:
         t['switched'] = True
-    if a.by and a.by != t['owner']:
-        t.setdefault('executors', []).append({'name': a.by, 'time': ts})
-    if count > REPAIR_RETRY_LIMIT:
+    if by and by != t['owner']:
+        t.setdefault('executors', []).append({'name': by, 'time': ts})
+    if count > limit:
         # 超上限：不再自动生成 repair——escalated 终态，处置权交回用户
         t['status'] = 'escalated'
         t['updated'] = now_ms()
         t.setdefault('checkpoints', []).append(
-            {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision，超过 repair 重试上限 "
-                                 f"{REPAIR_RETRY_LIMIT} → escalated（交回用户处置）"})
+            {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision，超过 {limit_label} "
+                                 f"{limit} → escalated（交回用户处置）"})
         save(path, data)
         show(t)
-        if a.by and a.by != t['owner']:
-            print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
-        print(f'  评审结论: needs_revision（第 {count} 次，超过 repair 重试上限 {REPAIR_RETRY_LIMIT}）→ 已升级 escalated')
+        if by and by != t['owner']:
+            print(f"实际执行者 {by} 已记录（owner={t['owner']}）")
+        print(f'  评审结论: needs_revision（第 {count} 次，超过 {limit_label} {limit}）→ 已升级 escalated')
         print('  终态：不可 claim/done，仅用户显式指令（retry 解除升级并重置重试预算）可再动')
         return
     # 自动生成 repair 任务（等价 create 装配；无上游依赖——评审已发生，修复即可开工，refresh 后即 ready）
     tid = f"T{data['seq'] + 1}"
     data['seq'] += 1
     data['tasks'][tid] = {
-        'id': tid, 'title': f"[repair] {t['title']}", 'owner': a.repair_owner or '', 'dep': [],
+        'id': tid, 'title': f"[repair] {t['title']}", 'owner': repair_owner or '', 'dep': [],
         'desc': f"评审失败修复（来源 {t['id']} 结论 needs_revision）：{findings}", 'status': 'pending',
         'created': now_ms(), 'updated': now_ms(), 'summary': '', 'fail': '',
         'repair_of': t['id'],
@@ -1013,8 +1125,8 @@ def _done_needs_revision(a, data, path, t):
     save(path, data)
     show(t)
     show(data['tasks'][tid])
-    if a.by and a.by != t['owner']:
-        print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
+    if by and by != t['owner']:
+        print(f"实际执行者 {by} 已记录（owner={t['owner']}）")
     if repointed:
         print(f"下游依赖已改挂 {tid}: " + ' '.join(repointed))
     if promoted:
@@ -1044,7 +1156,9 @@ def cmd_done(a, data, path):
     if a.rework is not None and a.rework < 0:
         sys.exit('错误：--rework 不能为负数')
     if a.verdict == 'needs_revision':
-        _done_needs_revision(a, data, path, t)
+        # 单票路径（m=1/未声明）：REPAIR_RETRY_LIMIT=3 计 repair 重试（m 票路径经 vote 由 REVIEW_ROUND_LIMIT 接管）
+        _review_needs_revision(a, data, path, t, findings=(a.findings or '').strip(),
+                               limit=REPAIR_RETRY_LIMIT, limit_label='repair 重试上限')
         return
     t['status'] = 'done'
     closed_repairs = []
@@ -1111,23 +1225,35 @@ def cmd_retry(a, data, path):
     t = get_task(data, a.id)
     if t['status'] == 'escalated':
         # escalated 唯一工具内出口（WP-5/S2）：用户显式指令解除升级，回 ready 并重置 repair 重试预算
-        # （用户决定再给一轮修复机会；旧 verdict/findings 留档不删，复审通过时被覆盖）
+        # （用户决定再给一轮修复机会；旧 verdict/findings 留档不删，复审通过时被覆盖）。
+        # m 票任务（WP-5/S3 接线点）：僵局/轮次升级解除时同步清空票箱、重置评审轮次（T20 回炉起与
+        # failed retry / watchdog reclaim / recover 共用 _mvote_reset_ballot 一处实现）。
         t['status'] = 'ready'
         t['fail'] = ''
         t['repair_count'] = 0
+        mvote = _mvote_reset_ballot(t)
         t['updated'] = now_ms()
         ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
         t.setdefault('checkpoints', []).append(
-            {'time': ts, 'note': '用户显式 retry：解除 escalated，回 ready；repair 重试预算已重置'})
+            {'time': ts, 'note': '用户显式 retry：解除 escalated，回 ready；repair 重试预算已重置'
+                                 + ('；m 票票箱已清空、评审轮次重置' if mvote else '')})
         save(path, data)
         show(t)
-        print('已解除升级：任务回 ready，repair 重试预算重置；请在任务书注明用户处置决定')
+        print('已解除升级：任务回 ready，repair 重试预算重置；请在任务书注明用户处置决定'
+              + ('（m 票任务：票箱已清空、评审轮次重置，重新投票）' if mvote else ''))
         return
     if t['status'] != 'failed':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 failed 可重试")
     t['status'] = 'ready'
     t['fail'] = ''
+    # T20 回炉（评审重要-1）：failed→retry 同样是「回 ready 重新评审」——m 票任务清空票箱、重置轮次
+    # （如评审员失联经 fail 处置后重派：旧票残留会让新一轮评审跨轮计票，假 pass 生效或假僵局）。
+    mvote = _mvote_reset_ballot(t)
     t['updated'] = now_ms()
+    if mvote:
+        ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('checkpoints', []).append(
+            {'time': ts, 'note': 'failed 重试：回 ready；m 票票箱已清空、评审轮次重置（重新投票）'})
     save(path, data)
     show(t)
 
@@ -1148,6 +1274,92 @@ def cmd_progress(a, data, path):
     save(path, data)
     show(t)
     print(f"  最新检查点({len(t['checkpoints'])}): [{ts}] {a.note}")
+
+
+# ── m 票布尔共识投票（v2.7，WP-5/S3，用户裁决 Q3=3A）────────────────────────
+# 口径与生效规则见 _vote_tally 与文件头。设计要点：评审员独立 summon、各自落票——投票写入点必须是
+# 多代理可分别调用的独立命令（done 是收口语义不能复用），票箱为任务级 votes 字段（随任务快照折叠/
+# 重放/hash 全链透明，零新顶层键）；并发写由 board_lock（flock）+ CAS --expected-revision 串行化，
+# 聚合评估在锁内针对刚加载的落盘状态进行（只读快照语义，无 TOCTOU）；--attempt 走既有代际校验
+# （fail closed，缺省不校验与旧版一致）。落款即身份（--by，与直改主板同信任级别——能写板文件即可
+# 伪造落款，与 done --by / claim --owner 同口径；不建评审员身份系统为既定非目标，T20 回炉裁决②）。
+
+def cmd_vote(a, data, path):
+    """vote <id> --by <评审员名> --score <0..1>：m 票评审落票（quorum_m≥2 任务专用；任务须 running）。
+    每票落账后按票箱即时评估生效规则：≥m 张同向布尔票且零反向票才生效——pass 生效仅置可收口状态
+    （显式 done --verdict pass 收口，summary 等收口审计照常落档）；fail 生效当场走 _review_needs_revision
+    共享机制（repair 生成+下游改挂+回 ready，轮次上限 REVIEW_ROUND_LIMIT），本轮票箱清空、vote_round
+    进次轮；出现任一反向票即僵局（零反向约束使任一同向永不生效），当场 escalated 交回用户。
+    未达生效线仅记票（每次落票单事件，args 记 by/score 供审计）。"""
+    t = get_task(data, a.id)
+    check_attempt(a, t)
+    if t.get('kind') != 'review':
+        sys.exit(f"错误：{a.id} 非 review 任务（kind={t.get('kind') or '（缺省）'}），无投票面")
+    if not _mvote_active(t):
+        sys.exit(f"错误：{a.id} 未启用 m 票（quorum_m={t.get('quorum_m') or '未声明，按 m=1'}）——"
+                 "单评审员路径直接 done --verdict 落结论，无需投票")
+    if t['status'] != 'running':
+        sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 running 可投票")
+    if not (0.0 <= a.score <= 1.0):
+        sys.exit(f"错误：--score 须为 [0,1] 区间数值（得到 {a.score!r}）：恰 1=pass 票、恰 0=fail 票、"
+                 "(0,1) 中间值=弃权")
+    by = (a.by or '').strip()
+    if not by:
+        sys.exit('错误：--by 必填（落款即身份：投票评审员名；同一评审员每轮一票）')
+    votes = t.setdefault('votes', [])
+    if any(v.get('by') == by for v in votes):
+        raise BoardError('duplicate_vote', task=a.id, by=by,
+                         hint='同一评审员本轮已投过票（票不可撤改）；如需重投由用户 retry 清空票箱后重新评审')
+    p_prev, f_prev, _ = _vote_tally(t)  # 本票落账前快照：判定本票是否为生效跃迁票（弃权票落已生效票箱不重复触发生效）
+    votes.append({'by': by, 'score': a.score, 'ts': now_ms()})
+    t['updated'] = now_ms()
+    m = t['quorum_m']
+    p, f, ab = _vote_tally(t)
+    tally = f'pass {p}/fail {f}/弃权 {ab}'
+    detail = '；'.join(f"{v['by']}:{v['score']:g}" for v in votes)
+    ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+    if p >= 1 and f >= 1:
+        # 僵局：反向票一经出现，零反向约束使任一同向永不生效（票不可撤改，等待剩余票不改变结局）
+        # ——当场 escalated 交回用户（验收 d：2 pass+1 fail → 不生效且交回用户）。
+        t['status'] = 'escalated'
+        t.setdefault('checkpoints', []).append(
+            {'time': ts, 'note': f"m 票评审（m={m}）出现反向票，零反向约束使任一同向永不生效"
+                                 f"（{tally}；{detail}）→ escalated 交回用户处置"})
+        save(path, data)
+        show(t)
+        print(f'  僵局收口：有反向票即任一同向永不生效（{tally}）→ 已升级 escalated，交回用户处置')
+        print('  终态：不可 claim/done/vote，仅用户显式指令（retry 解除升级并清空票箱）可再动')
+        return
+    if f >= m:  # pass==0 由僵局分支先行拦截：fail 生效必然零 pass 票
+        # fail 生效 → needs_revision 共享机制（repair 生成+DAG 重排+回 ready；m 票轮次上限 2）
+        rnd = int(t.get('vote_round') or 1)
+        failers = '、'.join(v['by'] for v in votes if v['score'] == 0)
+        findings = (f"m 票评审第 {rnd} 轮 fail 生效（{tally}；fail 票：{failers}）——"
+                    "各评审员发现明细见其 bus 汇报")
+        t['vote_round'] = rnd + 1
+        t['votes'] = []  # 本轮票箱清空（事件流可追溯），进入下一轮复审
+        print(f'  fail 生效（{tally}，零反向票）→ 按 needs_revision 路径处理（评审轮次上限 {REVIEW_ROUND_LIMIT}）')
+        _review_needs_revision(None, data, path, t, findings=findings,
+                               limit=REVIEW_ROUND_LIMIT, limit_label='评审轮次上限')
+        return
+    if p >= m:
+        # pass 生效：不自动收口——done 携带 summary 等收口审计，由显式 done --verdict pass 完成
+        if not (p_prev >= m and f_prev == 0):  # 本票为跃迁票（此前未生效）：落生效检查点，仅一次
+            t.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"m 票评审 pass 生效（m={m}，{tally}，零反向票）——可 done --verdict pass 收口"})
+            save(path, data)
+            show(t)
+            print(f'  pass 生效（{tally}，零反向票）：done --verdict pass 收口')
+            return
+        save(path, data)
+        show(t)
+        print(f'  已记票（{tally}）——pass 已生效（m={m}，零反向票），可 done --verdict pass 收口')
+        return
+    save(path, data)
+    show(t)
+    direction = 'pass' if f == 0 else 'fail'
+    need = (m - p) if f == 0 else (m - f)
+    print(f'  已记票（{tally}；{detail}）——未达生效线：同向需 ≥{m} 张且零反向票（还差 {need} 张 {direction} 票）')
 
 
 # ── 滑动无进展 watchdog + 孤儿 adopt（v2.7，WP-4b/S2）────────────────────────
@@ -1310,9 +1522,13 @@ def cmd_watchdog(a, data, path):
             t['nudges'] = 0
             t.pop('nudged_at', None)
             t.pop('heartbeat_at', None)
+            # T20 回炉（评审重要-1）：reclaim 回 ready 重新评审——m 票任务清空票箱、重置轮次（自动路径
+            # 无人操作即可触发，旧票跨轮残留的危害最大：假 pass 生效收口或假僵局）。
+            mvote = _mvote_reset_ballot(t)
             ts = datetime.datetime.fromtimestamp(now / 1000).strftime('%Y-%m-%d %H:%M:%S')
             t.setdefault('checkpoints', []).append(
-                {'time': ts, 'note': f"watchdog: reclaim（{why_note}）→ ready；attempt {att or '（无）'} 已撤销"})
+                {'time': ts, 'note': f"watchdog: reclaim（{why_note}）→ ready；attempt {att or '（无）'} 已撤销"
+                                     + ('；m 票票箱已清空、评审轮次重置' if mvote else '')})
             t['updated'] = now
             reclaimed += 1
             changed += 1
@@ -1340,11 +1556,18 @@ def cmd_watchdog(a, data, path):
 
 
 def cmd_recover(a, data, path):
+    """recover：全部 running 任务回 ready（会话中断后的兜底恢复）。m 票任务（T20 回炉，评审重要-1）：
+    回 ready 即重新评审——清空票箱、重置轮次，防旧票跨轮残留跨入新轮计票（假 pass 生效或假僵局）；
+    全部清空随本次 save 的单事件 after 快照落事件流。"""
+    ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
     n = 0
     for t in data['tasks'].values():
         if t['status'] == 'running':
             t['status'] = 'ready'
             t['updated'] = now_ms()
+            if _mvote_reset_ballot(t):
+                t.setdefault('checkpoints', []).append(
+                    {'time': ts, 'note': 'recover：回 ready；m 票票箱已清空、评审轮次重置（重新投票）'})
             n += 1
     save(path, data)
     print(f'已恢复 {n} 个 running 任务为 ready')
@@ -1731,6 +1954,9 @@ def main():
                    help='创建为 PM 规划草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；缺省行为不变')
     p.add_argument('--kind', help='任务种类（缺省不带 kind 字段，行为不变）：review=评审任务，完成须显式 '
                                   '--verdict pass|needs_revision，失败自动生成 repair 并重排下游依赖')
+    p.add_argument('--quorum-m', type=int, nargs='?', const=DEFAULT_REVIEW_QUORUM_M, default=None,
+                   help='m 票布尔共识陪审团规模（仅 review kind；裸声明即默认 3，Q3=3A）；'
+                        '未声明或 m=1 为单评审员路径，行为不变')
     add_write_args(p)
     p.set_defaults(fn=cmd_create)
 
@@ -1745,6 +1971,9 @@ def main():
     p.set_defaults(fn=cmd_reject,
                    help='PM 规划草案否决：draft -> rejected 终态（退出批准面不滞留；不可 claim/approve）')
     p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); p.add_argument('--verdict', help='review 任务完成结论（review 任务必填）：pass=评审通过正常完成；needs_revision=须携带 --findings，自动生成 repair+下游 DAG 重排，原任务回 ready 待复审'); p.add_argument('--findings', help='评审发现清单（needs_revision 必填，供 repair 任务引用）'); p.add_argument('--repair-owner', help='自动生成 repair 任务的 owner（缺省为空，由编排者分配）'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_done)
+    p = sub.add_parser('vote'); p.add_argument('id'); p.add_argument('--by', required=True, help='投票评审员名（落款即身份；同一评审员每轮一票，重投 duplicate_vote 拒绝）'); p.add_argument('--score', type=_score_arg, required=True, help='评审值 [0,1]：恰 1=pass 票、恰 0=fail 票、(0,1) 中间值=弃权；布尔票边界按十进制字面量精确判定（非恰 1/0 但双精度坍缩到边界的字面量，如 0.999…9 长 9 串，解析期拒绝）'); add_attempt_arg(p); add_write_args(p)
+    p.set_defaults(fn=cmd_vote,
+                   help='m 票评审投票（--quorum-m≥2 任务专用）：≥m 同向且零反向才生效——pass 生效后 done --verdict pass 收口；fail 生效当场自动 repair（票箱清空进次轮，超 2 轮 escalated）；反向票即僵局当场 escalated 交回用户')
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); add_write_args(p); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser('progress'); p.add_argument('id'); p.add_argument('note'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_progress)

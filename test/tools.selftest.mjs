@@ -670,7 +670,7 @@ test('WP-1 (d) 环检测：set_dependencies 构造 A→B→C→A 被拒且不落
 // (e) 全程无第三方 import：taskboard.py 仅标准库
 test('WP-1 (e) taskboard.py 零第三方 import（import 语句逐一落进标准库白名单）', () => {
   const src = readFileSync(TASKBOARD, 'utf-8')
-  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'copy', 'datetime', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid'])
+  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'copy', 'datetime', 'decimal', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid'])
   const found = []
   for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
     for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
@@ -3628,6 +3628,330 @@ test('T19 回炉 建议①③④：verify 写路径状态守卫；findings 4000 
   const sh3 = ok3('show', 'T1')
   assert.match(sh3.stdout, /返工 2 次，已换人/)
   assert.match(sh3.stdout, /实际执行者: 评审员B\[/)
+})
+
+// ── T20 WP-5/S3 m 票布尔共识：多评审员投票 + escalated 接线 + m=1 向后兼容（Q3=3A）──
+// 验收 (d)：3 票中 2 pass+1 弃权（如 0.5）→ pass 生效（场景以 m=2 复现：2 pass 达 m、弃权不计同向
+// 也不构成反向）；2 pass+1 fail → 不生效且交回用户（僵局当场 escalated）。(e)：m=1 退化为单评审员
+// 行为（未声明/显式 1 均走既有 done --verdict 单票路径，136-141 用例零改动全过共同覆盖）。Q3=3A：
+// 裸 --quorum-m 落默认 m=3、评审轮次上限 2（fail 生效超 2 轮 escalated，与单票路径 REPAIR_RETRY_LIMIT=3
+// 分路径取用，轮次计数同源复用 repair_count）。缺省（无 --quorum-m）行为完全不变。
+test('T20 (d1) m 票 pass 生效：3 票中 2 pass+1 弃权→pass 生效可收口；裸 --quorum-m 落默认 m=3（Q3=3A）；未生效收口 quorum_not_met 拒绝且零事件零落盘', (t) => {
+  const dir = makeBoardDir(t, 't20-pass')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  const eventsPath = boardPath + '.events.jsonl'
+  const evCount = () => readFileSync(eventsPath, 'utf-8').trim().split('\n').length
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  // 验收 (d) 场景：3 票中 2 pass+1 弃权 → pass 生效（m=2：同向布尔票达 m=2、弃权中性）
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '编排者') // T1
+  ok('claim', 'T1', '编排者')
+  ok('vote', 'T1', '--by', '甲', '--score', '1')
+  const eff = ok('vote', 'T1', '--by', '乙', '--score', '1')
+  assert.match(eff.stdout, /pass 生效/)
+  const abst = ok('vote', 'T1', '--by', '丙', '--score', '0.5') // 弃权：不计同向、不构成反向
+  assert.match(abst.stdout, /pass 已生效/)
+  let b = board()
+  assert.equal(b.tasks.T1.quorum_m, 2)
+  assert.equal(b.tasks.T1.votes.length, 3, '弃权票同样落票箱留档')
+  assert.deepEqual(b.tasks.T1.votes.map((v) => v.score), [1, 1, 0.5])
+  assert.equal(b.tasks.T1.status, 'running', 'pass 生效不自动收口，待显式 done --verdict pass')
+  ok('done', 'T1', '陪审团通过', '--verdict', 'pass')
+  b = board()
+  assert.equal(b.tasks.T1.status, 'done')
+  assert.equal(b.tasks.T1.verdict, 'pass')
+  // Q3=3A 参数落默认：裸 --quorum-m 即 m=3
+  ok('create', '默认陪审团', '--kind', 'review', '--quorum-m', '--owner', '编排者') // T2
+  b = board()
+  assert.equal(b.tasks.T2.quorum_m, 3, 'Q3=3A：裸声明 --quorum-m 落默认 m=3')
+  // 未生效收口被拒（零事件零落盘）：m=3 任务 1 张 pass 票即 done pass → quorum_not_met
+  ok('claim', 'T2', '编排者')
+  ok('vote', 'T2', '--by', '甲', '--score', '1')
+  const ev0 = evCount()
+  const rev0 = revOf(ok('show', 'T2').stdout)
+  const rej = runTb(dir, ['done', 'T2', '抢收', '--verdict', 'pass'])
+  assert.equal(rej.code, 1)
+  assert.equal(rej.json.error, 'quorum_not_met')
+  assert.equal(rej.json.quorum_m, 3)
+  assert.deepEqual(rej.json.tally, { pass: 1, fail: 0, abstain: 0 })
+  assert.equal(evCount(), ev0, '拒绝零事件追加')
+  assert.equal(revOf(ok('show', 'T2').stdout), rev0, '拒绝零落盘')
+})
+
+test('T20 (d2) 反向票僵局：2 pass+1 fail→不生效且当场 escalated 交回用户；escalated 拒 vote/claim/progress；用户 retry 清空票箱重置轮次后可重新评审', (t) => {
+  const dir = makeBoardDir(t, 't20-deadlock')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const denied = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 1, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '编排者') // T1
+  ok('claim', 'T1', '编排者')
+  ok('vote', 'T1', '--by', '甲', '--score', '1')
+  ok('vote', 'T1', '--by', '乙', '--score', '1') // pass 生效（m=2）
+  const r = ok('vote', 'T1', '--by', '丙', '--score', '0') // 反向票：僵局
+  assert.match(r.stdout, /escalated/)
+  let b = board()
+  assert.equal(b.tasks.T1.status, 'escalated', '不生效且交回用户（T19 escalated 终态承载）')
+  assert.equal(b.tasks.T1.verdict, undefined, '僵局无结论（pass/fail 均未生效）')
+  assert.equal(b.tasks.T1.votes.length, 3, '僵局票箱保留供用户核查')
+  assert.match(ok('status').stdout, /escalated=1/)
+  assert.match(denied('claim', 'T1', '某人').stderr, /escalated/)
+  assert.match(denied('progress', 'T1', 'x').stderr, /escalated/)
+  assert.match(denied('vote', 'T1', '--by', '丁', '--score', '1').stderr, /只有 running 可投票/)
+  // 用户 retry：解除升级 + 清空票箱 + 轮次重置（旧票留存会永久阻塞零反向约束）
+  ok('retry', 'T1')
+  b = board()
+  assert.equal(b.tasks.T1.status, 'ready')
+  assert.equal(b.tasks.T1.votes, undefined, '票箱已清空')
+  assert.equal(b.tasks.T1.repair_count, 0)
+  // 重新评审可正常走通：新轮次重新投票（1 fail 未达线仅记票，不残留旧票影响）
+  ok('claim', 'T1', '编排者')
+  const rv = ok('vote', 'T1', '--by', '甲', '--score', '0')
+  assert.match(rv.stdout, /未达生效线/)
+  b = board()
+  assert.equal(b.tasks.T1.votes.length, 1, '新一轮票箱从零开始')
+  assert.equal(b.tasks.T1.status, 'running')
+})
+
+test('T20 fail 生效接线：fail 票达 m 当场走 T19 needs_revision 路径（repair 生成+下游改挂+回 ready+票箱清空进次轮）；超评审轮次上限 2 escalated（第 3 轮不再生成 repair）；show 评审轮次标签', (t) => {
+  const dir = makeBoardDir(t, 't20-fail')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '编排者') // T1
+  ok('create', '下游任务', '--dep', 'T1') // T2
+  ok('claim', 'T1', '编排者')
+  // 第 1 轮 fail 生效：repair 生成 + 下游改挂 + 回 ready + 票箱清空进次轮
+  ok('vote', 'T1', '--by', '甲', '--score', '0')
+  const r1 = ok('vote', 'T1', '--by', '乙', '--score', '0')
+  assert.match(r1.stdout, /fail 生效/)
+  let b = board()
+  assert.equal(b.tasks.T1.status, 'ready')
+  assert.equal(b.tasks.T1.repair_count, 1)
+  assert.equal(b.tasks.T1.vote_round, 2, '轮次推进')
+  assert.deepEqual(b.tasks.T1.votes, [], '本轮票箱清空（事件流可追溯）')
+  assert.equal(b.tasks.T3.repair_of, 'T1', 'T3=repair：repair_of 回指原任务')
+  assert.deepEqual(b.tasks.T3.dep, [], 'repair 无上游依赖（评审已发生）')
+  assert.equal(b.tasks.T3.status, 'ready', 'repair 直接 ready（工具自动编排不经草案）')
+  assert.deepEqual(b.tasks.T2.dep, ['T3'], '下游 T2 依赖改挂最新 repair')
+  assert.equal(b.tasks.T2.status, 'pending', '下游等待 repair done（保持 ready 蕴含依赖已满足）')
+  // show 展示：m 票评审行（次轮空票箱）+ 评审轮次标签（m 票路径不用 repair 重试 3 分母）
+  const sh = ok('show', 'T1')
+  assert.match(sh.stdout, /m 票评审: m=2，第 2 轮；票箱 pass 0\/fail 0\/弃权 0（空）/)
+  assert.match(sh.stdout, /评审轮次: 1\/2/)
+  assert.doesNotMatch(sh.stdout, /repair 重试/)
+  assert.match(sh.stdout, /findings: m 票评审第 1 轮 fail 生效/)
+  // 第 2 轮 fail 生效（仍在轮次上限内）：再生成新 repair，下游改挂最新 repair
+  ok('claim', 'T1', '编排者')
+  ok('vote', 'T1', '--by', '甲', '--score', '0')
+  ok('vote', 'T1', '--by', '乙', '--score', '0')
+  b = board()
+  assert.equal(b.tasks.T1.status, 'ready')
+  assert.equal(b.tasks.T1.repair_count, 2)
+  assert.equal(b.tasks.T1.vote_round, 3)
+  const repairs = Object.values(b.tasks).filter((x) => x.repair_of === 'T1')
+  assert.equal(repairs.length, 2, '第 2 轮生成新 repair')
+  // 第 3 轮 fail 生效：超过评审轮次上限 2 → escalated，不再生成 repair
+  ok('claim', 'T1', '编排者')
+  ok('vote', 'T1', '--by', '甲', '--score', '0')
+  const r3 = ok('vote', 'T1', '--by', '乙', '--score', '0')
+  assert.match(r3.stdout, /escalated/)
+  b = board()
+  assert.equal(b.tasks.T1.status, 'escalated')
+  assert.equal(b.tasks.T1.repair_count, 3, '轮次计数同源复用 repair_count')
+  assert.equal(Object.values(b.tasks).filter((x) => x.repair_of === 'T1').length, 2, '第 3 轮不再生成 repair')
+  assert.match(r3.stdout, /评审轮次上限 2/)
+})
+
+test('T20 (e) m=1 兼容与守卫面：未声明/显式 m=1 均走既有单评审员 done --verdict 单票路径；vote 拒非 m 票与非 review 任务；score 越界/重复票/单方 needs_revision/CAS/attempt 语义共存', (t) => {
+  const dir = makeBoardDir(t, 't20-compat')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const denied = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 1, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  // (e) 未声明：单票直接收口（T19 语义零变化，无 quorum_m/votes 字段）
+  ok('create', '单评审员', '--kind', 'review', '--owner', '评审员') // T1
+  ok('claim', 'T1', '评审员')
+  ok('done', 'T1', '通过', '--verdict', 'pass')
+  let b = board()
+  assert.equal(b.tasks.T1.status, 'done')
+  assert.equal(b.tasks.T1.quorum_m, undefined)
+  assert.equal(b.tasks.T1.votes, undefined)
+  // (e) 显式 m=1：退化为同一单评审员行为
+  ok('create', '退化陪审团', '--kind', 'review', '--quorum-m', '1', '--owner', '评审员') // T2
+  ok('claim', 'T2', '评审员')
+  ok('done', 'T2', '通过', '--verdict', 'pass')
+  assert.equal(board().tasks.T2.status, 'done')
+  // vote 拒 m=1 任务（未声明与显式 1 同语义）
+  ok('create', '再来一单', '--kind', 'review', '--quorum-m', '1', '--owner', '评审员') // T3
+  ok('claim', 'T3', '评审员')
+  assert.match(denied('vote', 'T3', '--by', '甲', '--score', '1').stderr, /未启用 m 票/)
+  // vote 拒非 review 任务
+  ok('create', '普通任务', '--owner', '工人') // T4
+  ok('claim', 'T4', '工人')
+  assert.match(denied('vote', 'T4', '--by', '甲', '--score', '1').stderr, /review/)
+  // create 校验：--quorum-m 拒非 review kind、拒 <1
+  assert.match(denied('create', '普通带票', '--quorum-m', '3').stderr, /review/)
+  assert.match(denied('create', '零票', '--kind', 'review', '--quorum-m', '0').stderr, /--quorum-m/)
+  // m 票任务守卫面：score 越界 / 重复票 / 单方 needs_revision / CAS / attempt
+  ok('create', '陪审团', '--kind', 'review', '--quorum-m', '--owner', '编排者') // T5（裸声明 m=3）
+  ok('claim', 'T5', '编排者', '--attempt', 'A1')
+  assert.match(denied('vote', 'T5', '--by', '甲', '--score', '1.5').stderr, /--score/)
+  assert.match(denied('vote', 'T5', '--by', '甲', '--score', '-0.1').stderr, /--score/)
+  const stale = runTb(dir, ['vote', 'T5', '--by', '甲', '--score', '1', '--attempt', 'A0'])
+  assert.equal(stale.json.error, 'stale_attempt', 'attempt 代际校验共存（旧代际拒绝）')
+  const cas = runTb(dir, ['vote', 'T5', '--by', '甲', '--score', '1', '--expected-revision', '1'])
+  assert.equal(cas.json.error, 'stale_revision', 'CAS 乐观锁共存（旧 revision 拒绝）')
+  const v1 = ok('vote', 'T5', '--by', '甲', '--score', '1', '--attempt', 'A1')
+  assert.match(v1.stdout, /已记票/)
+  const dup = runTb(dir, ['vote', 'T5', '--by', '甲', '--score', '0.5'])
+  assert.equal(dup.code, 1)
+  assert.equal(dup.json.error, 'duplicate_vote', '同一评审员本轮一票（落款即身份）')
+  assert.equal(board().tasks.T5.votes.length, 1, '重投拒绝零落盘')
+  const nr = runTb(dir, ['done', 'T5', '单方裁决', '--verdict', 'needs_revision', '--findings', '问题'])
+  assert.equal(nr.code, 1)
+  assert.equal(nr.json.error, 'vote_required', 'm 票任务拒单方 needs_revision（fail 须经投票生效）')
+})
+
+test('T20 事件溯源：vote 走事件追加（type=vote、args 落 by/score）；fail 生效单事件携带 repair+改挂下游 after 快照；quorum_m/votes/vote_round 新字段重放折叠一致', (t) => {
+  const dir = makeBoardDir(t, 't20-events')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  const eventsPath = boardPath + '.events.jsonl'
+  const events = () => readFileSync(eventsPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '编排者') // T1
+  ok('create', '下游任务', '--dep', 'T1') // T2
+  ok('claim', 'T1', '编排者')
+  // 未达线票：每次落票恰一个事件，args 记投票意图
+  ok('vote', 'T1', '--by', '甲', '--score', '0.5') // 弃权：仅记票
+  ok('vote', 'T1', '--by', '乙', '--score', '0') // fail 票 1（m=2 未达线）
+  let evs = events()
+  assert.equal(evs[evs.length - 1].type, 'vote')
+  assert.deepEqual(evs[evs.length - 1].args, { by: '乙', score: 0 })
+  const t1 = evs[evs.length - 1].after.T1
+  assert.equal(t1.votes.length, 2, '未达线仅记票（弃权+fail 各一票）')
+  assert.equal(t1.quorum_m, 2)
+  // fail 生效：单事件携带 repair 新任务 + 下游改挂 + 原任务回 ready 的全量 after 快照
+  ok('vote', 'T1', '--by', '丙', '--score', '0') // fail 票 2：达 m=2 且零 pass 票 → fail 生效
+  evs = events()
+  const failEv = evs[evs.length - 1]
+  assert.equal(failEv.type, 'vote')
+  assert.deepEqual(Object.keys(failEv.after).sort(), ['T1', 'T2', 'T3'], '单事件多任务 after 快照（原任务+repair+改挂下游）')
+  assert.equal(failEv.after.T1.status, 'ready')
+  assert.deepEqual(failEv.after.T1.votes, [])
+  assert.equal(failEv.after.T3.repair_of, 'T1', 'repair T3 随同事件落账')
+  assert.deepEqual(failEv.after.T2.dep, ['T3'], '下游 T2 改挂随同事件落账')
+  // 重放幂等：新字段随任务快照折叠，重放与崩溃前逐字段一致
+  const before = board().tasks
+  ok('replay')
+  const after = board().tasks
+  assert.deepEqual(after, before, 'replay 折叠逐字段一致')
+})
+
+// ── T20 回炉（评审重要-1 + 裁决③）：回 ready 路径票箱清空 ──────────────────────
+// 票箱清空此前只接 escalated-retry 一处；failed→retry / recover / watchdog reclaim 三条回 ready
+// 路径残留旧票，跨轮计票可造成假共识（m=2 旧 pass + 新一轮仅 1 张新 pass → 「≥m 同向且零反向」
+// 假 pass 生效并收口，/tmp 实锤；watchdog reclaim 为自动路径更易触发）与假僵局（旧反向票残留）。
+// 修复后三条路径与 escalated 分支共用 _mvote_reset_ballot：以下用例每条路径各自验证
+// 「旧票残留 → 路径触发 → 票箱清空 → 新投票从零评估」，假 pass/假僵局场景修复后均不生效。
+
+test('T20 回炉(a) failed→retry 清箱：旧 pass 票残留经 fail→retry 回 ready 后票箱清空、轮次重置；新轮 1 张 pass 不达线（假 pass 不生效）', (t) => {
+  const dir = makeBoardDir(t, 't20-retry-failed')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const board = () => JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '编排者') // T1
+  ok('claim', 'T1', '编排者')
+  ok('vote', 'T1', '--by', '甲', '--score', '1') // 旧 pass 票（m=2 未达线仅记票）
+  ok('fail', 'T1', '评审员失联') // fail→retry 是回 ready 重新评审路径（非 fail 生效投票路径）
+  let b = board()
+  assert.equal(b.tasks.T1.status, 'failed')
+  assert.equal(b.tasks.T1.votes.length, 1, '前提：failed 态旧票残留')
+  ok('retry', 'T1')
+  b = board()
+  assert.equal(b.tasks.T1.status, 'ready')
+  assert.equal(b.tasks.T1.votes, undefined, '票箱已清空（与 escalated retry 同语义）')
+  assert.equal(b.tasks.T1.vote_round, undefined, '轮次已重置')
+  assert.ok(b.tasks.T1.checkpoints.some((c) => c.note.includes('m 票票箱已清空、评审轮次重置')), JSON.stringify(b.tasks.T1.checkpoints))
+  ok('claim', 'T1', '编排者')
+  const r = ok('vote', 'T1', '--by', '乙', '--score', '1') // 假 pass 反证：修复前此处「pass 生效（pass 2/fail 0）」假共识
+  assert.match(r.stdout, /未达生效线/)
+  assert.doesNotMatch(r.stdout, /pass 生效/)
+  b = board()
+  assert.equal(b.tasks.T1.status, 'running')
+  assert.equal(b.tasks.T1.votes.length, 1, '新轮票箱从零开始')
+})
+
+test('T20 回炉(b) recover 清箱：pass 生效后 recover 回 ready 票箱清空（单事件 after 快照落事件流）；新轮 1 张 pass 不达线（假 pass 不生效）', (t) => {
+  const dir = makeBoardDir(t, 't20-recover')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const board = () => JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  const events = () => readFileSync(join(dir, BOARD_REL) + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '编排者') // T1
+  ok('claim', 'T1', '编排者')
+  ok('vote', 'T1', '--by', '甲', '--score', '1')
+  ok('vote', 'T1', '--by', '乙', '--score', '1') // pass 生效（running，待显式收口）
+  ok('recover')
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'ready')
+  assert.equal(b.tasks.T1.votes, undefined, '票箱已清空')
+  assert.ok(b.tasks.T1.checkpoints.some((c) => c.note.includes('m 票票箱已清空、评审轮次重置')), JSON.stringify(b.tasks.T1.checkpoints))
+  const ev = events()[events().length - 1]
+  assert.equal(ev.type, 'recover')
+  assert.equal(ev.after.T1.status, 'ready')
+  assert.equal(ev.after.T1.votes, undefined, '清空动作随单事件 after 快照落事件流')
+  ok('claim', 'T1', '编排者')
+  const r = ok('vote', 'T1', '--by', '丙', '--score', '1') // 修复前：2 张旧 pass 残留 + 1 张新 pass 即假生效
+  assert.match(r.stdout, /未达生效线/)
+  assert.doesNotMatch(r.stdout, /pass 生效/)
+})
+
+test('T20 回炉(c) watchdog reclaim 清箱（自动路径）：旧 fail 票残留、review 任务无响应超限 → reclaim 清箱重轮；新轮 1 张 pass 不达线也不 escalated（假僵局不生效）', (t) => {
+  const dir = makeBoardDir(t, 't20-reclaim')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const board = () => JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '3', '--owner', '编排者') // T1
+  ok('claim', 'T1', '编排者', '--attempt', 'A1')
+  ok('vote', 'T1', '--by', '甲', '--score', '0') // 旧 fail 票（m=3 未达线仅记票）
+  const w = ok('watchdog', '--window-sec', '0', '--max-nudges', '0') // review 任务有落盘报告也不 adopt，照常 reclaim
+  assert.match(w.stdout, /已 reclaim/)
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'ready')
+  assert.equal(b.tasks.T1.votes, undefined, '票箱已清空（自动路径无人操作也清）')
+  assert.ok(b.tasks.T1.checkpoints.some((c) => c.note.startsWith('watchdog: reclaim') && c.note.includes('m 票票箱已清空、评审轮次重置')), JSON.stringify(b.tasks.T1.checkpoints))
+  ok('claim', 'T1', '编排者', '--attempt', 'A2')
+  const r = ok('vote', 'T1', '--by', '乙', '--score', '1') // 修复前：旧 fail 残留 → p1/f1 触发假僵局 escalated
+  assert.match(r.stdout, /未达生效线/)
+  assert.equal(board().tasks.T1.status, 'running', '假僵局反证：未 escalated')
+  assert.equal(board().tasks.T1.votes.length, 1, '新轮票箱从零开始')
+})
+
+test('T20 回炉(d) score 字面量边界（裁决③）：非恰 1/0 但双精度坍缩到边界的字面量解析期拒绝且零落盘；16 个 9 正常落弃权；nan 拒绝语义不变', (t) => {
+  const dir = makeBoardDir(t, 't20-score')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '--owner', '编排者') // T1 裸声明 m=3
+  ok('claim', 'T1', '编排者')
+  const before = readFileSync(boardPath)
+  // 21 个 9：float() 坍缩恰 1.0 → 若放行会记 pass 票（评审 /tmp 实测）；解析期具名拒绝（argparse exit 2）
+  const r1 = runTb(dir, ['vote', 'T1', '--by', '甲', '--score', '0.999999999999999999999'])
+  assert.equal(r1.code, 2)
+  assert.match(r1.stderr, /并非恰 1/)
+  assert.deepEqual(readFileSync(boardPath), before, '拒绝零落盘')
+  // 对称边界：1e-400 坍缩恰 0.0 → 若放行会记 fail 票；同样拒绝
+  const r2 = runTb(dir, ['vote', 'T1', '--by', '乙', '--score', '1e-400'])
+  assert.equal(r2.code, 2)
+  assert.match(r2.stderr, /并非恰 0/)
+  assert.deepEqual(readFileSync(boardPath), before, '拒绝零落盘')
+  // 16 个 9：双精度可区分（< 1.0）→ 正常落弃权票（既有口径不回归）
+  const r3 = ok('vote', 'T1', '--by', '丙', '--score', '0.9999999999999999')
+  assert.match(r3.stdout, /已记票/)
+  assert.equal(JSON.parse(readFileSync(boardPath, 'utf-8')).tasks.T1.votes[0].score, 0.9999999999999999)
+  // nan：仍走 cmd_vote 既有 [0,1] 区间校验（exit 1，与旧版一致）
+  const r4 = runTb(dir, ['vote', 'T1', '--by', '丁', '--score', 'nan'])
+  assert.equal(r4.code, 1)
+  assert.match(r4.stderr, /--score 须为/)
+  assert.equal(JSON.parse(readFileSync(boardPath, 'utf-8')).tasks.T1.votes.length, 1, '拒绝路径零落票')
 })
 
 // ── T12 (WP-4b ④) summon 专家断点续跑：seam 探测 + 恰好一次续跑 turn + 断点折叠 ──

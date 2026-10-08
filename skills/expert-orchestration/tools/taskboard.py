@@ -12,7 +12,27 @@ staged 计划草案（v2.7，WP-5/S1）：create --draft 创建 PM 规划草案�
   批准前零 spawn 在工具级执法：draft 不可 claim（拒绝零事件零落盘）、不参与依赖自动提升
   （refresh 只提升 pending）、不被 recover/watchdog 触碰（均只扫 running）；插件 lib 侧 auto-claim
   仅对 ready 认领（draft≠ready 天然跳过）。draft 是合法状态值——事件流/折叠视图/replay/hash 校验
-  全链透明，不新增板顶层键。
+  全链透明，不新增板顶层键。reject <id>：draft -> rejected 终态（被否决草案退出批准面不永久滞留，
+  archive 不因 draft 滞留被迫 --force；rejected 不可 claim/approve）；progress/reassign 拒 draft/rejected/
+  escalated（草案无执行进度、终态不可再动）；metrics 不计 draft/rejected（未开工不计 owner 工作量）。
+质量门禁 kind 化（v2.7，WP-5/S2）：create --kind review 声明评审任务（缺省不带 kind 字段，行为完全不变）；
+  review 任务完成语义分叉——done 须显式 --verdict pass|needs_revision：结论 pass 才可 done；结论 needs_revision
+  必须携带 --findings（缺 findings 在任何变更与 save 之前被拒，零事件零落盘），且不完成原任务——自动生成
+  repair 任务（引用原任务+findings，--repair-owner 可指定，不经 draft 直接 ready：来源是工具自动编排而非
+  PM 规划；repair_of 字段回指原任务，scope 继承原任务供 hook 第三查覆盖修复提交），原任务的全部下游依赖
+  改挂 repair（DAG 重排，与原任务/repair/重排下游同落单事件 after 快照，事件流可追溯），原任务回 ready
+  待修复后复审；repair 完成后下游按既有依赖提升自然解锁。repair 重试超过上限（REPAIR_RETRY_LIMIT=3，
+  轮次参数后续由 m 票任务统一接配置）不再生成 repair：任务转 escalated 终态交回用户处置——不可
+  claim/done/progress/reassign，用户显式 retry 解除升级并重置重试预算回 ready。
+  回炉修订（T19 评审重要-1/2 + 建议①-④ + 多轮语义）：①watchdog 对 review 任务永不 adopt——评审结论
+  必须经显式 done --verdict 落地，即使发现落盘报告也照常 reclaim 回 ready 重新评审；②复审 pass 时自动
+  收口名下开放 repair（ready/pending/failed）为 rejected 终态（作废语义——rejected 承载草案否决与 repair 收口
+  两类来源），其下游依赖改挂回已 done 的评审任务、按既有提升逻辑自然解锁；③多轮 needs_revision 每轮
+  都重排：下游（挂原任务或任一旧 repair）一律改挂最新 repair，已 ready 的下游回 pending（保持「ready
+  蕴含依赖已满足」），running/done 下游不打断；④--findings 超 FINDINGS_MAX_CHARS=4000 码点硬拒（与断点
+  恢复 prompt 预算同口径，不静默截断）；⑤needs_revision 路径 --rework/--switched/--by 落档（对齐普通
+  done 审计）；⑥verify 写路径拒 draft/rejected/escalated；⑦show 对 pass 后旧 findings 只展示归档标注
+  （数据与事件流不动）。
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
 检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
 指标：metrics 按 owner 聚合 任务数/累计返工/换人次数（新字段 rework/switched，旧板无此字段兼容）；done 支持 --rework N / --switched 记录返工与换人，--by 记录实际执行者（新字段 executors，旧板无此字段兼容），供项目收口时反哺专家路由表。
@@ -98,6 +118,15 @@ class BoardError(Exception):
         super().__init__(code)
         self.code = code
         self.fields = fields
+
+
+# repair 重试上限（v2.7 WP-5/S2）：review 任务累计 needs_revision 次数超过该值即转 escalated
+# 终态交回用户处置。预置默认 3（对齐 Q3=3A 预裁决）；轮次参数由 m 票共识任务（T20）统一接配置。
+REPAIR_RETRY_LIMIT = 3
+
+# --findings 长度上限（v2.7 T19 回炉，建议③）：码点数，超限硬拒（零事件零落盘）而非静默截断——
+# 截断会丢评审要点且 repair desc 以 findings 为据；口径与断点恢复 prompt 预算（lib RESUME_PROMPT_MAX_CHARS）对齐。
+FINDINGS_MAX_CHARS = 4000
 
 
 def now_ms():
@@ -339,11 +368,14 @@ def _event_args(a):
     if c == 'create':
         return {'title': a.title, 'owner': a.owner or '',
                 'dep': [d.strip() for d in (a.dep or '').split(',') if d.strip()],
-                'desc': a.desc or '', 'scope': a.scope or '', 'draft': bool(a.draft)}
+                'desc': a.desc or '', 'scope': a.scope or '', 'draft': bool(a.draft),
+                'kind': getattr(a, 'kind', None)}
     if c == 'claim':
         return {'owner': a.owner, 'attempt': a.attempt}
     if c == 'done':
-        return {'summary': a.summary or '', 'rework': a.rework, 'switched': a.switched, 'by': a.by}
+        return {'summary': a.summary or '', 'rework': a.rework, 'switched': a.switched, 'by': a.by,
+                'verdict': getattr(a, 'verdict', None), 'findings': getattr(a, 'findings', None),
+                'repair_owner': getattr(a, 'repair_owner', None)}
     if c == 'fail':
         return {'reason': a.reason or ''}
     if c == 'progress':
@@ -358,14 +390,15 @@ def _event_args(a):
         return {'dep': a.dep}
     if c == 'verify':
         return {'files': list(a.files or [])}
-    return {}  # retry/recover/approve 等无附加意图
+    return {}  # retry/recover/approve/reject 等无附加意图
 
 
 # 写命令事件上下文：main 派发前武装（pre 快照供差分、并按需充当收编种子），save() 据此落事件。
 # 写命令白名单：与 save() 调用方一一对应。读命令（list/show/status/deps/metrics）与
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
 _WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
-                         'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve'))
+                         'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve',
+                         'reject'))
 
 
 def _arm_event_ctx(a, data):
@@ -705,6 +738,10 @@ def verify_status(t, cwd=None):
 def cmd_verify(a, data, path):
     """verify <id> <文件...>：记录验证回执指纹；verify <id>：重算并输出 fresh/stale。"""
     t = get_task(data, a.id)
+    if a.files and t['status'] in ('draft', 'rejected', 'escalated'):
+        # 建议①（T19 回炉）：草案/终态/升级待处置无验证交付面——写回执路径与 progress/reassign 守卫
+        # 对齐（escalated 面不再有可写残余）；读路径（重算 fresh/stale）不受影响，供处置时诊断。
+        sys.exit(f"错误：{a.id} 状态为 {t['status']}，不可写验证回执")
     if a.files:
         rels = []
         for f in a.files:
@@ -733,10 +770,13 @@ def show(t):
     dep = (' dep=' + ','.join(t['dep'])) if t['dep'] else ''
     owner = (f" owner={t['owner']}") if t['owner'] else ''
     scope = (' scope=' + ','.join(t['scope'])) if t.get('scope') else ''
-    print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}{scope}")
+    kind = (f" kind={t['kind']}") if t.get('kind') else ''  # 缺省任务不带 kind 字段（行为不变）
+    print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}{scope}{kind}")
 
 
 def cmd_create(a, data, path):
+    if a.kind and a.kind != 'review':
+        sys.exit(f"错误：--kind 仅支持 review（得到 {a.kind!r}）；m 票共识等其余 kind 由后续版本提供")
     deps = [d.strip() for d in (a.dep or '').split(',') if d.strip()]
     for d in deps:
         if d not in data['tasks']:
@@ -752,6 +792,8 @@ def cmd_create(a, data, path):
     }
     if scope:
         data['tasks'][tid]['scope'] = scope
+    if a.kind:
+        data['tasks'][tid]['kind'] = a.kind  # review kind：完成走 --verdict 分叉（缺省不带该字段）
     promoted = refresh(data)
     save(path, data)
     show(data['tasks'][tid])
@@ -778,6 +820,21 @@ def cmd_show(a, data, _):
     show(t)
     if t['desc']:
         print(f"  完成标准: {t['desc']}")
+    if t.get('kind'):
+        extra = f"（repair_of={t['repair_of']}）" if t.get('repair_of') else ''
+        print(f"  kind: {t['kind']}{extra}")
+    if t.get('verdict'):
+        if t['verdict'] == 'pass' and t.get('findings'):
+            # 建议②（T19 回炉）：pass 后不再显示旧 findings（消除「通过却挂着发现」的矛盾展示）；
+            # 数据与事件流不动——findings 永存事件流可追溯，仅展示层修正。
+            print('  评审结论: pass（已通过，历史 findings 归档）')
+        else:
+            line = f"  评审结论: {t['verdict']}"
+            if t.get('findings'):
+                line += f"；findings: {t['findings']}"
+            print(line)
+    if t.get('repair_count'):
+        print(f"  repair 重试: {t['repair_count']}/{REPAIR_RETRY_LIMIT}")
     if t['summary']:
         print(f"  结果: {t['summary']}")
     if t['fail']:
@@ -810,6 +867,9 @@ def cmd_claim(a, data, path):
         # WP-5/S1 批准前零 spawn 工具级执法：draft 未批准不进派工面（拒绝零事件零落盘——
         # sys.exit 发生在任何变更与 save 之前）。
         sys.exit(f"错误：{a.id} 为 PM 规划草案（draft），未经 approve 批准不可认领")
+    if t['status'] == 'escalated':
+        # WP-5/S2 escalated 终态：交回用户处置，不可认领（用户显式 retry 是唯一工具内出口）
+        sys.exit(f"错误：{a.id} 已升级（escalated），等待用户处置，不可认领；用户显式 retry 可解除升级")
     if t['status'] != 'ready':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 ready 可认领")
     if a.attempt:
@@ -848,14 +908,167 @@ def cmd_approve(a, data, path):
         print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
 
 
+def _validate_done_verdict(a, t):
+    """review kind 完成语义分叉校验（WP-5/S2）：在任何变更与 save 之前拒绝——零事件零落盘。
+    review 任务：--verdict 必填且仅 pass|needs_revision；needs_revision 必须携带非空 --findings
+    （验收断言 b）；pass 不接受 --findings/--repair-owner（评审通过无需修复，防发现清单被静默丢弃）。
+    非 review 任务：不接受任何 review 语义参数（verdict/findings/repair_owner）。"""
+    kind = t.get('kind')
+    if kind == 'review':
+        if not a.verdict:
+            sys.exit(f"错误：{a.id} 为 review 任务，完成须显式给出结论 --verdict pass|needs_revision")
+        if a.verdict not in ('pass', 'needs_revision'):
+            sys.exit(f"错误：--verdict 仅接受 pass|needs_revision（得到 {a.verdict!r}）")
+        if a.verdict == 'needs_revision' and not (a.findings or '').strip():
+            sys.exit(f"错误：{a.id} 结论为 needs_revision 必须携带 --findings（评审发现清单，"
+                     "供自动 repair 任务引用）；缺 findings 的 needs_revision 被拒绝（零事件零落盘）")
+        if a.verdict == 'needs_revision' and len((a.findings or '').strip()) > FINDINGS_MAX_CHARS:
+            sys.exit(f"错误：--findings 长 {len((a.findings or '').strip())} 码点，超过上限 "
+                     f"{FINDINGS_MAX_CHARS}（与断点恢复 prompt 预算同口径）；超限硬拒不静默截断"
+                     "（截断会丢评审要点），请压缩为要点清单后重试（零事件零落盘）")
+        if a.verdict == 'pass' and ((a.findings or '').strip() or a.repair_owner):
+            sys.exit(f"错误：--verdict pass 不接受 --findings/--repair-owner（评审通过无需修复）；"
+                     "评审备注写入 summary")
+    elif a.verdict or (a.findings or '').strip() or a.repair_owner:
+        sys.exit(f"错误：{a.id} 非 review 任务（kind={kind or '（缺省）'}），"
+                 "不支持 --verdict/--findings/--repair-owner")
+
+
+def _done_needs_revision(a, data, path, t):
+    """review 结论 needs_revision（WP-5/S2）：原任务不完成——回 ready 待修复后复审；自动生成
+    repair 任务（引用原任务+findings，不经 draft 直接 ready：来源是工具自动编排而非 PM 规划），
+    原任务的全部下游依赖改挂 repair（DAG 重排）；全部变更经一次 save 落成单事件（多任务 after
+    快照，事件流可追溯）。repair 重试超过 REPAIR_RETRY_LIMIT 不再生成 repair：任务转 escalated
+    终态交回用户处置（不可 claim/done，用户显式 retry 可解除升级）。
+    多轮语义（T19 回炉，评审疑-1 编排者裁决「每轮都重排」）：每轮 needs_revision 都生成新 repair，
+    依赖原任务或任一旧 repair 的下游一律改挂最新 repair——下游始终只等最新修复；已 ready 的下游
+    随之回 pending（其依赖由已满足变为未满足，保持「ready 蕴含依赖已满足」不变量）；running/done
+    下游不打断（在途工作与既成事实不动）。--rework/--switched/--by 与普通 done 审计丰富度对齐落档。"""
+    findings = (a.findings or '').strip()
+    count = int(t.get('repair_count') or 0) + 1
+    ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+    t['verdict'] = 'needs_revision'
+    t['findings'] = findings
+    t['repair_count'] = count
+    # 建议④（回炉）：needs_revision 路径 --rework/--switched/--by 落档不丢弃（与普通 done 审计对齐）
+    if a.rework is not None:
+        t['rework'] = a.rework
+    if a.switched:
+        t['switched'] = True
+    if a.by and a.by != t['owner']:
+        t.setdefault('executors', []).append({'name': a.by, 'time': ts})
+    if count > REPAIR_RETRY_LIMIT:
+        # 超上限：不再自动生成 repair——escalated 终态，处置权交回用户
+        t['status'] = 'escalated'
+        t['updated'] = now_ms()
+        t.setdefault('checkpoints', []).append(
+            {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision，超过 repair 重试上限 "
+                                 f"{REPAIR_RETRY_LIMIT} → escalated（交回用户处置）"})
+        save(path, data)
+        show(t)
+        if a.by and a.by != t['owner']:
+            print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
+        print(f'  评审结论: needs_revision（第 {count} 次，超过 repair 重试上限 {REPAIR_RETRY_LIMIT}）→ 已升级 escalated')
+        print('  终态：不可 claim/done，仅用户显式指令（retry 解除升级并重置重试预算）可再动')
+        return
+    # 自动生成 repair 任务（等价 create 装配；无上游依赖——评审已发生，修复即可开工，refresh 后即 ready）
+    tid = f"T{data['seq'] + 1}"
+    data['seq'] += 1
+    data['tasks'][tid] = {
+        'id': tid, 'title': f"[repair] {t['title']}", 'owner': a.repair_owner or '', 'dep': [],
+        'desc': f"评审失败修复（来源 {t['id']} 结论 needs_revision）：{findings}", 'status': 'pending',
+        'created': now_ms(), 'updated': now_ms(), 'summary': '', 'fail': '',
+        'repair_of': t['id'],
+    }
+    if t.get('scope'):
+        data['tasks'][tid]['scope'] = list(t['scope'])  # 继承原任务 scope（hook 第三查覆盖修复提交）
+    # DAG 重排（多轮语义，T19 回炉）：依赖原任务或任一旧 repair 的下游一律改挂本次新 repair
+    # （首轮 gate 只有原任务，行为与旧版一致；后续轮旧 repair 也纳入改挂面）
+    gate = {t['id']} | {x['id'] for x in data['tasks'].values()
+                        if x.get('repair_of') == t['id'] and x['id'] != tid}
+    repointed, demoted = [], []
+    for x in data['tasks'].values():
+        if x['id'] == tid or not (gate & set(x['dep'])):
+            continue
+        x['dep'] = [tid if d in gate else d for d in x['dep']]
+        x['updated'] = now_ms()
+        repointed.append(x['id'])
+        if x['status'] == 'ready':  # 依赖由已满足变为未满足：回 pending，保持「ready 蕴含依赖已满足」
+            x['status'] = 'pending'
+            demoted.append(x['id'])
+            x.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"review 第 {count} 轮 needs_revision：依赖改挂最新 repair {tid}，回 pending 等待"})
+    cycle = find_cycle({x['id']: list(x['dep']) for x in data['tasks'].values()})  # 防御性全图环检测
+    if cycle:
+        raise BoardError('dependency_cycle', cycle='->'.join(cycle),
+                         hint='下游依赖改挂 repair 后全图成环（不应发生）；拒绝写入，请人工核查依赖')
+    t['status'] = 'ready'  # 回 ready：修复完成后由编排者安排复审（再 claim → done --verdict）
+    t['updated'] = now_ms()
+    t.setdefault('checkpoints', []).append(
+        {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision → 生成 repair {tid}；"
+                             f"下游 {','.join(repointed) or '（无）'} 依赖改挂最新 repair {tid}（每轮重排）"
+                             + (f"，已 ready 的 {','.join(demoted)} 回 pending" if demoted else '')
+                             + "，原任务回 ready 待复审"})
+    promoted = refresh(data)
+    save(path, data)
+    show(t)
+    show(data['tasks'][tid])
+    if a.by and a.by != t['owner']:
+        print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
+    if repointed:
+        print(f"下游依赖已改挂 {tid}: " + ' '.join(repointed))
+    if promoted:
+        print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
+
+
+def cmd_reject(a, data, path):
+    """reject <id>：PM 规划草案否决（v2.7，T19/S3①）——draft -> rejected 终态。
+    被否决草案退出批准面、不再永久滞留（archive 不因 draft 滞留被迫 --force）；
+    rejected 不可 claim/approve/progress/reassign；如需重启，按意见重新规划后新建草案条目。"""
+    t = get_task(data, a.id)
+    if t['status'] != 'draft':
+        sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 draft 可否决")
+    t['status'] = 'rejected'
+    t['updated'] = now_ms()
+    save(path, data)
+    show(t)
+    print('已否决：rejected 为终态，不可 claim/approve；如需重启请按意见重新规划后新建草案')
+
+
 def cmd_done(a, data, path):
     t = get_task(data, a.id)
     check_attempt(a, t)
     if t['status'] != 'running':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 running 可完成")
-    t['status'] = 'done'
+    _validate_done_verdict(a, t)  # review kind 语义分叉：先校验后变更（拒绝零事件零落盘）
     if a.rework is not None and a.rework < 0:
         sys.exit('错误：--rework 不能为负数')
+    if a.verdict == 'needs_revision':
+        _done_needs_revision(a, data, path, t)
+        return
+    t['status'] = 'done'
+    closed_repairs = []
+    if a.verdict == 'pass':
+        t['verdict'] = 'pass'  # review 评审通过：结论留档（非 review 任务无该字段）
+        # 重要-2（T19 回炉）：复审 pass 时自动收口名下开放 repair（ready/pending/failed，repair_of 指向本任务）
+        # 为 rejected 终态（作废语义——rejected 承载草案否决与 repair 收口两类来源），防僵尸 repair
+        # 永久阻塞下游；其下游依赖改挂回本任务（此刻已 done），随后由既有 refresh 提升自然解锁。
+        # running 的 repair 不自动打断（在途工作由编排者人工处置）；done 的 repair 是既成事实不动；
+        # failed 的 repair 随 pass 一并收口（二轮重要-1：pass 前已失败的 repair 不再僵尸阻塞下游）。
+        ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        for x in data['tasks'].values():
+            if x.get('repair_of') == t['id'] and x['status'] in ('ready', 'pending', 'failed'):
+                x['status'] = 'rejected'
+                x['updated'] = now_ms()
+                x.setdefault('checkpoints', []).append(
+                    {'time': ts, 'note': f"review {t['id']} 复审 pass：repair 自动收口为 rejected（作废，无需修复）"})
+                closed_repairs.append(x['id'])
+        if closed_repairs:  # 收口 repair 的下游改挂回评审任务（已 done → 依赖满足 → refresh 提升解锁）
+            closed_set = set(closed_repairs)
+            for x in data['tasks'].values():
+                if closed_set & set(x['dep']):
+                    x['dep'] = [t['id'] if d in closed_set else d for d in x['dep']]
+                    x['updated'] = now_ms()
     t['summary'] = a.summary or ''
     if a.rework is not None:
         t['rework'] = a.rework
@@ -876,6 +1089,8 @@ def cmd_done(a, data, path):
         print(f"实际执行者 {a.by} 已记录（owner={t['owner']}）")
     elif not a.by and t['owner'] in ('', '编排者'):
         print('提醒：owner 为空或编排者时建议用 --by <执行专家名> 记录实际执行者（多专家/门禁条目）')
+    if closed_repairs:
+        print('评审通过，repair 自动收口为 rejected（作废）: ' + ' '.join(closed_repairs))
     if promoted:
         print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
 
@@ -894,6 +1109,20 @@ def cmd_fail(a, data, path):
 
 def cmd_retry(a, data, path):
     t = get_task(data, a.id)
+    if t['status'] == 'escalated':
+        # escalated 唯一工具内出口（WP-5/S2）：用户显式指令解除升级，回 ready 并重置 repair 重试预算
+        # （用户决定再给一轮修复机会；旧 verdict/findings 留档不删，复审通过时被覆盖）
+        t['status'] = 'ready'
+        t['fail'] = ''
+        t['repair_count'] = 0
+        t['updated'] = now_ms()
+        ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('checkpoints', []).append(
+            {'time': ts, 'note': '用户显式 retry：解除 escalated，回 ready；repair 重试预算已重置'})
+        save(path, data)
+        show(t)
+        print('已解除升级：任务回 ready，repair 重试预算重置；请在任务书注明用户处置决定')
+        return
     if t['status'] != 'failed':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 failed 可重试")
     t['status'] = 'ready'
@@ -906,6 +1135,12 @@ def cmd_retry(a, data, path):
 def cmd_progress(a, data, path):
     t = get_task(data, a.id)
     check_attempt(a, t)
+    if t['status'] == 'draft':
+        sys.exit(f"错误：{a.id} 为 PM 规划草案（draft），无执行进度可记；approve 批准后再开工")
+    if t['status'] == 'rejected':
+        sys.exit(f"错误：{a.id} 已否决（rejected 终态），不可记检查点")
+    if t['status'] == 'escalated':
+        sys.exit(f"错误：{a.id} 已升级（escalated），等待用户处置，不可记检查点")
     ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
     t.setdefault('checkpoints', []).append({'time': ts, 'note': a.note})
     t['updated'] = now_ms()
@@ -1005,7 +1240,9 @@ def cmd_watchdog(a, data, path):
     """watchdog：扫描全部 running 任务的滑动无进展窗口；到期 nudge（重臂），连续 max_nudges 次无响应
     升级——先查落盘完成报告（任务板检查点轨迹已由 activity 覆盖：检查点即 progress，天然重臂窗口；
     完成报告落盘证据在 bus 收件箱/归档/发件箱），有证据 adopt 为 done，无证据 reclaim 回 ready 并撤销
-    当前代际。全部变更合入一个 watchdog 事件（after 快照差分），stdout 为新增命令自有契约；
+    当前代际。review kind 任务例外（T19 回炉，重要-1）：评审结论必须经显式 done --verdict 落地，
+    watchdog 永不代答——即使发现落盘报告也照常 reclaim（回 ready 重新评审），防 verdict 门禁被绕过。
+    全部变更合入一个 watchdog 事件（after 快照差分），stdout 为新增命令自有契约；
     adopt 显式记录实际执行者（executors，对齐手工 done --by 审计），汇总行输出 healthy 计数。"""
     window_ms = max(0, a.window_sec) * 1000
     max_nudges = max(0, a.max_nudges)
@@ -1038,7 +1275,10 @@ def cmd_watchdog(a, data, path):
             continue
         m, loc = _completion_evidence(tid, t, bus_root)
         att = t.get('attempt_id') or ''
-        if m is not None:
+        if m is not None and t.get('kind') != 'review':
+            # 重要-1（T19 回炉）：review 任务不进 adopt——评审员崩溃后残留的落盘报告不构成 verdict，
+            # 采纳为 done 即绕过 pass 门禁；一律走下方 reclaim 回 ready 重新评审，结论须经显式
+            # done --verdict 落地。
             summary = f"{m.get('subject', '')}：{(m.get('body') or '')[:160]}"
             t['status'] = 'done'
             t['summary'] = f"[watchdog adopt] {summary}"
@@ -1055,6 +1295,13 @@ def cmd_watchdog(a, data, path):
                          f" → 已采纳为 done（落盘完成报告 {m.get('id')}@{loc}）；完成标准：{t.get('desc', '')[:60]}")
         else:
             orig_owner = t.get('owner') or '未分配'
+            if m is not None:  # review 任务有落盘报告也不采纳（verdict 门禁不可被 watchdog 代答）
+                why_note = (f"review 任务有落盘报告 {m.get('id')}@{loc} 亦不采纳——评审结论必须经"
+                            "显式 done --verdict 落地，门禁不可代答")
+                why_line = '落盘报告不代答 verdict（评审结论须经显式 done --verdict 落地）'
+            else:
+                why_note = f"{max_nudges} 次 nudge 无响应且无落盘完成证据"
+                why_line = '无落盘完成证据'
             t['status'] = 'ready'
             if att:
                 t.setdefault('attempt_revoked', []).append(att)  # 孤儿代际撤销：旧 attempt 的迟到汇报按 stale_attempt 拒
@@ -1065,12 +1312,12 @@ def cmd_watchdog(a, data, path):
             t.pop('heartbeat_at', None)
             ts = datetime.datetime.fromtimestamp(now / 1000).strftime('%Y-%m-%d %H:%M:%S')
             t.setdefault('checkpoints', []).append(
-                {'time': ts, 'note': f"watchdog: reclaim（{max_nudges} 次 nudge 无响应且无落盘完成证据）→ ready；attempt {att or '（无）'} 已撤销"})
+                {'time': ts, 'note': f"watchdog: reclaim（{why_note}）→ ready；attempt {att or '（无）'} 已撤销"})
             t['updated'] = now
             reclaimed += 1
             changed += 1
             lines.append(f"{tid} [running] owner=（原 {orig_owner}）无进展 {stale_s}s nudge={nudges}/{max_nudges}"
-                         f" → 已 reclaim（无落盘完成证据；attempt {att or '（无）'} 撤销，转 ready 待重新派工）")
+                         f" → 已 reclaim（{why_line}；attempt {att or '（无）'} 撤销，转 ready 待重新派工）")
     if not lines:
         if healthy:
             print(f"watchdog: {healthy} 个 running 任务全部健康（window={a.window_sec}s 内均有活动证据，未做任何变更）")
@@ -1105,8 +1352,15 @@ def cmd_recover(a, data, path):
 
 def cmd_reassign(a, data, path):
     """转派：先拒绝复活任何已撤销代际，再撤销旧 attempt（记入 attempt_revoked），建立新代际；
-    旧代际的 done/fail/progress 随后被拒。"""
+    旧代际的 done/fail/progress 随后被拒。draft/rejected/escalated 不可转派（草案未进派工面、
+    终态不可再动——escalated 须用户显式 retry 解除升级后重新走 claim/reassign）。"""
     t = get_task(data, a.id)
+    if t['status'] == 'draft':
+        sys.exit(f"错误：{a.id} 为 PM 规划草案（draft），未经 approve 批准不可转派")
+    if t['status'] == 'rejected':
+        sys.exit(f"错误：{a.id} 已否决（rejected 终态），不可转派")
+    if t['status'] == 'escalated':
+        sys.exit(f"错误：{a.id} 已升级（escalated），等待用户处置，不可转派；用户显式 retry 可解除升级")
     revoked = t.get('attempt_revoked') or []
     if a.attempt_id in revoked:
         raise BoardError('stale_attempt', attempt=a.attempt_id, current=t.get('attempt_id'),
@@ -1180,6 +1434,9 @@ def cmd_status(a, data, _):
     draft = [t for t in data['tasks'].values() if t['status'] == 'draft']
     if draft:
         print('待批准草案: ' + ' '.join(t['id'] for t in draft))  # 批准面盘点入口（无 draft 时零输出）
+    escalated = [t for t in data['tasks'].values() if t['status'] == 'escalated']
+    if escalated:
+        print('已升级待用户处置: ' + ' '.join(t['id'] for t in escalated))  # escalated 盘点入口（无则零输出）
     for t in running + failed:
         cp = last_checkpoint(t)
         if cp:
@@ -1192,6 +1449,8 @@ def cmd_metrics(a, data, _):
         return
     agg = {}
     for t in data['tasks'].values():
+        if t['status'] in ('draft', 'rejected'):
+            continue  # 未开工条目不计入 owner 工作量指标（draft 草案未批准、rejected 已否决）
         o = t['owner'] or '（未分配）'
         s = agg.setdefault(o, [0, 0, 0])
         s[0] += 1
@@ -1424,7 +1683,8 @@ def cmd_replay(a, data, path):
 
 
 def cmd_archive(a, data, path):
-    open_tasks = [t for t in data['tasks'].values() if t['status'] not in ('done', 'failed')]
+    open_tasks = [t for t in data['tasks'].values()
+                  if t['status'] not in ('done', 'failed', 'rejected')]  # rejected 终态不算未收口（S3① 被否决草案不滞留）
     if open_tasks and not a.force:
         listing = ', '.join(f"{t['id']}[{t['status']}]" for t in open_tasks)
         sys.exit(f'拒绝归档：还有未收口任务 {listing}；先 done/fail，或确认放弃用 --force')
@@ -1469,6 +1729,8 @@ def main():
     p.add_argument('--scope', help='关联域（逗号分隔路径前缀，如 src,docs）；hook 第三查与验证回执的依据')
     p.add_argument('--draft', action='store_true',
                    help='创建为 PM 规划草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；缺省行为不变')
+    p.add_argument('--kind', help='任务种类（缺省不带 kind 字段，行为不变）：review=评审任务，完成须显式 '
+                                  '--verdict pass|needs_revision，失败自动生成 repair 并重排下游依赖')
     add_write_args(p)
     p.set_defaults(fn=cmd_create)
 
@@ -1479,7 +1741,10 @@ def main():
     p = sub.add_parser('approve'); p.add_argument('id'); add_write_args(p)
     p.set_defaults(fn=cmd_approve,
                    help='PM 规划草案批准：draft -> ready（依赖未满足先回 pending 走自动提升）；批准前 claim 被拒')
-    p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_done)
+    p = sub.add_parser('reject'); p.add_argument('id'); add_write_args(p)
+    p.set_defaults(fn=cmd_reject,
+                   help='PM 规划草案否决：draft -> rejected 终态（退出批准面不滞留；不可 claim/approve）')
+    p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); p.add_argument('--verdict', help='review 任务完成结论（review 任务必填）：pass=评审通过正常完成；needs_revision=须携带 --findings，自动生成 repair+下游 DAG 重排，原任务回 ready 待复审'); p.add_argument('--findings', help='评审发现清单（needs_revision 必填，供 repair 任务引用）'); p.add_argument('--repair-owner', help='自动生成 repair 任务的 owner（缺省为空，由编排者分配）'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_done)
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); add_write_args(p); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser('progress'); p.add_argument('id'); p.add_argument('note'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_progress)

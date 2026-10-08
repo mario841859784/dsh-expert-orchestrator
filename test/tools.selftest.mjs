@@ -3184,6 +3184,452 @@ test('WP-5 (e) auto-claim 对 draft 跳过：lib 侧仅认 ready（draft≠ready
   assert.equal(board.tasks.T1.owner, '测试专家')
 })
 
+// ── T19 WP-5/S2 质量门禁 kind 化：review 任务 + findings 硬校验 + 自动 repair + DAG 重排 + escalated ──
+// 验收 (b)：needs_revision 缺 findings 被拒（零事件零落盘）；(c)：review→A→B 链 needs_revision →
+// repair 生成+下游依赖改挂（单事件 after 快照可追溯，走 T10 事件追加路径）→ repair done 后 A/B 按既有
+// 依赖提升；escalated 状态机（进入/不可 claim+done+progress+reassign/用户显式 retry 退出）；S3 顺带 4 项
+// （reject 终态、progress/reassign 拒 draft、metrics 排除未开工、archive 放行 rejected）。缺省（无 --kind）
+// 行为完全不变由「缺省 create 无 kind 字段」断言 + 既有用例零改动全过共同覆盖。
+test('T19 (S1) review kind：--kind review 落 kind 字段、缺省 create 无 kind 字段；review done 须显式 verdict、needs_revision 缺 findings 被拒零事件零落盘；pass 拒 findings；非 review 任务拒 verdict', (t) => {
+  const dir = makeBoardDir(t, 'review-kind')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '评审任务', '--kind', 'review', '--owner', '评审员') // T1
+  const boardPath = join(dir, BOARD_REL)
+  const eventsPath = boardPath + '.events.jsonl'
+  const evCount = () => readFileSync(eventsPath, 'utf-8').trim().split('\n').length
+  let board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T1.kind, 'review')
+  assert.equal(board.tasks.T1.status, 'ready') // 无依赖照常自动提升（review kind 不改状态机）
+  ok('create', '普通任务') // T2：缺省（无 --kind）不写 kind 字段，行为完全不变
+  board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.ok(!('kind' in board.tasks.T2), '缺省 create 不应写 kind 字段')
+  // review 任务 done 不带 verdict 被拒（零事件零落盘——拒绝发生在任何变更与 save 之前）
+  ok('claim', 'T1', '评审员')
+  const before = { board: readFileSync(boardPath), n: evCount() }
+  let r = runTb(dir, ['done', 'T1', '漏了结论'])
+  assert.equal(r.code, 1)
+  assert.match(r.stderr, /--verdict/)
+  assert.deepEqual(readFileSync(boardPath), before.board)
+  assert.equal(evCount(), before.n)
+  // needs_revision 缺 findings 被拒（验收断言 b：零事件零落盘）
+  r = runTb(dir, ['done', 'T1', '--verdict', 'needs_revision'])
+  assert.equal(r.code, 1)
+  assert.match(r.stderr, /needs_revision/)
+  assert.match(r.stderr, /findings/)
+  assert.deepEqual(readFileSync(boardPath), before.board)
+  assert.equal(evCount(), before.n)
+  // --verdict 非法值被拒；pass 携带 findings/--repair-owner 被拒（防发现清单被静默丢弃）
+  r = runTb(dir, ['done', 'T1', '--verdict', 'approved'])
+  assert.equal(r.code, 1)
+  assert.match(r.stderr, /pass\|needs_revision/)
+  r = runTb(dir, ['done', 'T1', '通过', '--verdict', 'pass', '--findings', '多余'])
+  assert.equal(r.code, 1)
+  assert.match(r.stderr, /pass 不接受/)
+  // 非 review 任务不接受 review 语义参数；不带新参数行为不变
+  ok('claim', 'T2', '工人')
+  r = runTb(dir, ['done', 'T2', '完成', '--verdict', 'pass'])
+  assert.equal(r.code, 1)
+  assert.match(r.stderr, /非 review 任务/)
+  ok('done', 'T2', '完成')
+  // pass 正常完成且结论留档
+  r = ok('done', 'T1', '评审通过', '--verdict', 'pass')
+  assert.match(r.stdout, /T1 \[done\]/)
+  board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T1.verdict, 'pass')
+  assert.equal(board.tasks.T1.status, 'done')
+})
+
+test('T19 (S2c) review→A→B 链：needs_revision 自动生成 repair+下游依赖改挂（单事件 after 快照可追溯）→ repair done 后 A/B 按既有依赖提升 → 复审 pass 收口', (t) => {
+  const dir = makeBoardDir(t, 'review-dag')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '评审R', '--kind', 'review', '--scope', 'src') // T1
+  ok('create', '实现A', '--dep', 'T1') // T2
+  ok('create', '实现B', '--dep', 'T2') // T3
+  ok('claim', 'T1', '评审员')
+  const r = ok('done', 'T1', '--verdict', 'needs_revision', '--findings', '边界条件缺失', '--repair-owner', '修复工')
+  assert.match(r.stdout, /T1 \[ready\]/) // 原任务回 ready 待复审（不完成）
+  assert.match(r.stdout, /T4 \[ready\]/) // repair 直接 ready（工具自动编排不经 draft）
+  assert.match(r.stdout, /下游依赖已改挂 T4: T2/)
+  const boardPath = join(dir, BOARD_REL)
+  let board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  // repair 任务：引用原任务+findings、owner 可指定、repair_of 回指、scope 继承（hook 第三查覆盖修复提交）
+  assert.equal(board.tasks.T4.owner, '修复工')
+  assert.equal(board.tasks.T4.repair_of, 'T1')
+  assert.match(board.tasks.T4.desc, /T1/)
+  assert.match(board.tasks.T4.desc, /边界条件缺失/)
+  assert.deepEqual(board.tasks.T4.scope, ['src'])
+  assert.equal(board.tasks.T4.status, 'ready')
+  // DAG 重排：T2 依赖 T1→T4；T3（依赖 T2 而非 T1）不动
+  assert.deepEqual(board.tasks.T2.dep, ['T4'])
+  assert.deepEqual(board.tasks.T3.dep, ['T2'])
+  assert.equal(board.tasks.T2.status, 'pending')
+  // 原任务留档：verdict/findings/repair_count
+  assert.equal(board.tasks.T1.verdict, 'needs_revision')
+  assert.equal(board.tasks.T1.findings, '边界条件缺失')
+  assert.equal(board.tasks.T1.repair_count, 1)
+  // 事件流可追溯（验收断言 c）：单事件携带全部变更任务的 after 快照
+  const evs = readFileSync(boardPath + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  const ev = evs[evs.length - 1]
+  assert.equal(ev.type, 'done')
+  assert.equal(ev.args.verdict, 'needs_revision')
+  assert.equal(ev.args.findings, '边界条件缺失')
+  assert.equal(ev.args.repair_owner, '修复工')
+  for (const tid of ['T1', 'T2', 'T4']) assert.ok(ev.after[tid], `事件 after 快照缺 ${tid}`)
+  assert.equal(ev.after.T2.dep[0], 'T4')
+  assert.equal(ev.after.T4.status, 'ready')
+  assert.ok(!ev.after.T3, 'T3 未变更不应出现在 after 快照')
+  // replay 幂等：新字段（kind/findings/verdict/repair_of）随任务快照折叠，重放静默通过
+  const rp = ok('replay')
+  assert.equal(rp.stderr, '')
+  // repair done → 下游按既有依赖提升自然解锁
+  ok('claim', 'T4', '修复工')
+  const rd = ok('done', 'T4', '修复完成')
+  assert.match(rd.stdout, /自动转 ready: T2/)
+  board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T2.status, 'ready')
+  assert.equal(board.tasks.T3.status, 'pending') // B 仍等 A
+  // A done → B 提升（既有依赖链不受重排影响）
+  ok('claim', 'T2', '工人')
+  const ad = ok('done', 'T2', 'A 完成')
+  assert.match(ad.stdout, /自动转 ready: T3/)
+  // 复审 pass 收口：结论覆盖 needs_revision
+  ok('claim', 'T1', '评审员')
+  const rr = ok('done', 'T1', '复审通过', '--verdict', 'pass')
+  assert.match(rr.stdout, /T1 \[done\]/)
+  board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T1.verdict, 'pass')
+})
+
+test('T19 (S2-escalated) repair 重试超上限转 escalated：进入（不再生成 repair）/不可 claim+done+progress+reassign/status 盘点/用户显式 retry 解除并重置预算', (t) => {
+  const dir = makeBoardDir(t, 'review-escalated')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const denied = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 1, args.join(' ')); return r }
+  ok('create', '评审R', '--kind', 'review') // T1
+  for (let i = 1; i <= 3; i++) { // 上限内（REPAIR_RETRY_LIMIT=3）每轮生成 repair、原任务回 ready
+    ok('claim', 'T1', '评审员')
+    const r = ok('done', 'T1', '--verdict', 'needs_revision', '--findings', `问题${i}`)
+    assert.match(r.stdout, /T1 \[ready\]/)
+  }
+  const boardPath = join(dir, BOARD_REL)
+  let board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T1.repair_count, 3)
+  const taskCount = Object.keys(board.tasks).length // 1 评审 + 3 repair
+  // 第 4 次 needs_revision：超过上限 → escalated，交回用户处置，不再生成 repair
+  ok('claim', 'T1', '评审员')
+  const r4 = ok('done', 'T1', '--verdict', 'needs_revision', '--findings', '问题4')
+  assert.match(r4.stdout, /escalated/)
+  board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'escalated')
+  assert.equal(board.tasks.T1.repair_count, 4)
+  assert.equal(Object.keys(board.tasks).length, taskCount) // 未新增 repair
+  // 终态守卫：不可 claim/done/progress/reassign（仅用户显式指令可再动）
+  assert.match(denied('claim', 'T1', '某人').stderr, /escalated/)
+  assert.match(denied('done', 'T1', 'x').stderr, /只有 running 可完成/)
+  assert.match(denied('progress', 'T1', 'x').stderr, /escalated/)
+  assert.match(denied('reassign', 'T1', 'A1').stderr, /escalated/)
+  // status 盘点行：计数 + 待处置清单（无 escalated 时零输出由既有用例覆盖）
+  const st = ok('status').stdout
+  assert.match(st, /escalated=1/)
+  assert.match(st, /已升级待用户处置: T1/)
+  // 用户显式 retry：解除升级、回 ready、repair 重试预算重置
+  const rt = ok('retry', 'T1')
+  assert.match(rt.stdout, /T1 \[ready\]/)
+  board = JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board.tasks.T1.repair_count, 0)
+  assert.equal(board.tasks.T1.status, 'ready')
+})
+
+test('T19 (S3) reject 终态出口与守卫、progress/reassign 拒 draft、metrics 排除未开工、archive 放行 rejected', (t) => {
+  const dir = makeBoardDir(t, 'review-reject')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const denied = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 1, args.join(' ')); return r }
+  ok('create', '草案X', '--draft', '--owner', 'PM') // T1
+  // progress/reassign 拒 draft（S3②：草案无执行进度、未进派工面）
+  assert.match(denied('progress', 'T1', 'x').stderr, /draft/)
+  assert.match(denied('reassign', 'T1', 'A1').stderr, /draft/)
+  // reject：draft -> rejected 终态（S3①：被否决草案不再永久滞留）
+  const r = ok('reject', 'T1')
+  assert.match(r.stdout, /T1 \[rejected\]/)
+  // 终态不可再动：reject/approve/claim/progress 全拒
+  assert.match(denied('reject', 'T1').stderr, /只有 draft 可否决/)
+  assert.match(denied('approve', 'T1').stderr, /只有 draft 可批准/)
+  assert.match(denied('claim', 'T1', '某人').stderr, /rejected/)
+  assert.match(denied('progress', 'T1', 'x').stderr, /rejected/)
+  // metrics 排除未开工条目（S3④：draft/rejected 不计 owner 工作量）
+  ok('create', '带owner草案', '--draft', '--owner', 'PM') // T2 draft
+  ok('create', '普通任务', '--owner', '工人') // T3
+  const m = ok('metrics').stdout
+  assert.doesNotMatch(m, /PM \|/) // draft（owner=PM）不计
+  assert.match(m, /工人 \| 任务数 1/)
+  // archive：draft 仍阻塞（既有语义不变），rejected 不算未收口
+  ok('claim', 'T3', '工人')
+  ok('done', 'T3', '完成')
+  const archDeny = denied('archive')
+  assert.match(archDeny.stderr, /T2\[draft\]/)
+  assert.ok(!archDeny.stderr.includes('T1[rejected]'), 'rejected 不应再列为未收口任务')
+  ok('reject', 'T2')
+  ok('archive') // 全部条目收口（done/rejected）→ 不再需要 --force
+})
+
+// ── T19 回炉（评审重要-1）：watchdog 对 review 任务永不 adopt——评审员崩溃后残留的落盘 [交付]
+// 报告不构成 verdict，采纳即绕过 pass 门禁；nudge 上限后照常 reclaim 回 ready 重新评审；
+// 非 review 任务同场景照常 adopt（既有语义不回归对照）。──
+test('T19 回炉 重要-1：watchdog×review——有落盘 [交付] 报告仍 reclaim（不代答 verdict、attempt 撤销回 ready）；非 review 对照照常 adopt', (t) => {
+  const setup = (label, kindArgs) => {
+    const dir = makeBoardDir(t, label)
+    assert.equal(runTb(dir, ['create', '评审R', '--desc', '评审标准', ...kindArgs]).code, 0)
+    assert.equal(runTb(dir, ['claim', 'T1', '评审员', '--attempt', 'A1']).code, 0)
+    writeBusMsg(dir, join('_archive', 'coordinator'), {
+      id: 'mev300', from: '评审员', to: 'coordinator', subject: '[交付] T1', body: '评审报告落盘',
+      files: [], ts: 1791443400000, read: false, task: 'T1', attempt_id: 'A1',
+    })
+    return dir
+  }
+  // review 任务：报告存在也不采纳——reclaim 回 ready、撤销代际、检查点注明 verdict 门禁原因
+  const dir1 = setup('review-watchdog', ['--kind', 'review'])
+  const w = runTb(dir1, ['watchdog', '--window-sec', '0', '--max-nudges', '0'])
+  assert.equal(w.code, 0, w.stdout + w.stderr)
+  assert.ok(w.stdout.includes('已 reclaim') && !w.stdout.includes('已采纳'), w.stdout)
+  assert.ok(w.stdout.includes('不代答 verdict'), w.stdout)
+  const t1 = readTask(dir1, 'T1')
+  assert.equal(t1.status, 'ready')
+  assert.equal(t1.verdict, undefined, 'watchdog 不得产生 verdict') // 未被采纳为 done，无任何结论
+  assert.equal(t1.summary, '', 'adopt 的 [watchdog adopt] summary 不应出现')
+  assert.ok((t1.attempt_revoked || []).includes('A1'), JSON.stringify(t1)) // 代际照常撤销
+  assert.ok((t1.checkpoints || []).some((c) => c.note.startsWith('watchdog: reclaim') && c.note.includes('--verdict')),
+    JSON.stringify(t1.checkpoints))
+  // 对照：非 review 任务同场景照常 adopt（既有 adopt 语义零回归）
+  const dir2 = setup('plain-watchdog', [])
+  const w2 = runTb(dir2, ['watchdog', '--window-sec', '0', '--max-nudges', '0'])
+  assert.ok(w2.stdout.includes('已采纳为 done'), w2.stdout)
+  assert.equal(readTask(dir2, 'T1').status, 'done')
+})
+
+// ── T19 回炉（评审重要-2）：复审 pass 自动收口僵尸 repair——R needs_revision→P 生成→R 复审 pass→
+// P 自动 rejected（作废终态）→下游依赖改挂回已 done 的评审任务、按既有提升逻辑自然解锁；
+// show 对 pass+旧 findings 只显示归档标注（数据/事件流不动，仅展示层）；单事件 after 快照可追溯。──
+test('T19 回炉 重要-2：R needs_revision→P 生成→R 复审 pass→P 自动收口 rejected→A/B 解锁；show 归档标注；事件 after 快照', (t) => {
+  const dir = makeBoardDir(t, 'review-pass-close')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '评审R', '--kind', 'review') // T1
+  ok('create', '实现A', '--dep', 'T1') // T2
+  ok('create', '实现B', '--dep', 'T2') // T3
+  ok('claim', 'T1', '评审员')
+  ok('done', 'T1', '--verdict', 'needs_revision', '--findings', '边界条件缺失') // T4=repair P1
+  const boardPath = join(dir, BOARD_REL)
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.equal(board().tasks.T4.repair_of, 'T1')
+  assert.deepEqual(board().tasks.T2.dep, ['T4'])
+  // 复审 pass：P1（仍 ready）自动收口为 rejected；T2 依赖改挂回 T1（done）→ 既有提升自然解锁
+  ok('claim', 'T1', '评审员')
+  const rp = ok('done', 'T1', '复审通过', '--verdict', 'pass')
+  let b = board()
+  assert.equal(b.tasks.T1.status, 'done')
+  assert.equal(b.tasks.T1.verdict, 'pass')
+  assert.equal(b.tasks.T4.status, 'rejected', '僵尸 repair 自动收口为 rejected 终态')
+  assert.ok((b.tasks.T4.checkpoints || []).some((c) => c.note.includes('自动收口')), JSON.stringify(b.tasks.T4.checkpoints))
+  assert.deepEqual(b.tasks.T2.dep, ['T1'], '下游依赖改挂回评审任务')
+  assert.equal(b.tasks.T2.status, 'ready') // A 解锁
+  assert.equal(b.tasks.T3.status, 'pending') // B 仍等 A
+  assert.match(rp.stdout, /repair 自动收口为 rejected（作废）: T4/)
+  assert.match(rp.stdout, /自动转 ready: T2/)
+  // show：pass 后旧 findings 只显示归档标注，不再显示旧发现清单（展示层矛盾修正）
+  const sh = ok('show', 'T1')
+  assert.match(sh.stdout, /评审结论: pass（已通过，历史 findings 归档）/)
+  assert.ok(!sh.stdout.includes('边界条件缺失'), sh.stdout)
+  // 数据层 findings 仍在（事件流/折叠视图可追溯），仅展示层修正
+  assert.equal(b.tasks.T1.findings, '边界条件缺失')
+  // 单事件 after 快照：收口与改挂同落一个 done 事件
+  const evs = readFileSync(boardPath + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  const ev = evs[evs.length - 1]
+  assert.equal(ev.type, 'done')
+  assert.equal(ev.args.verdict, 'pass')
+  for (const tid of ['T1', 'T4', 'T2']) assert.ok(ev.after[tid], `事件 after 快照缺 ${tid}`)
+  assert.equal(ev.after.T4.status, 'rejected')
+  assert.equal(ev.after.T2.dep[0], 'T1')
+  // 全链走通：A done → B 提升
+  ok('claim', 'T2', '工人')
+  assert.match(ok('done', 'T2', 'A 完成').stdout, /自动转 ready: T3/)
+  // replay 幂等（rejected 随快照折叠）
+  assert.equal(ok('replay').stderr, '')
+})
+
+// ── T19 回炉（多轮 repair 语义，评审疑-1 编排者裁决「每轮都重排」）：两次 needs_revision 每轮
+// 生成新 repair、下游改挂最新 repair；P1 done 后已 ready 的下游在第 2 轮回 pending（保持
+// 「ready 蕴含依赖已满足」）；未收口的 P1 随复审 pass 一并自动收口、已 done 的 P2 不动。──
+test('T19 回炉 多轮：R 两次 needs_revision→P1/P2→下游最终挂 P2→P2 done→解锁；P1 未收口随 R pass 一并自动收口；P1 done 后下游回 pending 场景', (t) => {
+  const dir = makeBoardDir(t, 'review-multi-round')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '评审R', '--kind', 'review') // T1
+  ok('create', '实现A', '--dep', 'T1') // T2
+  ok('claim', 'T1', '评审员')
+  ok('done', 'T1', '--verdict', 'needs_revision', '--findings', '问题1') // T3=P1
+  const boardPath = join(dir, BOARD_REL)
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.deepEqual(board().tasks.T2.dep, ['T3'])
+  // 第 2 轮（P1 未 done、A 仍 pending 挂 P1）：重排 → A 改挂最新 repair P2
+  ok('claim', 'T1', '评审员')
+  ok('done', 'T1', '--verdict', 'needs_revision', '--findings', '问题2') // T4=P2
+  let b = board()
+  assert.deepEqual(b.tasks.T2.dep, ['T4'], '下游改挂最新 repair（每轮重排）')
+  assert.equal(b.tasks.T2.status, 'pending')
+  assert.equal(b.tasks.T3.status, 'ready') // P1 仍开放
+  assert.ok((b.tasks.T1.checkpoints || []).some((c) => c.note.includes('每轮重排')), JSON.stringify(b.tasks.T1.checkpoints))
+  // P2 done → A 解锁
+  ok('claim', 'T4', '修复工')
+  assert.match(ok('done', 'T4', '修复完成').stdout, /自动转 ready: T2/)
+  assert.equal(board().tasks.T2.status, 'ready')
+  // R 复审 pass：P1（仍未收口）随 pass 一并自动收口；P2 已 done 不动
+  ok('claim', 'T1', '评审员')
+  const rp = ok('done', 'T1', '复审通过', '--verdict', 'pass')
+  b = board()
+  assert.equal(b.tasks.T3.status, 'rejected')
+  assert.equal(b.tasks.T4.status, 'done')
+  assert.match(rp.stdout, /repair 自动收口为 rejected（作废）: T3/)
+  // 场景 B：P1 done → 下游已 ready，第 2 轮 needs_revision → 下游回 pending 挂 P2（不变量保持）
+  const dir2 = makeBoardDir(t, 'review-multi-round2')
+  const ok2 = (...args) => { const r = runTb(dir2, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok2('create', '评审R2', '--kind', 'review') // T1
+  ok2('create', '实现C', '--dep', 'T1') // T2
+  ok2('claim', 'T1', '评审员')
+  ok2('done', 'T1', '--verdict', 'needs_revision', '--findings', '问题1') // T3=P1
+  ok2('claim', 'T3', '修复工')
+  assert.match(ok2('done', 'T3', '修复完成').stdout, /自动转 ready: T2/)
+  assert.equal(JSON.parse(readFileSync(join(dir2, BOARD_REL), 'utf-8')).tasks.T2.status, 'ready')
+  ok2('claim', 'T1', '评审员')
+  ok2('done', 'T1', '--verdict', 'needs_revision', '--findings', '问题2') // T4=P2
+  b = JSON.parse(readFileSync(join(dir2, BOARD_REL), 'utf-8'))
+  assert.deepEqual(b.tasks.T2.dep, ['T4'], '已 ready 下游也改挂最新 repair')
+  assert.equal(b.tasks.T2.status, 'pending', '已 ready 的下游回 pending（ready 蕴含依赖已满足）')
+  assert.ok((b.tasks.T2.checkpoints || []).some((c) => c.note.includes('回 pending')), JSON.stringify(b.tasks.T2.checkpoints))
+  // P2 done → C 恢复 ready；R pass：已收口（done）的旧 repair 不被误动（收口只针对 ready/pending）
+  ok2('claim', 'T4', '修复工')
+  assert.match(ok2('done', 'T4', '修复完成').stdout, /自动转 ready: T2/)
+  assert.equal(JSON.parse(readFileSync(join(dir2, BOARD_REL), 'utf-8')).tasks.T2.status, 'ready')
+  ok2('claim', 'T1', '评审员')
+  ok2('done', 'T1', '复审通过', '--verdict', 'pass')
+  b = JSON.parse(readFileSync(join(dir2, BOARD_REL), 'utf-8'))
+  assert.equal(b.tasks.T3.status, 'done', '已 done 的旧 repair 是既成事实，pass 收口不误动')
+  assert.equal(b.tasks.T4.status, 'done')
+  // 两板 replay 幂等
+  assert.equal(ok('replay').stderr, '')
+  assert.equal(ok2('replay').stderr, '')
+})
+
+// ── T19 二轮回炉（评审重要-1）：pass 前已失败的 repair 同样随复审 pass 自动收口——
+// 旧收口集合仅 ready/pending，failed repair 不收口不改挂：下游被僵尸 repair 永久阻塞且 done 零提示；
+// 修复后 failed repair 随 pass 收口为 rejected、下游改挂回已 done 评审任务自然解锁；
+// running repair 既有行为不变（设计为不打断）；收口仍走单事件 after 快照路径。──
+test('T19 二轮回炉 重要-1：R needs_revision→P 生成→P fail→R 复审 pass→failed P 自动收口 rejected→A 解锁；running P 不打断；单事件 after 快照', (t) => {
+  const dir = makeBoardDir(t, 'review-pass-close-failed')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '评审R', '--kind', 'review') // T1
+  ok('create', '实现A', '--dep', 'T1') // T2
+  ok('claim', 'T1', '评审员')
+  ok('done', 'T1', '--verdict', 'needs_revision', '--findings', '缺陷1') // T3=repair P1
+  const boardPath = join(dir, BOARD_REL)
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  assert.deepEqual(board().tasks.T2.dep, ['T3'])
+  // P1 先走失败路线：claim → fail（pass 前已失败的 repair，旧收口集合不覆盖 → 僵尸态）
+  ok('claim', 'T3', '修复工')
+  ok('fail', 'T3', '修复失败：根因不在本侧')
+  let b = board()
+  assert.equal(b.tasks.T3.status, 'failed')
+  assert.equal(b.tasks.T2.status, 'pending', 'failed repair 阻塞下游（修复前僵尸态）')
+  // R 复审 pass：failed P1 随 pass 自动收口 rejected；T2 改挂回 T1（done）→ 解锁
+  ok('claim', 'T1', '评审员')
+  const rp = ok('done', 'T1', '复审通过', '--verdict', 'pass')
+  b = board()
+  assert.equal(b.tasks.T3.status, 'rejected', 'failed repair 随 pass 收口为 rejected 终态')
+  assert.ok((b.tasks.T3.checkpoints || []).some((c) => c.note.includes('自动收口')), JSON.stringify(b.tasks.T3.checkpoints))
+  assert.deepEqual(b.tasks.T2.dep, ['T1'], '下游依赖改挂回评审任务')
+  assert.equal(b.tasks.T2.status, 'ready', '下游解锁')
+  assert.match(rp.stdout, /repair 自动收口为 rejected（作废）: T3/)
+  assert.match(rp.stdout, /自动转 ready: T2/)
+  // 单事件 after 快照：收口与改挂同落一个 done 事件
+  const evs = readFileSync(boardPath + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  const ev = evs[evs.length - 1]
+  assert.equal(ev.type, 'done')
+  assert.equal(ev.args.verdict, 'pass')
+  for (const tid of ['T1', 'T3', 'T2']) assert.ok(ev.after[tid], `事件 after 快照缺 ${tid}`)
+  assert.equal(ev.after.T3.status, 'rejected')
+  assert.equal(ev.after.T2.dep[0], 'T1')
+  // 全链走通：A 可正常 claim
+  ok('claim', 'T2', '工人')
+  // 对照：running 的 repair 既有行为不变（设计为不打断，pass 后仍 running、下游仍挂它等待）
+  const dir2 = makeBoardDir(t, 'review-pass-close-running')
+  const ok2 = (...args) => { const r = runTb(dir2, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok2('create', '评审R2', '--kind', 'review') // T1
+  ok2('create', '实现D', '--dep', 'T1') // T2
+  ok2('claim', 'T1', '评审员')
+  ok2('done', 'T1', '--verdict', 'needs_revision', '--findings', '缺陷2') // T3=repair P2
+  ok2('claim', 'T3', '修复工') // running：在途修复
+  ok2('claim', 'T1', '评审员') // needs_revision 后原任务回 ready，复审前须再 claim
+  const rp2 = ok2('done', 'T1', '复审通过', '--verdict', 'pass')
+  b = JSON.parse(readFileSync(join(dir2, BOARD_REL), 'utf-8'))
+  assert.equal(b.tasks.T3.status, 'running', 'running repair 不被打断（人工处置）')
+  assert.deepEqual(b.tasks.T2.dep, ['T3'], '下游不改挂（在途修复仍承载解锁路径）')
+  assert.equal(b.tasks.T2.status, 'pending')
+  assert.ok(!rp2.stdout.includes('repair 自动收口'), '零收口时 done 无收口提示')
+  // 两板 replay 幂等
+  assert.equal(ok('replay').stderr, '')
+  assert.equal(ok2('replay').stderr, '')
+})
+
+// ── T19 回炉（建议①③④）：verify 写路径拒 draft/rejected/escalated（读路径不动）；
+// --findings 超 4000 码点硬拒零事件零落盘、4000 边界通过；needs_revision 的
+// --rework/--switched/--by 落档（与普通 done 审计丰富度对齐）。──
+test('T19 回炉 建议①③④：verify 写路径状态守卫；findings 4000 码点上限硬拒（边界通过）；needs_revision 落档 --rework/--switched/--by', (t) => {
+  const dir = makeBoardDir(t, 'review-tweaks')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  const denied = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 1, args.join(' ')); return r }
+  const boardPath = join(dir, BOARD_REL)
+  writeFileSync(join(dir, 'a.md'), 'x') // verify 文件夹具
+  // 建议①：draft 写回执被拒；reject 后（rejected）同样被拒；读路径不受守卫影响
+  ok('create', '草案V', '--draft') // T1
+  assert.match(denied('verify', 'T1', 'a.md').stderr, /不可写验证回执/)
+  ok('reject', 'T1')
+  assert.match(denied('verify', 'T1', 'a.md').stderr, /不可写验证回执/)
+  // escalated 写回执被拒（第 4 次 needs_revision 升级；前 3 轮各生成一个 repair 留在板上）
+  ok('create', '评审V', '--kind', 'review') // T2
+  ok('claim', 'T2', '评审员')
+  for (let i = 1; i <= 4; i++) {
+    if (i > 1) ok('claim', 'T2', '评审员') // 每轮 needs_revision 后回 ready，复审须再 claim
+    const r = ok('done', 'T2', '--verdict', 'needs_revision', '--findings', `问题${i}`)
+    if (i < 4) assert.match(r.stdout, /T2 \[ready\]/)
+  }
+  assert.equal(JSON.parse(readFileSync(boardPath, 'utf-8')).tasks.T2.status, 'escalated')
+  assert.match(denied('verify', 'T2', 'a.md').stderr, /不可写验证回执/)
+  // 对照：非守卫状态照常可写（ready）
+  ok('create', '普通W') // T6 → ready
+  assert.match(ok('verify', 'T6', 'a.md').stdout, /验证回执已记录/)
+  // 建议③：findings 超 4000 码点硬拒（零事件零落盘）；恰 4000 通过
+  const dir3 = makeBoardDir(t, 'findings-cap')
+  const ok3 = (...args) => { const r = runTb(dir3, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok3('create', '评审F', '--kind', 'review')
+  ok3('claim', 'T1', '评审员')
+  const bp3 = join(dir3, BOARD_REL)
+  const before = { board: readFileSync(bp3), n: readFileSync(bp3 + '.events.jsonl', 'utf-8').trim().split('\n').length }
+  const over = runTb(dir3, ['done', 'T1', '--verdict', 'needs_revision', '--findings', 'x'.repeat(4001)])
+  assert.equal(over.code, 1)
+  assert.match(over.stderr, /4000/)
+  assert.deepEqual(readFileSync(bp3), before.board) // 板逐字节未变
+  assert.equal(readFileSync(bp3 + '.events.jsonl', 'utf-8').trim().split('\n').length, before.n) // 零事件
+  ok3('done', 'T1', '--verdict', 'needs_revision', '--findings', 'y'.repeat(4000)) // 边界值通过
+  assert.equal(JSON.parse(readFileSync(bp3, 'utf-8')).tasks.T1.findings, 'y'.repeat(4000))
+  // 建议④：needs_revision 路径 --rework/--switched/--by 落档
+  ok3('claim', 'T1', '评审员')
+  const rn = ok3('done', 'T1', '--verdict', 'needs_revision', '--findings', '问题A', '--rework', '2', '--switched', '--by', '评审员B')
+  assert.match(rn.stdout, /实际执行者 评审员B 已记录/)
+  const b3 = JSON.parse(readFileSync(bp3, 'utf-8'))
+  assert.equal(b3.tasks.T1.rework, 2)
+  assert.equal(b3.tasks.T1.switched, true)
+  assert.equal(b3.tasks.T1.executors[0].name, '评审员B')
+  const sh3 = ok3('show', 'T1')
+  assert.match(sh3.stdout, /返工 2 次，已换人/)
+  assert.match(sh3.stdout, /实际执行者: 评审员B\[/)
+})
+
 // ── T12 (WP-4b ④) summon 专家断点续跑：seam 探测 + 恰好一次续跑 turn + 断点折叠 ──
 // 用户裁决（2026-10-07 Q2=2A）：断点续跑仅新一代宿主启用（dsh 0.2.x，冷恢复要求
 // descriptor.mode==='continuable'）；旧宿主 0.1.7-alpha.2 维持现状（one-shot +

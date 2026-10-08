@@ -29,7 +29,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 ## 2. PM 规划召唤（草案 → 批准 → spawn 三段式）
 
-大型任务规划走三段式：**PM 产出以 `create --draft` 落板为可编辑草案（draft 状态，待批准）→ 发起方/用户批准（`approve`）→ 才可委派 spawn（第 3 节）**。批准前零 spawn 在工具级执法：draft 任务不可 claim（claim 明确拒绝且零事件追加零落盘）；派工即回写 auto-claim 在插件 lib 侧解析 show 输出、**仅对 ready 条目认领**（draft≠ready 天然跳过）——草案未批准时任何委派都不会建立派工代际。
+大型任务规划走三段式：**PM 产出以 `create --draft` 落板为待批准草案（draft 状态；草案内容创建后不可经任务板修改，「可编辑」指发起方可废弃重创建）→ 发起方/用户批准（`approve`）或否决（`reject`，rejected 终态）→ 批准后才可委派 spawn（第 3 节）**。批准前零 spawn 在工具级执法：draft 任务不可 claim（claim 明确拒绝且零事件追加零落盘）；派工即回写 auto-claim 在插件 lib 侧解析 show 输出、**仅对 ready 条目认领**（draft≠ready 天然跳过）——草案未批准时任何委派都不会建立派工代际。
 
 **第 1 段·草案（draft）——PM 规划落板**：
 
@@ -37,11 +37,11 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 2. 规划任务书必须自包含（专家看不到对话）：目标与验收期望、已知约束、关键上下文（工作目录、相关文件路径、已确认事实），并明确「只规划不执行」。
 3. 组装规划任务书前按项目/主题关键词 grep 经验池相关条目（不全文通读），写入「经验提示」。
 4. 要求 PM 返回结构化计划：子任务清单（2–6 条，每条含做什么、建议执行专家领域、验收标准）、依赖与并行关系、里程碑顺序、风险与范围外项。
-5. 把计划落进任务板（第 9 节 taskboard.py）：**每个项目/计划一个独立板**——`--board .expert-taskboards/<项目slug>.json`（如 dsh-onebot-m1），禁止把无关任务建进同一个板；每个子任务一个条目，用 `create --draft` 创建为**草案**（draft 状态：可编辑待批准、不可 claim、不参与依赖自动提升），`--owner` 标意向执行专家、`--desc` 写验收标准、`--dep` 声明依赖；todo_write 同步关键里程碑给用户看。
+5. 把计划落进任务板（第 9 节 taskboard.py）：**每个项目/计划一个独立板**——`--board .expert-taskboards/<项目slug>.json`（如 dsh-onebot-m1），禁止把无关任务建进同一个板；每个子任务一个条目，用 `create --draft` 创建为**草案**（draft 状态：待批准、不可 claim、不参与依赖自动提升；草案内容创建后不可经任务板修改，需调整时废弃重创建或批准后 `set_dependencies`），`--owner` 标意向执行专家、`--desc` 写验收标准、`--dep` 声明依赖；todo_write 同步关键里程碑给用户看。
 6. 用户的项目级裁决（删除文件、方向变更、优先级取舍）写入项目板对应条目的 desc/summary——**跨会话意图以任务板为准**，任何会话派工前先读板。
 7. **PM 召唤分级**：真正跨域/目标模糊的大型任务才召唤 PM；中型任务由编排者按固定五问清单自查代替 PM——① 产出物清单完整吗？② 依赖顺序对吗？③ 每项有可验收标准吗？④ 有写冲突风险吗？⑤ 范围外是什么？自查结论写入任务板。
 
-**第 2 段·批准（approve）——发起方/用户显式放行**：逐条核对草案（验收标准、依赖、范围）后执行 `taskboard.py approve <id>`（draft→ready；依赖未满足时先回 pending，由既有依赖自动提升在依赖 done 时转 ready；支持 `--expected-revision` CAS）。用户在场的由用户批准，未在场的由发起方编排者批准并在板检查点/bus 留痕；`status` 的「待批准草案」行与 `list` 的 `[draft]` 状态是批准面盘点入口。未通过的草案保持 draft 不批准（不建代际不派工），按意见重新规划后新建草案条目；需调整依赖的草案先 approve 再 `set_dependencies`（draft 状态不接受 set_dependencies）。
+**第 2 段·批准（approve）——发起方/用户显式放行**：逐条核对草案（验收标准、依赖、范围）后执行 `taskboard.py approve <id>`（draft→ready；依赖未满足时先回 pending，由既有依赖自动提升在依赖 done 时转 ready；支持 `--expected-revision` CAS）。用户在场的由用户批准，未在场的由发起方编排者批准并在板检查点/bus 留痕；`status` 的「待批准草案」行与 `list` 的 `[draft]` 状态是批准面盘点入口。未通过的草案保持 draft 不批准（不建代际不派工），按意见重新规划后新建草案条目；确不再推进的草案用 `reject <id>` 否决为 **rejected 终态**（退出批准面、不可 claim/approve/progress/reassign，archive 不再被其阻塞）；需调整依赖的草案先 approve 再 `set_dependencies`（draft 状态不接受 set_dependencies）。
 
 **第 3 段·spawn（委派）——仅 ready 后进入第 3 节**：批准后条目为 ready，才按第 3 节逐项召唤执行专家（claim/auto-claim 建立派工代际）；依赖未满足的条目随依赖 done 自动转 ready 后同样处理。**批准前禁止 spawn**——协议级纪律，工具级由 draft 不可 claim 兜底执法。
 
@@ -93,6 +93,10 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 **门禁执法平面（v2.6，默认关闭，显式开启）**：`python3 <技能目录>/tools/taskboard.py --install-hook` 向当前仓库 `.git/hooks/commit-msg` 写入零依赖 hook（POSIX sh 薄壳 + python3 调 taskboard.py `_hook-check`），三查语义：① 提交消息须可解析出任务 id（形如 `T<数字>`）；② 消息中解析出的**全部**任务 id 逐个核对——均须在板内且状态 running，任一不满足即拒（防「T1 T999」夹带未核 id）；③ 各任务声明 scope（`create --scope`）时取 scope **并集**，提交文件须落在任一关联域内。已有同名 hook 报错退出不覆盖（内容一致幂等；内容含本插件指纹标记行视为旧版插件 hook，允许原地升级覆盖）；`--uninstall-hook` 仅移除本插件安装的——凭写入 hook 内的**稳定指纹标记行**辨认（不认模板/全文哈希，模板任何演进都不影响卸载；旧版哈希形态标记行同被认得），无标记行的用户自有 hook 一律拒绝删除；`--board` 可把项目板路径固化进 hook。**降级语义（fail-open，均 stderr 告警放行、不阻塞提交）**：门禁脚本缺失、python3 不可用（hook 头部 `command -v` 检测，装回后门禁自动恢复）、任务板缺失（含 `archive` 归档把板移走——归档收口属预期流程，hook 不再阻塞提交；板缺失时校验平面整体不可用，连无任务 id 消息也一并放行）。取舍说明：hook 是辅助门禁而非数据完整性屏障，板/环境不可用时拒绝会永久卡死所有提交（archive 后必触发板缺失），故统一选择降级可见而非阻塞；板在而三查不过仍 fail closed，紧急单次可用 `git commit --no-verify` 并记录。**未显式 `--install-hook` 前任何命令不触碰 `.git/hooks/`**。
 
 1. **独立评审**（大型任务必过；小型实施可跳过）：召唤一名与实现者**不同领域**的专家（如后端实现→代码审查工程师或安全审计工程师评审），任务书要求只读评审 diff/产出，输出「同意 / 部分同意 / 反对 + 理由 + 必改项」。部分同意或反对→把必改项派回实现专家回炉，**回炉上限 2 轮**，仍不过→上报用户决策。
+
+   **review kind 任务（v2.7 工具级评审门禁）**：评审/验收类子任务用 `create --kind review` 声明（缺省任务不带 kind 字段，行为不变），把上一条「评审→回炉→复审」纪律落到任务板状态机。完成语义分叉：`done <id> --verdict pass` 才算评审通过；结论 needs_revision 必须携带 `--findings "…"`（缺 findings 被工具拒绝——零事件零落盘），此时原任务**不完成**——回 ready 待复审，工具自动生成 repair 任务（引用原任务+findings，`--repair-owner` 可指定 owner，直接 ready 不经草案：来源是工具自动编排而非 PM 规划；`repair_of` 回指原任务、scope 继承供门禁 hook 覆盖修复提交），原任务全部下游依赖自动改挂 repair（DAG 重排，与原任务/repair/重排下游同落**单事件 after 快照**，事件流可追溯），repair 完成后下游按既有依赖自然解锁；复审时机由编排者掌握（reviewer 再次 claim 后 `done --verdict`）。repair 重试超过上限（工具预置默认 3；轮次参数由 m 票共识任务统一接配置）不再生成 repair：任务转 **escalated 终态**交回用户处置——不可 claim/done/progress/reassign，用户显式 `retry` 是唯一工具内出口（解除升级、回 ready 并重置重试预算）；`status` 的「已升级待用户处置」行是升级面盘点入口。工具内置上限与本条人工回炉上限（2 轮）分层并行：前者约束任务板状态机，后者约束编排流程。
+
+   **review kind 补充语义（T19 回炉）**：①**watchdog 永不 adopt review 任务**——评审员崩溃后残留的落盘 `[交付]` 报告不构成 verdict，nudge 上限后照常 reclaim 回 ready 重新评审（检查点注明「不代答 verdict」），评审结论只能经显式 `done --verdict` 落地；②**复审 pass 自动收口僵尸 repair**——pass 时名下开放 repair（ready/pending、`repair_of` 指向本任务）自动置为 **rejected 终态**（作废语义：rejected 承载「PM 草案否决」与「repair 收口」两类来源），其下游依赖改挂回已 pass 的评审任务、按既有提升逻辑自然解锁（单事件多任务 after 快照可追溯）；running 状态的 repair 不自动打断（在途工作由编排者人工处置）；③**多轮 needs_revision 每轮都重排**（编排者裁决）——每轮生成新 repair 并把依赖原任务或任一旧 repair 的下游一律改挂**最新** repair（下游始终只等最新修复），已 ready 的下游回 pending（保持「ready 蕴含依赖已满足」），running/done 下游不打断；旧 repair 若仍未收口，随复审 pass 一并自动收口；④`--findings` 上限 **4000 码点**（与断点恢复 prompt 预算同口径），超限硬拒不静默截断（零事件零落盘，评审员压缩为要点清单后重试）；⑤needs_revision 路径同样接受 `--rework/--switched/--by` 落档（与普通 done 审计丰富度对齐）；⑥`verify` 写路径拒 draft/rejected/escalated（读路径重算 fresh/stale 不受影响）；⑦show 对 pass 后旧 findings 只展示「已通过（历史 findings 归档）」标注（findings 数据与事件流不动，仅展示层修正）。
 2. **PM 检查点**（大型任务必过；小型实施免，见第 1 节）：向 PM（默认「项目推进专员」；范围与拆解类问题可再次召唤「高级项目经理」）汇报：当前进度（已完成/进行中/受阻，附证据）、与原计划的偏差、评审结论；要求返回调整后的计划、风险处置、需用户决策事项。按新计划更新任务板与 todo 后继续。
 
 ## 5. 委派任务书模板
@@ -170,16 +174,18 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 **任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）。**任务板权威定义（v2.7 事件溯源化）**：状态权威 = append-only JSONL 事件流 `<板文件>.events.jsonl`，JSON 板文件只是**折叠视图**缓存（对外只增 event_seq/event_state_hash 簿记，既有字段零删改，list/status/show 输出结构不变）——视图被手改/损坏 → stderr 报警并按事件流权威重建覆盖（stdout 零污染）；**事件流被清空而视图含簿记、视图含未知顶层键、事件链 hash 断链或末事件 state_hash 对账失配 → `{"error":"unrecoverable","unrecoverable":true,...}`**（绝不静默返回空数据，绝不裸 traceback——如实报告编排者，禁止当作空板重建）。崩溃恢复自动进行（残尾截断/缺行尾换行自愈 + stderr 告警，已落账事件不回滚）；`replay` 可显式重放重建视图（幂等，崩溃演练/人工核对用）；旧 v2.6 板首次写命令自动收编为事件流（数据零丢失，revision 延续）。**A2 残余风险注记：「剥簿记+清日志」（簿记字段与事件流同时剥除）是原理性残余**——数据侧无从证明曾有过板，**备份是最后兜底：定期备份 `.expert-taskboards/`（建议连同 `.expert-bus/` 一并备份）**：
 
-    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）；大型任务规划期加 --draft 创建 PM 草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）
+    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）；大型任务规划期加 --draft 创建 PM 草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；评审/验收类子任务加 --kind review（完成须 --verdict 分叉，见第 4 节 review kind 段）
     python3 <技能目录>/tools/taskboard.py approve T3   # PM 草案批准（v2.7，第 2 节三段式第 2 段）：draft -> ready（依赖未满足先回 pending，依赖 done 时自动提升）；批准前 claim/auto-claim 均被拒（批准前零 spawn 工具级执法）；支持 --expected-revision CAS
+    python3 <技能目录>/tools/taskboard.py reject T3    # PM 草案否决（v2.7）：draft -> rejected 终态——退出批准面不永久滞留（archive 不再被其阻塞）；rejected 不可 claim/approve/progress/reassign；需重启时按意见重新规划后新建草案
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家      # ready -> running
     # 派工即回写（v2.6 auto-claim）：summon_expert/summon_experts 在派发入口（专家 run 前）自动对任务书显式引用的 T<数字>（≤8 个，超取前 8 并提示截断；命令引述与路径形态不解析）执行上述 claim（owner=被召唤专家名；owner 已有/非 ready/非唯一板跳过）——专家拿到任务书时条目已 running，无需手工重复认领；专家失败/召唤失败条目保持 running 不回滚，由编排者按板处置（reassign/fail/recover）；DSH_EXPERT_AUTOCLAIM=0 或空串整体关闭；认领/跳过/失败（taskboard 超时与板不可读分别提示）均以【auto-claim】提示行附在 summon 结果/错误尾部
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要"     # 依赖它的任务自动转 ready
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --rework 1 --switched  # --rework 记返工次数，--switched 标记中途换人
-    python3 <技能目录>/tools/taskboard.py metrics  # 收口时按 owner 聚合任务数/累计返工/换人次数；反哺 routing.md（第 8 节路由回写）
-    python3 <技能目录>/tools/taskboard.py fail T3 "原因" ; retry T3
-    python3 <技能目录>/tools/taskboard.py progress T3 "已完成X；产物:路径；agent_id:xxx"  # 长任务每阶段记检查点（事件流持久，中断/崩溃不丢）；重试前编排者先 show 读取（按一次性纪律以全新代理重跑）
+    python3 <技能目录>/tools/taskboard.py done T3 "评审通过" --verdict pass  # review kind 任务（--kind review）完成语义分叉（v2.7）：pass 才可 done，并自动收口名下开放 repair 为 rejected（下游改挂回评审任务自然解锁）；needs_revision 必须携带 --findings（≤4000 码点，缺/超限拒绝且零事件零落盘；--rework/--switched/--by 照常落档）——原任务不完成回 ready 待复审，每轮生成新 repair 并把下游改挂最新 repair（多轮重排，单事件可追溯）；repair 重试超上限转 escalated 终态（不可 claim/done，retry 显式解除并重置预算）；watchdog 对 review 任务永不 adopt（评审结论只能经 --verdict 落地）
+    python3 <技能目录>/tools/taskboard.py metrics  # 收口时按 owner 聚合任务数/累计返工/换人次数；draft/rejected 未开工条目不计入（未开工不算 owner 工作量）；反哺 routing.md（第 8 节路由回写）
+    python3 <技能目录>/tools/taskboard.py fail T3 "原因" ; retry T3  # retry 亦为 escalated 唯一工具内出口：用户显式解除升级（回 ready 并重置 repair 重试预算）
+    python3 <技能目录>/tools/taskboard.py progress T3 "已完成X；产物:路径；agent_id:xxx"  # 长任务每阶段记检查点（事件流持久，中断/崩溃不丢）；重试前编排者先 show 读取（按一次性纪律以全新代理重跑）；拒 draft/rejected/escalated（草案无执行进度、终态不可再动）
     python3 <技能目录>/tools/taskboard.py heartbeat T3 --attempt <attempt_id>    # 长任务报活（v2.7）：重臂滑动无进展窗口并清零 nudge 计数（不产检查点；仅 running 可心跳；带 --attempt 走代际校验）
     python3 <技能目录>/tools/taskboard.py watchdog [--window-sec 1800] [--max-nudges 2] [--bus-root <cwd>/.expert-bus]  # 编排者显式调用（v2.7，非自动轮询）：扫描 running 任务滑动无进展窗口——activity=max(updated,heartbeat_at,nudged_at)，progress/heartbeat/新代际 claim 均重臂（健康的长任务永不因跑得久被杀）；窗口到期 nudge（板内静默计数+重臂，无送达通道），连续 --max-nudges 次无响应升级：先检索落盘完成报告（[交付] subject 前缀=强证据直接采纳）有则 adopt 为 done（记 executors 审计），无则 reclaim（撤代际回 ready）；--expected-revision 可走 CAS
     python3 <技能目录>/tools/taskboard.py --board .expert-taskboards/<项目slug>.json replay  # 显式按事件流重放重建折叠视图（v2.7，幂等；崩溃演练/人工核对用——视图损坏的报警重建已自动，无需此步）
@@ -198,7 +204,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
     python3 <技能目录>/tools/taskboard.py create "标题" --expected-revision 3   # CAS 乐观锁：写命令带 --expected-revision，与当前 revision 不符返回 {"error":"stale_revision",...} 并拒绝落盘；重读后携带最新 revision 重试
   - 进程互斥：板写入经 <board>.lock 文件锁（fcntl.flock）串行化，CAS 校验-写入在锁内原子完成；无 fcntl 平台（如 Windows）降级为唯一 tmp + 原子替换（不互截板文件，强一致仅 POSIX 保证）。
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家 --attempt <attempt_id>      # 派工代际：attempt_id 由编排者生成并随任务书下发；带新 attempt_id 认领即撤销旧代际
-    python3 <技能目录>/tools/taskboard.py reassign T3 <新attempt_id> --owner 新专家     # 转派：先撤销旧 attempt（记入 attempt_revoked），旧代际的汇报随后被拒；已撤销代际不能经 reassign 复活
+    python3 <技能目录>/tools/taskboard.py reassign T3 <新attempt_id> --owner 新专家     # 转派：先撤销旧 attempt（记入 attempt_revoked），旧代际的汇报随后被拒；已撤销代际不能经 reassign 复活；拒 draft/rejected/escalated（终态不可再动）
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --attempt <attempt_id>     # 执行方汇报必须携带派工时的 attempt_id（fail closed：任务无开放代际时被拒 {"error":"no_attempt",...}）；旧/已撤销代际返回 {"error":"stale_attempt",...}（fail/progress 同）
     python3 <技能目录>/tools/taskboard.py set_dependencies T3 --dep T1,T2               # 改依赖（整体替换）：写入前全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 并拒绝落盘
   - 查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（对损坏板逐条标注「（损坏）」）外所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback——此时如实报告编排者，禁止当作空板重建。

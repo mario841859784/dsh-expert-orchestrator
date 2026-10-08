@@ -7,7 +7,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, renameSync, symlinkSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawnSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -39,7 +39,18 @@ import {
   trustedBusMessages,
   withLessonHint,
 } from '../lib/tools.js'
-import { remoteCleanupCustomDeleted, remoteDeleteCustom, remoteSaveCustom } from '../lib/index.js'
+import { remoteCleanupCustomDeleted, remoteDeleteCustom, remoteSaveCustom, SOURCE_ID_RE } from '../lib/index.js'
+import {
+  FILE_LAYER_SOURCE_ID,
+  globalExpertsDir,
+  projectExpertsDir,
+  parseExpertFile,
+  parseExpertFrontmatter,
+  loadFileExperts,
+  readFileLayerPersona,
+  resolveFileExpert,
+  scanExpertDir,
+} from '../lib/expert-files.js'
 import { readFileSync } from 'node:fs'
 
 const PERSONA_LIMIT = 100000 // 与 tools.js MAX_PERSONA_CHARS 一致
@@ -4526,4 +4537,446 @@ test('T12 回炉 疑问3: exec.signal 缺省——startContinuable/sendMessage �
   assert.equal(opts.signal.aborted, false)
   emitEnd({ id: 'child-1', stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: '续跑完成' }] })
   await p
+})
+
+// ── WP-6a 专家定义文件层（T13）：S1 解析/S2 三层覆盖/S3 执行期重读/S4 容错 ──
+// 路径约定：全局层 = <DSH_HOME|~/.dsh>/experts/*.md（与 lib/index.js
+// resolvePresetTargetDir 同一 .dsh 定位约定）；项目层 = <cwd>/.dsh/experts/*.md。
+// 覆盖语义（用户裁决 2026-10-07 Q4=4A）：项目层>全局层>内置/来源包（只读兜底）。
+
+/** 文件层测试 env 守卫：沙箱 DSH_HOME（传 null 表示删除该 env）+ 自动恢复
+ *  （文件层全局层锚点，防测试间 env 泄漏）。 */
+const guardFileLayerHome = (t, home) => {
+  const prev = process.env.DSH_HOME
+  if (home === null) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = home
+  t.after(() => {
+    if (prev === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prev
+  })
+}
+
+/** 写一个合法/自定义的文件层专家定义。 */
+const writeExpertMd = (dir, file, fmLines, body = '专家正文') => {
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, file), `---\n${fmLines.join('\n')}\n---\n\n${body}`)
+}
+
+/** 文件层集成夹具：one-shot mock provider（无 continuable 四件套 →
+ *  detectResumeSeam 返回 null 走现状路径），捕获每次召唤注入的 persona。 */
+const makeFileLayerCtx = () => {
+  const descriptors = []
+  const personas = []
+  const ctx = {
+    tools: { register: (d) => descriptors.push(d) },
+    subagents: {
+      getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+      start: async (_provider, spec) => {
+        personas.push(spec.persona)
+        return { result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }
+      },
+    },
+  }
+  return { descriptors, ctx, personas }
+}
+
+test('WP-6a parseExpertFrontmatter/parseExpertFile: name 必填 + 可选键 + 行式容错', () => {
+  const ok = parseExpertFile('---\nname: backend-engineer\ntitle: 后端工程师\nmethod: expert-methods/backend-engineer.md\n---\n\n正文')
+  assert.equal(ok.ok, true)
+  assert.deepEqual(ok.expert, { name: 'backend-engineer', title: '后端工程师', method: 'expert-methods/backend-engineer.md' })
+  // 缺 name → 拒绝；无 frontmatter → 拒绝；空 name → 拒绝
+  assert.equal(parseExpertFile('---\ntitle: x\n---\nbody').ok, false)
+  assert.equal(parseExpertFile('没有 frontmatter 的普通 md').ok, false)
+  assert.equal(parseExpertFile('---\nname:   \n---\nbody').ok, false)
+  assert.equal(parseExpertFile(null).ok, false)
+  // 行无法解析 → 整文件拒绝（格式错误显式暴露，不静默吞键）
+  const bad = parseExpertFile('---\nname: x\n这是一行没有冒号的内容\n---\nbody')
+  assert.equal(bad.ok, false)
+  assert.ok(bad.error.includes('无法解析'), bad.error)
+  // 注释行与空行跳过；CRLF 兼容
+  const ok2 = parseExpertFrontmatter('---\r\n# 注释\r\nname: a\r\n\r\ntitle: 标题\r\n---\r\nbody')
+  assert.equal(ok2.ok, true)
+  assert.equal(ok2.name, 'a')
+  // 回炉 m2：前导 UTF-8 BOM 剥除——BOM 文件不再误报「缺少 frontmatter 块」
+  const bom = parseExpertFile('\uFEFF---\nname: bom专家\ntitle: 波姆\n---\nbody')
+  assert.equal(bom.ok, true)
+  assert.deepEqual(bom.expert, { name: 'bom专家', title: '波姆', method: null })
+  assert.equal(parseExpertFrontmatter('\uFEFF---\r\nname: b\r\n---\r\nbody').ok, true)
+})
+
+test('WP-6a scanExpertDir/loadFileExperts: 缺目录→空、坏文件告警跳过、.md 过滤+排序、同层重名首胜', (t) => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-home-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  // 目录缺失 → 空数组（不抛错）
+  assert.deepEqual(loadFileExperts({ homeDir: join(home, 'nope'), projectDir: join(proj, 'nope') }, warn).all, [])
+  // 混合内容：好文件 + 坏文件（缺 name）+ 非 .md + 同层重名
+  const gDir = join(home, 'experts')
+  writeExpertMd(gDir, 'b-second.md', ['name: 重复甲', 'title: 甲'])
+  writeExpertMd(gDir, 'a-first.md', ['name: 重复甲', 'title: 甲二号'])  // 文件名排序在前 → 首胜
+  writeExpertMd(gDir, 'broken.md', ['title: 缺名'])
+  writeExpertMd(gDir, 'z-only.md', ['name: 唯名'])
+  writeFileSync(join(gDir, 'notes.txt'), '---\nname: txt\n---\n') // 非 .md 不扫
+  const fl = loadFileExperts({ homeDir: gDir, projectDir: join(proj, '.dsh', 'experts') }, warn)
+  // 文件名排序确定性；同层重名首文件胜出（a-first.md 胜、b-second.md 被跳过）
+  assert.deepEqual(fl.all.map((e) => [e.layer, e.file, e.name]), [['global', 'a-first.md', '重复甲'], ['global', 'z-only.md', '唯名']])
+  assert.ok(fl.all.every((e) => e.source === FILE_LAYER_SOURCE_ID && e.path && e.layer === 'global'))
+  // 告警语义：坏文件跳过 + 同层重名跳过，均 stderr 告警（warn 注入收集）
+  assert.ok(warns.some((m) => m.includes('broken.md') && m.includes('name')), warns.join(' | '))
+  assert.ok(warns.some((m) => m.includes('同层重名') && m.includes('b-second.md')), warns.join(' | '))
+})
+
+test('WP-6a resolveFileExpert: 项目层>全局层覆盖；删项目层回落全局层；title 唯一/多命中；missing', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-r-home-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-r-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  const gDir = join(home, 'experts')
+  const pDir = join(proj, '.dsh', 'experts')
+  writeExpertMd(gDir, 'g.md', ['name: 覆盖甲', 'title: 甲专家'], '全局版')
+  writeExpertMd(pDir, 'p.md', ['name: 覆盖甲'], '项目版')
+  writeExpertMd(pDir, 't.md', ['name: 唯乙', 'title: 乙专家'], '乙')
+  writeExpertMd(gDir, 't2.md', ['name: 丙', 'title: 乙专家'], '丙') // 与唯乙 title 撞名
+  const fl = loadFileExperts({ homeDir: gDir, projectDir: pDir })
+  // ① name 归一命中：项目层胜出（all 项目层在前）
+  const hitP = resolveFileExpert(fl.all, ' 覆盖甲 ')
+  assert.equal(hitP.ok, true)
+  assert.equal(hitP.expert.layer, 'project')
+  assert.ok(hitP.expert.path.startsWith(pDir))
+  // ② 删项目层 → 回落全局层
+  rmSync(join(pDir, 'p.md'))
+  const fl2 = loadFileExperts({ homeDir: gDir, projectDir: pDir })
+  const hitG = resolveFileExpert(fl2.all, '覆盖甲')
+  assert.equal(hitG.ok, true)
+  assert.equal(hitG.expert.layer, 'global')
+  // ③ title 唯一命中（乙专家现在撞名：唯乙/丙 → ambiguous；删全局 t2 后唯一）
+  assert.equal(resolveFileExpert(fl2.all, '乙专家').reason, 'ambiguous')
+  rmSync(join(gDir, 't2.md'))
+  const fl3 = loadFileExperts({ homeDir: gDir, projectDir: pDir })
+  const hitT = resolveFileExpert(fl3.all, '乙专家')
+  assert.equal(hitT.ok, true)
+  assert.equal(hitT.expert.name, '唯乙')
+  // ④ 未命中 → missing（空 query 同样）
+  assert.equal(resolveFileExpert(fl3.all, '不存在').reason, 'missing')
+  assert.equal(resolveFileExpert(fl3.all, '').reason, 'missing')
+})
+
+test('WP-6a 路径约定: 全局层随 DSH_HOME、项目层随 cwd 锚点', (t) => {
+  assert.equal(globalExpertsDir({ DSH_HOME: '/x/.dsh' }), join('/x/.dsh', 'experts'))
+  // env 注入对象直接传入（非 process.env），不触碰测试进程 env
+  guardFileLayerHome(t, null) // 删除 DSH_HOME → 回落 os.homedir() 约定
+  assert.equal(globalExpertsDir(), join(homedir(), '.dsh', 'experts'))
+  assert.equal(projectExpertsDir('/y/ws'), join('/y/ws', '.dsh', 'experts'))
+})
+
+test('WP-6a 集成 断言(a): 项目层覆盖全局层 + 执行期改文件立即生效（不重启、不重建 ctx）', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-i-home-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-i-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-i-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(dst, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  const gDir = join(home, 'experts')
+  const pDir = join(proj, '.dsh', 'experts')
+  writeExpertMd(gDir, '测试专家.md', ['name: 测试专家'], '全局版正文')
+  writeExpertMd(pDir, '测试专家.md', ['name: 测试专家'], '项目版v1')
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // ① 项目层覆盖全局层与花名册：persona=项目层内容
+  await summon.execute({ expert: '测试专家', task: '任务一' }, { agent: {} })
+  assert.equal(personas[0], '项目版v1')
+  // ② 执行期改文件立即生效（S3 核心）：同一 ctx 直接改盘再 summon
+  writeFileSync(join(pDir, '测试专家.md'), '---\nname: 测试专家\n---\n\n项目版v2（改后）')
+  await summon.execute({ expert: '测试专家', task: '任务二' }, { agent: {} })
+  assert.equal(personas[1], '项目版v2（改后）')
+})
+
+test('WP-6a 集成 三层覆盖链: 删项目层→全局层；删全局层→花名册兜底（内置/来源包只读兜底）', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-c-home-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-c-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-c-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(dst, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  const gDir = join(home, 'experts')
+  const pDir = join(proj, '.dsh', 'experts')
+  writeExpertMd(gDir, '测试专家.md', ['name: 测试专家'], '全局版正文')
+  writeExpertMd(pDir, '测试专家.md', ['name: 测试专家'], '项目版正文')
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '测试专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], '项目版正文')
+  rmSync(join(pDir, '测试专家.md'))
+  await summon.execute({ expert: '测试专家', task: '二' }, { agent: {} })
+  assert.equal(personas[1], '全局版正文')
+  rmSync(join(gDir, '测试专家.md'))
+  await summon.execute({ expert: '测试专家', task: '三' }, { agent: {} })
+  assert.equal(personas[2], 'ROSTER-PERSONA')
+})
+
+test('WP-6a 集成 解析失败容错: 坏文件跳过+好文件可用；花名册专家不受影响', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-t-home-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-t-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-t-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(dst, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  const pDir = join(proj, '.dsh', 'experts')
+  writeExpertMd(pDir, 'broken.md', ['title: 缺名专家'])
+  writeExpertMd(pDir, 'good.md', ['name: 文件层新专家'], '文件层正文')
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // ① 坏文件旁的好文件可召唤；坏文件被跳过（专家不存在）
+  await summon.execute({ expert: '文件层新专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], '文件层正文')
+  await assert.rejects(() => summon.execute({ expert: '缺名专家', task: 'x' }, { agent: {} }), /专家不存在/)
+  // ② 花名册专家不受文件层坏文件影响（不炸整个花名册）
+  await summon.execute({ expert: '测试专家', task: '二' }, { agent: {} })
+  assert.equal(personas[1], 'ROSTER-PERSONA')
+})
+
+test('WP-6a 集成 list_experts: 文件层组并入（非空可见/bySource=file 可展开/空时零变化+来源不存在）', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-l-home-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-l-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-l-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(dst, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const list = descriptors.find((d) => d.name === 'list_experts')
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // ① 未使用文件层（两目录缺失）：输出与既有行为一致——total=1、无 file 组
+  const before = await list.execute({})
+  assert.equal(before.total, 1)
+  assert.ok(!before.sources.some((g) => g.source === FILE_LAYER_SOURCE_ID))
+  await assert.rejects(() => list.execute({ bySource: FILE_LAYER_SOURCE_ID }), /来源不存在或未启用/)
+  // ② 文件层非空：文件层组并入候选视图；bySource=伪来源 id 展开含 layer 标注
+  writeExpertMd(join(proj, '.dsh', 'experts'), '新专家.md', ['name: 文件层新专家', 'title: 新专家'], '正文')
+  const after = await list.execute({})
+  assert.equal(after.total, 2)
+  const fileGroup = after.sources.find((g) => g.source === FILE_LAYER_SOURCE_ID)
+  assert.equal(fileGroup.count, 1)
+  const expanded = await list.execute({ bySource: FILE_LAYER_SOURCE_ID })
+  assert.deepEqual(expanded.sources[0].experts.map((e) => [e.name, e.layer, e.disabled === undefined ? null : e.disabled]), [['文件层新专家', 'project', null]])
+  // ③ 文件层独有专家可 summon（无需花名册条目）
+  await summon.execute({ expert: '文件层新专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], '正文')
+})
+
+test('WP-6a 集成 零回归守卫: 空沙箱 HOME+无项目层时 summon/list 行为与既有逐字一致', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-z-home-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-z-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-z-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(dst, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const list = descriptors.find((d) => d.name === 'list_experts')
+  // roster 专家 persona 仍来自 getExpertContentImpl（文件层无干扰）
+  await summon.execute({ expert: '测试专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], 'ROSTER-PERSONA')
+  // 未定义专家报错文案不变（含文件层未命中回落语义）
+  await assert.rejects(() => summon.execute({ expert: '不存在专家', task: 'x' }, { agent: {} }), /专家不存在：不存在专家/)
+  // list total 只含花名册候选
+  assert.equal((await list.execute({})).total, 1)
+})
+
+// ── T13 回炉（评审 m1791474603733373 部分同意：M1 + q1 裁决 + m2/m4/测试缺口）──
+
+test('WP-6a 回炉 M1: 符号链接专家文件不进花名册（lstat 跳过+stderr 告警），真实文件不受影响', async (t) => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-m1-home-'))
+  const dir = mkdtempSync(join(tmpdir(), 'wp6a-m1-'))
+  const outside = mkdtempSync(join(tmpdir(), 'wp6a-m1-out-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-m1-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-m1-proj-'))
+  t.after(() => {
+    for (const d of [home, dir, outside, dst, proj]) rmSync(d, { recursive: true, force: true })
+  })
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  // 混合内容：真实合法文件 + 指向目录外合法 .md 的符号链接 + 悬空链接
+  writeExpertMd(dir, 'real.md', ['name: 真实专家'], '真实正文')
+  writeExpertMd(outside, 'outer.md', ['name: 链接专家'], '外部正文')
+  symlinkSync(join(outside, 'outer.md'), join(dir, 'link.md'))
+  symlinkSync(join(dir, 'missing.md'), join(dir, 'dangling.md'))
+  // ① 扫描层：符号链接（含悬空）一律不进花名册；真实文件不受影响
+  const entries = scanExpertDir(dir, 'project', warn)
+  assert.deepEqual(entries.map((e) => [e.name, e.path]), [['真实专家', join(dir, 'real.md')]])
+  assert.ok(warns.some((m) => m.includes('link.md') && m.includes('符号链接')), warns.join(' | '))
+  assert.ok(warns.some((m) => m.includes('dangling.md') && m.includes('符号链接')), warns.join(' | '))
+  // ② 集成层：项目层随仓库 clone 进来的同名链接不接管 summon——花名册专家仍命中
+  mkdirSync(join(proj, '.dsh', 'experts'), { recursive: true })
+  symlinkSync(join(outside, 'outer.md'), join(proj, '.dsh', 'experts', '测试专家.md'))
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '测试专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], 'ROSTER-PERSONA')
+  assert.equal(personas.some((p) => p === '外部正文'), false)
+})
+
+test('WP-6a 回炉裁决 q1: 文件层 title 不劫持花名册 name/title 解析；title 仅文件层内部兜底', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-q1-home-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-q1-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-q1-proj-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(dst, { recursive: true, force: true }); rmSync(proj, { recursive: true, force: true }) })
+  guardFileLayerHome(t, home)
+  // 花名册：name=测试专家（title=花名册头衔）+ name=同名戊；文件层四件对齐裁决矩阵
+  mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(
+    join(dst, 'expert-sources', 'merged', 'roster.json'),
+    JSON.stringify({ core: [
+      { source: 'bundled-core', file: '测试专家.md', name: '测试专家', title: '花名册头衔' },
+      { source: 'bundled-core', file: '同名戊.md', name: '同名戊' },
+    ] }))
+  const pDir = join(proj, '.dsh', 'experts')
+  writeExpertMd(pDir, 'f1.md', ['name: 文件层乙', 'title: 测试专家'], '乙正文') // title 撞花名册 name
+  writeExpertMd(pDir, 'f2.md', ['name: 花名册头衔', 'title: 丙头衔'], '丙正文') // name 撞花名册 title
+  writeExpertMd(pDir, 'f3.md', ['name: 文件层丁', 'title: 丁头衔'], '丁正文')   // 独立 title
+  writeExpertMd(pDir, 'f4.md', ['name: 同名戊'], '戊文件层正文')                // 与花名册同名
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // ① 文件层专家 title = 花名册专家 name：花名册 name 召唤仍命中花名册专家（裁决核心用例）
+  await summon.execute({ expert: '测试专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], 'ROSTER-PERSONA')
+  // ② 文件层专家 name = 花名册专家 title：花名册 title 召唤仍命中花名册专家
+  await summon.execute({ expert: '花名册头衔', task: '二' }, { agent: {} })
+  assert.equal(personas[1], 'ROSTER-PERSONA')
+  // ③ 花名册整体未命中 → 文件层 title 兜底解析（仅文件层内）命中
+  await summon.execute({ expert: '丁头衔', task: '三' }, { agent: {} })
+  assert.equal(personas[2], '丁正文')
+  // ④ 花名册未命中 → 文件层 name 解析照常可用
+  await summon.execute({ expert: '文件层乙', task: '四' }, { agent: {} })
+  assert.equal(personas[3], '乙正文')
+  // ⑤ Q4=4A 同名覆盖保持：花名册与文件层 name 同时精确命中 → 文件层胜（唯一优先通道）
+  await summon.execute({ expert: '同名戊', task: '五' }, { agent: {} })
+  assert.equal(personas[4], '戊文件层正文')
+  // ⑥ 文件层 title 多命中 → summon 级 ambiguous（宁拒勿猜，附文件层清单）
+  writeExpertMd(pDir, 'f5.md', ['name: 文件层己', 'title: 丁头衔'], '己正文')
+  await assert.rejects(() => summon.execute({ expert: '丁头衔', task: 'x' }, { agent: {} }),
+    (e) => e.message.includes('委派名存在多个候选') && e.message.includes('f3.md') && e.message.includes('f5.md'))
+})
+
+test('WP-6a 回炉: resolveFileExpert mode 分段契约（summon 链按 name/title 两段咨询）', () => {
+  const entries = [{ name: '甲', title: '乙', layer: 'project', file: 'a.md', source: FILE_LAYER_SOURCE_ID, method: null, path: '/x/a.md' }]
+  // mode='name'：只查 name，title 不参与（花名册 name 覆盖的唯一通道）
+  assert.equal(resolveFileExpert(entries, '甲', { mode: 'name' }).ok, true)
+  assert.equal(resolveFileExpert(entries, '乙', { mode: 'name' }).reason, 'missing')
+  // mode='title'：只查 title，name 不参与（文件层内部兜底解析）
+  assert.equal(resolveFileExpert(entries, '乙', { mode: 'title' }).expert.name, '甲')
+  assert.equal(resolveFileExpert(entries, '甲', { mode: 'title' }).reason, 'missing')
+  // 缺省：name→title 完整链（既有语义与既有用例不变）
+  assert.equal(resolveFileExpert(entries, '乙').expert.name, '甲')
+  assert.equal(resolveFileExpert(entries, '不存在').reason, 'missing')
+})
+
+test('WP-6a 回炉 m4: 文件层伪来源 id 移出 SOURCE_ID_RE 字符空间——来源包 id 不可能撞名', () => {
+  // 命名空间隔离不变量：伪来源 id 首字符 '.' 不满足来源 id 白名单（^[a-z0-9]…），
+  // 任何来源包/自定义来源的 id 都不可能与其撞名，bySource 分组互不干扰。
+  assert.equal(FILE_LAYER_SOURCE_ID, '.file-layer')
+  assert.equal(SOURCE_ID_RE.test(FILE_LAYER_SOURCE_ID), false)
+  // 'file' 等合法来源 id 永远属于花名册来源组（文件层不占用 SOURCE_ID_RE 字符空间）
+  assert.ok(SOURCE_ID_RE.test('file'))
+})
+
+test('WP-6a 回炉 测试缺口: 文件层 persona 读取失败显式报错（删文件/换链接/目录），不静默换人', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'wp6a-rp-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // ① 删除：统一「不可读」显式报错（错误文案契约）
+  const gone = join(dir, 'gone.md')
+  writeExpertMd(dir, 'gone.md', ['name: 甲'], '甲正文')
+  assert.equal(readFileLayerPersona(gone), '---\nname: 甲\n---\n\n甲正文')
+  rmSync(gone)
+  assert.throws(() => readFileLayerPersona(gone), (e) => e.message.startsWith(`专家定义文件不可读：${gone}——`))
+  // ② 扫描→读取间隙被换成符号链接：读取侧 lstat 守卫拒绝（M1 防御纵深）
+  const swap = join(dir, 'swap.md')
+  writeExpertMd(dir, 'swap.md', ['name: 乙'], '乙正文')
+  rmSync(swap) // 模拟「扫描后被替换」：真实文件 → 符号链接（指向已删除目标）
+  symlinkSync(gone, swap)
+  assert.throws(() => readFileLayerPersona(swap), /符号链接，拒绝读取（symlink 永不进信任面）/)
+  // ③ 路径是目录：同一显式报错面
+  mkdirSync(join(dir, 'adir.md'), { recursive: true })
+  assert.throws(() => readFileLayerPersona(join(dir, 'adir.md')), /专家定义文件不可读/)
+})
+
+// ── T13 二轮回炉（评审 m1791476729604644：M1-R2 目录级链接守卫 + m7 isFile 过滤）──
+
+test('WP-6a 回炉 M1-R2: experts 目录本身为符号链接 → 空层+告警（项目层/全局层两入口），正常目录不受影响', async (t) => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const home = mkdtempSync(join(tmpdir(), 'wp6a-mdl-home-'))
+  const outside = mkdtempSync(join(tmpdir(), 'wp6a-mdl-out-'))
+  const dst = mkdtempSync(join(tmpdir(), 'wp6a-mdl-dst-'))
+  const proj = mkdtempSync(join(tmpdir(), 'wp6a-mdl-proj-'))
+  t.after(() => { for (const d of [home, outside, dst, proj]) rmSync(d, { recursive: true, force: true }) })
+  // 目录外 victim：无目录级守卫时将随链接目录未经检查入册并可读
+  writeExpertMd(outside, 'victim.md', ['name: 链接专家'], '外部正文')
+  // ① 项目层：<proj>/.dsh/experts 本身为指向目录外的目录符号链接（git 可携带）
+  mkdirSync(join(proj, '.dsh'), { recursive: true })
+  const pDir = join(proj, '.dsh', 'experts')
+  symlinkSync(outside, pDir)
+  assert.deepEqual(scanExpertDir(pDir, 'project', warn), [])
+  assert.ok(warns.some((m) => m.includes(pDir) && m.includes('符号链接')), warns.join(' | '))
+  // ② 全局层：<home>/experts 为符号链接同样被拒（两处入口同经本守卫）
+  const gDir = join(home, 'experts')
+  symlinkSync(outside, gDir)
+  const fl = loadFileExperts({ homeDir: gDir, projectDir: join(proj, 'missing') }, warn)
+  assert.deepEqual(fl.global, [])
+  assert.deepEqual(fl.all, [])
+  assert.ok(warns.some((m) => m.includes(gDir) && m.includes('符号链接')), warns.join(' | '))
+  // ③ 悬空目录链接：同样空层 + 告警（lstat 不跟随，链接本身可见）
+  const dangling = join(proj, '.dsh', 'dangling-experts')
+  symlinkSync(join(outside, 'no-such-dir'), dangling)
+  assert.deepEqual(scanExpertDir(dangling, 'project', warn), [])
+  assert.ok(warns.some((m) => m.includes(dangling) && m.includes('符号链接')), warns.join(' | '))
+  // ④ 正常目录不受影响：真实目录照常入册（守卫只拒目录自身为链接）
+  const realDir = mkdtempSync(join(tmpdir(), 'wp6a-mdl-real-'))
+  t.after(() => rmSync(realDir, { recursive: true, force: true }))
+  writeExpertMd(realDir, 'real.md', ['name: 真实专家'], '真实正文')
+  assert.deepEqual(scanExpertDir(realDir, 'project', warn).map((e) => e.name), ['真实专家'])
+  // ⑤ 集成：项目层目录链接下 summon 不可达外部正文——花名册兜底、文件层专家不存在
+  guardFileLayerHome(t, home)
+  rosterFixture(dst, ['测试专家'])
+  const { descriptors, ctx, personas } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'ROSTER-PERSONA' }), autoClaimCwd: proj })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '测试专家', task: '一' }, { agent: {} })
+  assert.equal(personas[0], 'ROSTER-PERSONA')
+  await assert.rejects(() => summon.execute({ expert: '链接专家', task: 'x' }, { agent: {} }), /专家不存在/)
+  assert.equal(personas.some((p) => p === '外部正文'), false)
+})
+
+test('WP-6a 回炉 m7: 非普通文件（FIFO/.md 命名目录）isFile() 过滤——扫描不挂起、不误入册', (t) => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const dir = mkdtempSync(join(tmpdir(), 'wp6a-m7-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeExpertMd(dir, 'real.md', ['name: 真实专家'], '真实正文')
+  // FIFO（*.md 命名）：无 isFile() 过滤时下方 readFileSync 会挂起整个扫描/召唤。
+  // git 不携带 FIFO，仅本地自伤面；mkfifo（POSIX）可用即实证「立即返回+告警」，
+  // 不可用环境由下方 .md 命名目录用例覆盖同一 isFile() 守卫。
+  const fifoPath = join(dir, 'pipe.md')
+  if (spawnSync('mkfifo', [fifoPath]).status === 0) {
+    // 扫描必须立即返回（挂起即本用例失败）；FIFO 不入册且告警
+    const fifoEntries = scanExpertDir(dir, 'project', warn)
+    assert.deepEqual(fifoEntries.map((e) => e.name), ['真实专家'])
+    assert.ok(warns.some((m) => m.includes('pipe.md') && m.includes('不是普通文件')), warns.join(' | '))
+  }
+  // .md 命名目录：同一 isFile() 守卫跳过（此前落入 readFileSync EISDIR 的歧义
+  // 「不可读」文案）；其内部 .md 照旧不扫描（非递归语义不变）
+  mkdirSync(join(dir, 'nested.md'), { recursive: true })
+  writeFileSync(join(dir, 'nested.md', 'inner.md'), '---\nname: 嵌套专家\n---\n\n嵌套正文')
+  const entries = scanExpertDir(dir, 'project', warn)
+  assert.deepEqual(entries.map((e) => e.name), ['真实专家'])
+  assert.ok(warns.some((m) => m.includes('nested.md') && m.includes('不是普通文件')), warns.join(' | '))
 })

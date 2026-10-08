@@ -27,15 +27,23 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 - **小型实施**（≤3 个文件的聚焦修改，无新领域）→ 免 PM，直接第 3 节委派 1 名执行专家，你验收。改版本声明、改文档、小修复都属此类——**委派，而不是自己改**。
 - **只读操作**（问答、检索、读代码、跑测试核对）→ 可亲自做，无需委派。
 
-## 2. PM 规划召唤
+## 2. PM 规划召唤（草案 → 批准 → spawn 三段式）
+
+大型任务规划走三段式：**PM 产出以 `create --draft` 落板为可编辑草案（draft 状态，待批准）→ 发起方/用户批准（`approve`）→ 才可委派 spawn（第 3 节）**。批准前零 spawn 在工具级执法：draft 任务不可 claim（claim 明确拒绝且零事件追加零落盘）；派工即回写 auto-claim 在插件 lib 侧解析 show 输出、**仅对 ready 条目认领**（draft≠ready 天然跳过）——草案未批准时任何委派都不会建立派工代际。
+
+**第 1 段·草案（draft）——PM 规划落板**：
 
 1. 默认召唤「高级项目经理」（division=project-management）；多项目并行、跨部门协调或以进度/风险为主线时用「项目推进专员」。
 2. 规划任务书必须自包含（专家看不到对话）：目标与验收期望、已知约束、关键上下文（工作目录、相关文件路径、已确认事实），并明确「只规划不执行」。
 3. 组装规划任务书前按项目/主题关键词 grep 经验池相关条目（不全文通读），写入「经验提示」。
 4. 要求 PM 返回结构化计划：子任务清单（2–6 条，每条含做什么、建议执行专家领域、验收标准）、依赖与并行关系、里程碑顺序、风险与范围外项。
-5. 大型任务把计划落进任务板（第 9 节 taskboard.py）：**每个项目/计划一个独立板**——`--board .expert-taskboards/<项目slug>.json`（如 dsh-onebot-m1），禁止把无关任务建进同一个板；每个子任务一个条目，`--owner` 标执行专家、`--desc` 写验收标准、`--dep` 声明依赖；todo_write 同步关键里程碑给用户看。
+5. 把计划落进任务板（第 9 节 taskboard.py）：**每个项目/计划一个独立板**——`--board .expert-taskboards/<项目slug>.json`（如 dsh-onebot-m1），禁止把无关任务建进同一个板；每个子任务一个条目，用 `create --draft` 创建为**草案**（draft 状态：可编辑待批准、不可 claim、不参与依赖自动提升），`--owner` 标意向执行专家、`--desc` 写验收标准、`--dep` 声明依赖；todo_write 同步关键里程碑给用户看。
 6. 用户的项目级裁决（删除文件、方向变更、优先级取舍）写入项目板对应条目的 desc/summary——**跨会话意图以任务板为准**，任何会话派工前先读板。
 7. **PM 召唤分级**：真正跨域/目标模糊的大型任务才召唤 PM；中型任务由编排者按固定五问清单自查代替 PM——① 产出物清单完整吗？② 依赖顺序对吗？③ 每项有可验收标准吗？④ 有写冲突风险吗？⑤ 范围外是什么？自查结论写入任务板。
+
+**第 2 段·批准（approve）——发起方/用户显式放行**：逐条核对草案（验收标准、依赖、范围）后执行 `taskboard.py approve <id>`（draft→ready；依赖未满足时先回 pending，由既有依赖自动提升在依赖 done 时转 ready；支持 `--expected-revision` CAS）。用户在场的由用户批准，未在场的由发起方编排者批准并在板检查点/bus 留痕；`status` 的「待批准草案」行与 `list` 的 `[draft]` 状态是批准面盘点入口。未通过的草案保持 draft 不批准（不建代际不派工），按意见重新规划后新建草案条目；需调整依赖的草案先 approve 再 `set_dependencies`（draft 状态不接受 set_dependencies）。
+
+**第 3 段·spawn（委派）——仅 ready 后进入第 3 节**：批准后条目为 ready，才按第 3 节逐项召唤执行专家（claim/auto-claim 建立派工代际）；依赖未满足的条目随依赖 done 自动转 ready 后同样处理。**批准前禁止 spawn**——协议级纪律，工具级由 draft 不可 claim 兜底执法。
 
 ## 3. 执行编排
 
@@ -47,7 +55,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
   - 评审专家 → 保留 spawn：评审者≠实现者的独立性优先于缓存收益，fork 会让评审者继承编排者的上下文框定（含实现者的结果汇报）。
   - 无状态一次性实施专家 → 用自有 `summon_expert` 白纸召唤（persona 由工具注入）；
   - 同质大批量召唤（≥4 个且专家提示词文件 ≥150 行）→ 分批串行提交：批量召唤用自有 `summon_experts`（≤8、并发 4、部分成功语义）每批 ≤4、批间等待完成，第二批起可命中首批写入的共享前缀（单次 8 个在并发 4 下已天然分两波）；异质/小批量仍并行（延迟优先）。以上仅给建议，默认行为不变。
-- 委派时把 PM 对该子任务的验收标准写进任务板条目（`claim`），完成后 `done` 推进依赖链。**派工即回写（v2.6 auto-claim）**：`summon_expert`/`summon_experts` 在**派发入口**（专家 run 开始之前）即解析任务书中显式引用的任务 id（形如 `T<数字>` 的独立 token，且在 cwd 下唯一 `.expert-taskboards/*.json` 板真实存在）并自动 claim（ready→running，owner=被召唤专家名）——**专家拿到任务书时条目已 running**，无需再手工认领；owner 已有（不覆盖）/非 ready（done、failed、依赖未满足）/非唯一板一律跳过。auto-claim 的认领/跳过/失败都以 `【auto-claim】…` 提示行附在 summon 结果尾部；专家执行失败时附在错误信息尾部（降级可见），见跳过或失败时编排者按提示手工 `claim` 补齐。**失败不回滚**：专家执行失败或召唤失败时，已 claim 的条目保持 running，不自动回退 ready——由编排者按板处置：换人/纠正 owner 用 `reassign`，废弃用 `fail`，会话崩溃批量恢复用 `recover`。解析上限：任务书显式任务 id ≤8 个，超出取前 8 并在提示中说明截断。**不解析的形态**：命令引述（`claim/done/progress/show/deps + T<数字>`，如「先 claim T5」是对命令的引述）与路径形态（`T<数字>` 前邻 `/`、`.`、`-`，如 `build/T3-report.md`）。**残余误伤类**：同句提及的其他任务 id（如「对照 T3 的验收标准处理 T7」）仍会被一并认领——宁漏勿错仍为原则，缓解条件=仅 ready 且无 owner 才 claim（非 ready/已有 owner 一律跳过），万一误认领用 `reassign` 纠正。`DSH_EXPERT_AUTOCLAIM` 设为 `0` 或空串整体关闭（未设置或其他值均视为开启）；auto-claim 任何失败都不阻塞召唤主流程。
+- 委派时把 PM 对该子任务的验收标准写进任务板条目（`claim`），完成后 `done` 推进依赖链。**派工即回写（v2.6 auto-claim）**：`summon_expert`/`summon_experts` 在**派发入口**（专家 run 开始之前）即解析任务书中显式引用的任务 id（形如 `T<数字>` 的独立 token，且在 cwd 下唯一 `.expert-taskboards/*.json` 板真实存在）并自动 claim（ready→running，owner=被召唤专家名）——**专家拿到任务书时条目已 running**，无需再手工认领；owner 已有（不覆盖）/非 ready（done、failed、依赖未满足、PM 草案 draft——批准前零 spawn，第 2 节三段式；lib 侧按 show 解析的状态仅对 ready 认领，draft≠ready 天然跳过）/非唯一板一律跳过。auto-claim 的认领/跳过/失败都以 `【auto-claim】…` 提示行附在 summon 结果尾部；专家执行失败时附在错误信息尾部（降级可见），见跳过或失败时编排者按提示手工 `claim` 补齐。**失败不回滚**：专家执行失败或召唤失败时，已 claim 的条目保持 running，不自动回退 ready——由编排者按板处置：换人/纠正 owner 用 `reassign`，废弃用 `fail`，会话崩溃批量恢复用 `recover`。解析上限：任务书显式任务 id ≤8 个，超出取前 8 并在提示中说明截断。**不解析的形态**：命令引述（`claim/done/progress/show/deps + T<数字>`，如「先 claim T5」是对命令的引述）与路径形态（`T<数字>` 前邻 `/`、`.`、`-`，如 `build/T3-report.md`）。**残余误伤类**：同句提及的其他任务 id（如「对照 T3 的验收标准处理 T7」）仍会被一并认领——宁漏勿错仍为原则，缓解条件=仅 ready 且无 owner 才 claim（非 ready/已有 owner 一律跳过），万一误认领用 `reassign` 纠正。`DSH_EXPERT_AUTOCLAIM` 设为 `0` 或空串整体关闭（未设置或其他值均视为开启）；auto-claim 任何失败都不阻塞召唤主流程。
 - **执行者记录**：done 时编排者核对实际执行者与 owner 一致；多专家共担一个条目时，各自 progress 留痕，编排者把实际执行者写入 summary（或拆条目）——任务板必须能回答『这条实际是谁做的』。
 - **断点续跑（v2.7，WP-4b ④；用户裁决 2026-10-07 Q2=2A：仅新一代宿主启用）**：`summon_expert`/`summon_experts` 在新一代宿主（seam 探测通过：宿主 subagents 带 continuation 生命周期 startContinuable/sendMessage + provider 声明 continuable 创建能力 prepareContinuable + 结算观察面可用）下把专家 run 建为持久 continuable 子代理——中断（stopReason=error/max-tokens）后由**工具自动**经宿主冷恢复投递**恰好一个续跑 turn**（不产生第二个续跑代理/第二次续跑），续跑 prompt 折入断点数据=任务板最新检查点（`progress` 落盘 checkpoints 的最新一条——`show` 只输出最新检查点而非全轨迹；事件流持久不丢）+ bus 汇报（coordinator 信箱中该专家落款的消息，先全量署名过滤再取最新尾部若干条，`task=` 命中任务书引用任务 id 的消息优先，`--no-attempt-filter` 纯读零副作用）+ 中断前部分产出（内嵌换行/行首清单标记在折入前净化）；续跑后完成则正常返回（answer 尾附【断点续跑】注记），续跑后再中断按一次性纪律抛错交编排者处置。取消（aborted）与拒绝（refusal）不续跑。**旧宿主 0.1.7-alpha.2 seam 探测失败，维持 one-shot 现状**（专家中断=报错，编排者按检查点+续跑任务书重派全新代理，见 §3.1）；`DSH_EXPERT_RESUME=0` 或空串强制关闭回退现状（排障用）。**编排者职责不变**：派工时仍须要求长任务专家落检查点——续跑 prompt 的进度清单正是从检查点与 bus 汇报折叠而来，无检查点=续跑只能盲续（prompt 会显式要求先补检查点再继续）。
 - **长任务存活纪律（v2.7 heartbeat/watchdog）**：对长任务/多阶段委派，任务书检查点段必填，并要求专家「每完成一阶段落 `progress` 检查点并 bus 同步 coordinator；无法产出阶段产出时至少 `heartbeat` 报活」。编排者**按需显式**跑 `taskboard.py watchdog`（滑动无进展窗口：窗口内无 activity（progress/heartbeat/新代际 claim 均重臂）先 nudge 计数+重臂一个窗口，连续 `--max-nudges` 次无响应才升级——升级时先在落盘信箱（收件箱/归档/发件箱）找本任务本 attempt 本 owner 的完成报告，有证据 adopt 为 done（工作比它的 agent 活得久），无证据 reclaim（撤销代际回 ready））；**watchdog 是编排者显式调用而非自动轮询**，且 **nudge 只是板内静默计数（写检查点轨迹），没有任何消息送达通道**——专家不会收到提醒，运维勿误读为通知机制，专家侧响应 nudge 的唯一方式是落检查点/heartbeat。**完成汇报 subject 以 `[交付]` 开头**（如「[交付] T12 完成」）——watchdog adopt 的强证据（直接采纳，免词汇启发）；无该前缀的完成报告须**同时满足三条件**才被采纳（防中途汇报误标 done）：subject 含「完成」＋ body 无「继续/进行中/下一步/开始/即将/计划/待」等过程词汇 ＋ subject+body 含交付词汇（产物/改动/交付/文件/路径）。**`[交付]` 前缀仅限终态汇报发送（硬纪律）**——提前交付后中断的组合会让 watchdog 在续跑进行中把中途汇报 adopt 为 done，板上 done 与实际续跑并存。**summon 等待期内编排者勿并行 reclaim 同任务**（watchdog 操作纪律边界：续跑等待期任务无 activity 可能被 nudge→reclaim；reclaim 本身不损数据，旧代际的迟到汇报会被过代过滤归档/拒收，但编排者不应主动制造该窗口）。
@@ -162,7 +170,8 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 **任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）。**任务板权威定义（v2.7 事件溯源化）**：状态权威 = append-only JSONL 事件流 `<板文件>.events.jsonl`，JSON 板文件只是**折叠视图**缓存（对外只增 event_seq/event_state_hash 簿记，既有字段零删改，list/status/show 输出结构不变）——视图被手改/损坏 → stderr 报警并按事件流权威重建覆盖（stdout 零污染）；**事件流被清空而视图含簿记、视图含未知顶层键、事件链 hash 断链或末事件 state_hash 对账失配 → `{"error":"unrecoverable","unrecoverable":true,...}`**（绝不静默返回空数据，绝不裸 traceback——如实报告编排者，禁止当作空板重建）。崩溃恢复自动进行（残尾截断/缺行尾换行自愈 + stderr 告警，已落账事件不回滚）；`replay` 可显式重放重建视图（幂等，崩溃演练/人工核对用）；旧 v2.6 板首次写命令自动收编为事件流（数据零丢失，revision 延续）。**A2 残余风险注记：「剥簿记+清日志」（簿记字段与事件流同时剥除）是原理性残余**——数据侧无从证明曾有过板，**备份是最后兜底：定期备份 `.expert-taskboards/`（建议连同 `.expert-bus/` 一并备份）**：
 
-    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）
+    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）；大型任务规划期加 --draft 创建 PM 草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）
+    python3 <技能目录>/tools/taskboard.py approve T3   # PM 草案批准（v2.7，第 2 节三段式第 2 段）：draft -> ready（依赖未满足先回 pending，依赖 done 时自动提升）；批准前 claim/auto-claim 均被拒（批准前零 spawn 工具级执法）；支持 --expected-revision CAS
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家      # ready -> running
     # 派工即回写（v2.6 auto-claim）：summon_expert/summon_experts 在派发入口（专家 run 前）自动对任务书显式引用的 T<数字>（≤8 个，超取前 8 并提示截断；命令引述与路径形态不解析）执行上述 claim（owner=被召唤专家名；owner 已有/非 ready/非唯一板跳过）——专家拿到任务书时条目已 running，无需手工重复认领；专家失败/召唤失败条目保持 running 不回滚，由编排者按板处置（reassign/fail/recover）；DSH_EXPERT_AUTOCLAIM=0 或空串整体关闭；认领/跳过/失败（taskboard 超时与板不可读分别提示）均以【auto-claim】提示行附在 summon 结果/错误尾部

@@ -3033,6 +3033,157 @@ test('T11/S2-c watchdog/heartbeat 走既有事件追加路径：单事件携带�
   assert.ok(st.stdout.includes('进行中: T1') || st.stdout.includes('进行中: T1 T2') || st.stdout.includes('T1'), st.stdout)
 })
 
+// ── WP-5/S1 staged 计划草案（T18）：draft 状态 + approve 流 ─────────────────
+// 断言 (a)：draft 创建后 claim 被拒、零事件追加零落盘（批准前零 spawn 工具级执法）；
+// approve 后 claim 成功。②缺省 create 行为不变由既有用例零改动全过覆盖（WP-1 兼容回归等）。
+test('WP-5 (a) draft 草案：claim 被拒零事件零落盘；approve 后 claim 成功；approve 非 draft 拒绝且走 CAS', (t) => {
+  const dir = makeBoardDir(t, 'draft')
+  let r = runTb(dir, ['create', 'PM 草案任务', '--desc', '完成标准', '--draft'])
+  assert.equal(r.code, 0)
+  assert.match(r.stdout, /T1 \[draft\]/)
+  const boardPath = join(dir, BOARD_REL)
+  const eventsPath = boardPath + '.events.jsonl'
+  const boardBefore = readFileSync(boardPath)
+  const eventsBefore = readFileSync(eventsPath)
+  // ① claim 被拒：rc=1、stderr 点名 draft 与 approve、板文件与事件流逐字节未变（拒绝发生在任何变更与 save 之前）
+  const denied = runTb(dir, ['claim', 'T1', '某人'])
+  assert.equal(denied.code, 1)
+  assert.match(denied.stderr, /draft/)
+  assert.match(denied.stderr, /approve/)
+  assert.deepEqual(readFileSync(boardPath), boardBefore)
+  assert.deepEqual(readFileSync(eventsPath), eventsBefore)
+  assert.equal(readFileSync(eventsPath, 'utf-8').trim().split('\n').length, 1) // 仍只有 create 事件
+  // ② approve 后 claim 成功（draft -> ready -> running）
+  r = runTb(dir, ['approve', 'T1'])
+  assert.equal(r.code, 0)
+  assert.match(r.stdout, /T1 \[ready\]/)
+  r = runTb(dir, ['claim', 'T1', '后端工程师'])
+  assert.equal(r.code, 0)
+  assert.match(r.stdout, /T1 \[running\]/)
+  // ③ approve 只认 draft：ready 任务被拒
+  const bad = runTb(dir, ['approve', 'T1'])
+  assert.equal(bad.code, 1)
+  assert.match(bad.stderr, /只有 draft 可批准/)
+  // ④ approve 走 CAS：stale revision 拒绝且零事件追加；最新 revision 写入成功
+  r = runTb(dir, ['create', '第二草案', '--draft'])
+  assert.equal(r.code, 0)
+  const rev = revOf(runTb(dir, ['list']).stdout)
+  const evBefore = readFileSync(eventsPath)
+  const stale = runTb(dir, ['approve', 'T2', '--expected-revision', String(rev - 1)])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  assert.deepEqual(readFileSync(eventsPath), evBefore)
+  r = runTb(dir, ['approve', 'T2', '--expected-revision', String(rev)])
+  assert.equal(r.code, 0)
+  assert.match(r.stdout, /T2 \[ready\]/)
+})
+
+test('WP-5 (b) draft 不参与依赖自动提升、不被 recover 触碰；approve 依赖未满足回 pending、批准不解锁下游依赖', (t) => {
+  const dir = makeBoardDir(t, 'draft-deps')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '前置任务') // T1 -> ready（缺省行为不变）
+  let r = ok('create', '草案任务', '--dep', 'T1', '--draft') // T2 draft：声明依赖不转 pending/ready
+  assert.match(r.stdout, /T2 \[draft\]/)
+  // 依赖 T1 done 后：draft 不被自动提升（refresh 只提升 pending）
+  ok('claim', 'T1', '某人')
+  ok('done', 'T1', '完成')
+  assert.match(ok('show', 'T2').stdout, /T2 \[draft\]/)
+  // recover 不触碰 draft（只扫 running）
+  ok('recover')
+  assert.match(ok('show', 'T2').stdout, /T2 \[draft\]/)
+  // approve：T1 已 done → 依赖满足 → ready
+  r = ok('approve', 'T2')
+  assert.match(r.stdout, /T2 \[ready\]/)
+  // 批准≠完成：依赖 draft 的下游不因 approve 解锁（draft -> ready 而非 done）
+  ok('create', '草案任务2', '--draft') // T3 draft
+  r = ok('create', '下游任务', '--dep', 'T3') // T4 pending
+  assert.match(r.stdout, /T4 \[pending\]/)
+  ok('approve', 'T3') // T3 -> ready
+  const sh = ok('show', 'T4')
+  assert.match(sh.stdout, /T4 \[pending\]/)
+  assert.match(sh.stdout, /等待: T3/)
+  // approve 依赖未满足：不伪造成 ready，回 pending 由既有自动提升在依赖 done 时转 ready
+  ok('create', '前置2') // T5 -> ready
+  ok('create', '草案3', '--dep', 'T5', '--draft') // T6 draft
+  r = ok('approve', 'T6') // T5 未 done → pending
+  assert.match(r.stdout, /T6 \[pending\]/)
+  ok('claim', 'T5', '某人')
+  r = ok('done', 'T5', '完成') // 依赖满足 → 自动提升
+  assert.match(r.stdout, /自动转 ready: T6/)
+  assert.match(ok('show', 'T6').stdout, /T6 \[ready\]/)
+})
+
+test('WP-5 (c) draft 在事件流/重放/hash 全链透明：事件快照含 draft 状态与意图、approve 走事件追加、replay 幂等静默', (t) => {
+  const dir = makeBoardDir(t, 'draft-events')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '草案任务', '--draft')
+  ok('create', '第二草案', '--draft')
+  const eventsPath = join(dir, BOARD_REL) + '.events.jsonl'
+  let evs = readFileSync(eventsPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.equal(evs.length, 2)
+  assert.equal(evs[0].type, 'create')
+  assert.equal(evs[0].after.T1.status, 'draft')
+  assert.equal(evs[0].args.draft, true)
+  assert.equal(evs[1].after.T2.status, 'draft')
+  assert.equal(evs[1].args.draft, true)
+  // approve 走既有事件追加路径（seq 连续，after 快照 status=ready）
+  ok('approve', 'T1')
+  evs = readFileSync(eventsPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.equal(evs.length, 3)
+  assert.equal(evs[2].type, 'approve')
+  assert.equal(evs[2].seq, 3)
+  assert.equal(evs[2].after.T1.status, 'ready')
+  // replay 幂等：重放静默（stderr 空 = 事件链 hash 与 state_hash 对账全过），视图与折叠一致
+  const r = ok('replay')
+  assert.equal(r.stderr, '')
+  const board = JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'ready')
+  assert.equal(board.tasks.T2.status, 'draft')
+  // 后续读命令同样静默通过，draft 未被折叠层丢弃
+  const lst = ok('list')
+  assert.equal(lst.stderr, '')
+  assert.match(lst.stdout, /T2 \[draft\]/)
+})
+
+test('WP-5 (d) status 盘点：draft 计数与待批准草案行（无 draft 时既有输出零变化）', (t) => {
+  const dir = makeBoardDir(t, 'draft-status')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '普通任务') // T1 ready
+  let r = ok('status')
+  assert.ok(!r.stdout.includes('待批准草案'))
+  ok('create', '草案', '--draft') // T2 draft
+  r = ok('status')
+  assert.match(r.stdout, /draft=1/)
+  assert.match(r.stdout, /待批准草案: T2/)
+  // approve 后待批准行消失（回到既有输出形态）
+  ok('approve', 'T2')
+  r = ok('status')
+  assert.ok(!r.stdout.includes('待批准草案'))
+})
+
+test('WP-5 (e) auto-claim 对 draft 跳过：lib 侧仅认 ready（draft≠ready 状态假设核对），批准后同一召唤即认领', async (t) => {
+  const dst = makeWp4aDst(t, 'draft')
+  const boardDir = makeBoardDir(t, 'draft-autoclaim')
+  assert.equal(runTb(boardDir, ['create', '草案任务', '--draft']).code, 0) // T1 draft
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // draft 跳过认领（lib/tools.js autoClaimOne 仅对 status==='ready' claim），板零变更
+  const r = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+  assert.ok(r.answer.startsWith('ok'), r.answer)
+  assert.ok(r.answer.includes('T1 状态为 draft，跳过认领'), r.answer)
+  let board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'draft')
+  assert.equal(board.tasks.T1.owner, '')
+  // approve 后同一召唤形态即自动认领（ready 才进派工面）
+  assert.equal(runTb(boardDir, ['approve', 'T1']).code, 0)
+  const r2 = await summon.execute({ expert: '测试专家', task: '请处理 T1' }, { agent: {} })
+  assert.ok(r2.answer.includes('T1 已自动认领（owner=测试专家'), r2.answer)
+  board = JSON.parse(readFileSync(join(boardDir, BOARD_REL), 'utf-8'))
+  assert.equal(board.tasks.T1.status, 'running')
+  assert.equal(board.tasks.T1.owner, '测试专家')
+})
+
 // ── T12 (WP-4b ④) summon 专家断点续跑：seam 探测 + 恰好一次续跑 turn + 断点折叠 ──
 // 用户裁决（2026-10-07 Q2=2A）：断点续跑仅新一代宿主启用（dsh 0.2.x，冷恢复要求
 // descriptor.mode==='continuable'）；旧宿主 0.1.7-alpha.2 维持现状（one-shot +

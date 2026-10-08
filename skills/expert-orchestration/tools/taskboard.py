@@ -6,6 +6,13 @@
 状态流转：pending（依赖未满足）-> ready -> running -> done | failed
   claim: ready -> running；done: running -> done（依赖它的任务自动转 ready）
   fail:  running -> failed；retry: failed -> ready；recover: 所有 running -> ready
+staged 计划草案（v2.7，WP-5/S1）：create --draft 创建 PM 规划草案（status=draft，可编辑待批准）；
+  approve <id>: draft -> ready 走既有事件追加路径（依赖未满足时先回 pending，由既有依赖自动提升在
+  依赖 done 时转 ready——保持「ready 蕴含依赖已满足」不变量；CAS --expected-revision 共存）。
+  批准前零 spawn 在工具级执法：draft 不可 claim（拒绝零事件零落盘）、不参与依赖自动提升
+  （refresh 只提升 pending）、不被 recover/watchdog 触碰（均只扫 running）；插件 lib 侧 auto-claim
+  仅对 ready 认领（draft≠ready 天然跳过）。draft 是合法状态值——事件流/折叠视图/replay/hash 校验
+  全链透明，不新增板顶层键。
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
 检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
 指标：metrics 按 owner 聚合 任务数/累计返工/换人次数（新字段 rework/switched，旧板无此字段兼容）；done 支持 --rework N / --switched 记录返工与换人，--by 记录实际执行者（新字段 executors，旧板无此字段兼容），供项目收口时反哺专家路由表。
@@ -332,7 +339,7 @@ def _event_args(a):
     if c == 'create':
         return {'title': a.title, 'owner': a.owner or '',
                 'dep': [d.strip() for d in (a.dep or '').split(',') if d.strip()],
-                'desc': a.desc or '', 'scope': a.scope or ''}
+                'desc': a.desc or '', 'scope': a.scope or '', 'draft': bool(a.draft)}
     if c == 'claim':
         return {'owner': a.owner, 'attempt': a.attempt}
     if c == 'done':
@@ -351,14 +358,14 @@ def _event_args(a):
         return {'dep': a.dep}
     if c == 'verify':
         return {'files': list(a.files or [])}
-    return {}  # retry/recover 等无附加意图
+    return {}  # retry/recover/approve 等无附加意图
 
 
 # 写命令事件上下文：main 派发前武装（pre 快照供差分、并按需充当收编种子），save() 据此落事件。
 # 写命令白名单：与 save() 调用方一一对应。读命令（list/show/status/deps/metrics）与
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
 _WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
-                         'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog'))
+                         'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve'))
 
 
 def _arm_event_ctx(a, data):
@@ -740,7 +747,7 @@ def cmd_create(a, data, path):
     data['seq'] += 1
     data['tasks'][tid] = {
         'id': tid, 'title': a.title, 'owner': a.owner or '', 'dep': deps,
-        'desc': a.desc or '', 'status': 'pending', 'created': now_ms(),
+        'desc': a.desc or '', 'status': 'draft' if a.draft else 'pending', 'created': now_ms(),
         'updated': now_ms(), 'summary': '', 'fail': '',
     }
     if scope:
@@ -799,6 +806,10 @@ def cmd_show(a, data, _):
 
 def cmd_claim(a, data, path):
     t = get_task(data, a.id)
+    if t['status'] == 'draft':
+        # WP-5/S1 批准前零 spawn 工具级执法：draft 未批准不进派工面（拒绝零事件零落盘——
+        # sys.exit 发生在任何变更与 save 之前）。
+        sys.exit(f"错误：{a.id} 为 PM 规划草案（draft），未经 approve 批准不可认领")
     if t['status'] != 'ready':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 ready 可认领")
     if a.attempt:
@@ -818,6 +829,23 @@ def cmd_claim(a, data, path):
     t['updated'] = now_ms()
     save(path, data)
     show(t)
+
+
+def cmd_approve(a, data, path):
+    """approve <id>：PM 规划草案批准（v2.7，WP-5/S1）——draft -> ready，走既有事件追加路径
+    （CAS --expected-revision 共存）。依赖未满足时不伪造成 ready：先回 pending，由既有依赖自动
+    提升在依赖 done 时转 ready（保持「ready 蕴含依赖已满足」不变量）。批准是草案进入派工面的
+    唯一出口；批准前 claim/auto-claim 均被拒（批准前零 spawn）。"""
+    t = get_task(data, a.id)
+    if t['status'] != 'draft':
+        sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 draft 可批准")
+    t['status'] = 'pending'  # 依赖已满足时由下方 refresh 自动转 ready（复用既有不变量维护）
+    t['updated'] = now_ms()
+    promoted = refresh(data)
+    save(path, data)
+    show(t)
+    if promoted:
+        print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
 
 
 def cmd_done(a, data, path):
@@ -1149,6 +1177,9 @@ def cmd_status(a, data, _):
         print('进行中: ' + ' '.join(t['id'] for t in running))
     if failed:
         print('失败待重试: ' + ' '.join(t['id'] for t in failed))
+    draft = [t for t in data['tasks'].values() if t['status'] == 'draft']
+    if draft:
+        print('待批准草案: ' + ' '.join(t['id'] for t in draft))  # 批准面盘点入口（无 draft 时零输出）
     for t in running + failed:
         cp = last_checkpoint(t)
         if cp:
@@ -1436,6 +1467,8 @@ def main():
     p.add_argument('--dep', help='逗号分隔的依赖任务ID')
     p.add_argument('--desc', help='完成标准')
     p.add_argument('--scope', help='关联域（逗号分隔路径前缀，如 src,docs）；hook 第三查与验证回执的依据')
+    p.add_argument('--draft', action='store_true',
+                   help='创建为 PM 规划草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；缺省行为不变')
     add_write_args(p)
     p.set_defaults(fn=cmd_create)
 
@@ -1443,6 +1476,9 @@ def main():
     p.set_defaults(fn=cmd_list)
     p = sub.add_parser('show'); p.add_argument('id'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('claim'); p.add_argument('id'); p.add_argument('owner', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_claim)
+    p = sub.add_parser('approve'); p.add_argument('id'); add_write_args(p)
+    p.set_defaults(fn=cmd_approve,
+                   help='PM 规划草案批准：draft -> ready（依赖未满足先回 pending 走自动提升）；批准前 claim 被拒')
     p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_done)
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); add_write_args(p); p.set_defaults(fn=cmd_retry)

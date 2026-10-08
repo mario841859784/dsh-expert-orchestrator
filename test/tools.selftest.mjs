@@ -993,10 +993,308 @@ test('WP-2 (c) skip-round：信箱本轮可见消息为空且归档了过期消�
   assert.ok(ur.stdout.includes('已归档 1 封过期消息'), ur.stdout)
 })
 
+// ── T11/S1a 过代过滤误判修复（回归）：多板共存工作区下默认板解析选中陈旧无关板，把合法当前代际
+// 消息误判「attempt 非当前代际」归档——真实事故：T10 两条汇报（--task T10 --attempt t10-a1-1791433344，
+// 与板内完全一致）被无 --board 的读取归档，因 .expert-taskboards/default.json（陈旧无关板）里同 id
+// 任务 T10 的 attempt_id=None。修复语义：默认解析主板上仍严格（缺失/损坏 unrecoverable 不回归），
+// 同工作区其余候选板做「确认」增权（任一板确认当前代际即保留，撤销记录仍权威）；显式 --board 单板
+// 严格不变；损坏候选板仅 stderr 告警跳过（只可能错杀不认错杀）。
+test('T11/S1a 多板对账：陈旧 default.json 不再误杀合法当前代际消息（跨板确认保留+stderr 提示）；真过期仍归档（撤销权威优先）；显式 --board 单板严格；损坏候选板告警跳过；板缺失/损坏 unrecoverable 不回归', (t) => {
+  const mkBoard = (dir, name, tasks) => {
+    mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+    writeFileSync(join(dir, '.expert-taskboards', name), JSON.stringify({ tasks, seq: 2, revision: 7 }))
+  }
+  const send = (dir, subj, att) =>
+    runBus(dir, ['send', '--from', '专家', '--to', 'coordinator', '--subject', subj, '--body', '产物: x', '--task', 'T1', '--attempt', att])
+
+  // 场景1（事故回放）：default.json 陈旧（T1 无 attempt_id），v26.json 才是权威板（T1@A1 running）
+  const dir = makeBusDir(t, 's1a-rescue')
+  mkBoard(dir, 'default.json', { T1: { id: 'T1', title: '旧项目任务', status: 'done', dep: [] } })
+  mkBoard(dir, 'expert-orchestrator-v26.json', { T1: { id: 'T1', title: '当前任务', status: 'running', dep: [], attempt_id: 'A1' } })
+  assert.equal(send(dir, '合法当前代际汇报', 'A1').code, 0)
+  const r = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.equal(r.code, 0, r.stderr)
+  assert.ok(r.stdout.includes('合法当前代际汇报'), r.stdout) // 修复前：被归档，收件箱空
+  assert.ok(!r.stdout.includes('已归档过期消息'), r.stdout)
+  assert.ok(r.stderr.includes('已由候选板 expert-orchestrator-v26.json 确认为当前代际'), r.stderr) // 跨板救援可观测
+  assert.equal(boxMsgs(dir, 'coordinator').length, 1)
+
+  // 场景2（真过期仍归档）：陈旧板「确认」A0 为当前，权威板已撤销 A0 → 撤销权威优先，归档
+  const dir2 = makeBusDir(t, 's1a-revoked')
+  mkBoard(dir2, 'default.json', { T1: { id: 'T1', title: '旧', status: 'running', dep: [], attempt_id: 'A0' } })
+  mkBoard(dir2, 'expert-orchestrator-v26.json', { T1: { id: 'T1', title: '新', status: 'running', dep: [], attempt_id: 'A1', attempt_revoked: ['A0'] } })
+  assert.equal(send(dir2, '已撤销代际汇报', 'A0').code, 0)
+  const r2 = runBus(dir2, ['read', '--box', 'coordinator'])
+  assert.equal(r2.code, 0)
+  assert.ok(r2.stdout.includes('已归档过期消息') && r2.stdout.includes('attempt 已撤销'), r2.stdout)
+  assert.ok(!r2.stdout.includes('已撤销代际汇报'), r2.stdout)
+  assert.equal(boxMsgs(dir2, 'coordinator').length, 0)
+  assert.equal(readdirSync(join(dir2, BUS_REL, '_archive', 'coordinator')).length, 1)
+
+  // 场景3（显式 --board 单板严格）：显式指定陈旧板 → 不做跨板确认，仍按该板归档（权威即所指）
+  const dir3 = makeBusDir(t, 's1a-explicit')
+  mkBoard(dir3, 'default.json', { T1: { id: 'T1', title: '旧', status: 'done', dep: [] } })
+  mkBoard(dir3, 'expert-orchestrator-v26.json', { T1: { id: 'T1', title: '新', status: 'running', dep: [], attempt_id: 'A1' } })
+  assert.equal(send(dir3, '显式板对账', 'A1').code, 0)
+  const r3 = runBus(dir3, ['read', '--box', 'coordinator', '--board', join(dir3, '.expert-taskboards', 'default.json')])
+  assert.equal(r3.code, 0)
+  assert.ok(r3.stdout.includes('已归档过期消息') && r3.stdout.includes('attempt 非当前代际'), r3.stdout)
+  assert.equal(boxMsgs(dir3, 'coordinator').length, 0)
+
+  // 场景4（损坏候选板）：主解析板严格可用、候选板损坏 → stderr 告警跳过，不崩不误杀
+  const dir4 = makeBusDir(t, 's1a-corrupt-sib')
+  mkBoard(dir4, 'default.json', { T1: { id: 'T1', title: '旧', status: 'done', dep: [] } })
+  mkdirSync(join(dir4, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(dir4, '.expert-taskboards', 'broken.json'), '{not-json')
+  mkBoard(dir4, 'expert-orchestrator-v26.json', { T1: { id: 'T1', title: '新', status: 'running', dep: [], attempt_id: 'A1' } })
+  assert.equal(send(dir4, '候选板损坏场景', 'A1').code, 0)
+  const r4 = runBus(dir4, ['read', '--box', 'coordinator'])
+  assert.equal(r4.code, 0, r4.stderr)
+  assert.ok(r4.stderr.includes('候选任务板') && r4.stderr.includes('不可读'), r4.stderr) // 告警显式
+  assert.ok(r4.stdout.includes('候选板损坏场景'), r4.stdout) // 权威板确认保留
+
+  // 场景5（主解析板损坏不回归）：default.json 损坏 → 仍 unrecoverable（不因候选板在而静默换板）
+  const dir5 = makeBusDir(t, 's1a-corrupt-primary')
+  mkdirSync(join(dir5, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(dir5, '.expert-taskboards', 'default.json'), '{not-json')
+  mkBoard(dir5, 'expert-orchestrator-v26.json', { T1: { id: 'T1', title: '新', status: 'running', dep: [], attempt_id: 'A1' } })
+  assert.equal(send(dir5, '主板损坏', 'A1').code, 0)
+  const r5 = runBus(dir5, ['read', '--box', 'coordinator'])
+  assert.equal(r5.code, 1)
+  assert.equal(r5.json.error, 'unrecoverable')
+  assert.equal(r5.json.unrecoverable, true)
+  assert.equal(boxMsgs(dir5, 'coordinator').length, 1) // 不归档不丢弃
+
+  // 场景6（板缺失不回归）：无任何板 → unrecoverable（既有语义）
+  const dir6 = makeBusDir(t, 's1a-noboard')
+  assert.equal(send(dir6, '无板', 'A1').code, 0)
+  const r6 = runBus(dir6, ['read', '--box', 'coordinator'])
+  assert.equal(r6.code, 1)
+  assert.equal(r6.json.error, 'unrecoverable')
+  assert.equal(boxMsgs(dir6, 'coordinator').length, 1)
+})
+
+// ── T11/S1b bus seq 增量推送：send 打发件人单调 seq、游标按 seq 推进（at-least-once 不变）、
+// read --since-seq 增量读取；与过代过滤/skip-round/--unread 叠加共存。
+test('T11/S1b seq 增量推送：消息带发件人单调 seq 且游标记 seq（仅成功回执后前进）；崩溃+游标损坏后 seq 仍单调不回退（发件箱文件下界）；--since-seq 增量读取（旧版无 seq 消息仅全量读可见）；与 --unread/过代过滤/skip-round 叠加；--all-boxes 组合被拒', (t) => {
+  // 场景1：单调 seq + 游标 seq + 输出展示
+  const dir = makeBusDir(t, 's1b-seq')
+  const send = (from, subj, env = {}) =>
+    runBus(dir, ['send', '--from', from, '--to', 'coordinator', '--subject', subj, '--body', 'b'], env)
+  for (const s of ['一', '二', '三']) assert.equal(send('甲', s).code, 0)
+  const msgs = boxMsgs(dir, 'coordinator').sort((x, y) => x.seq - y.seq)
+  assert.deepEqual(msgs.map((m) => m.seq), [1, 2, 3], JSON.stringify(msgs.map((m) => m.seq))) // 发件人单调
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, BUS_REL, '_outbox', '甲', 'cursor.json'), 'utf-8')),
+    { cursor: outboxNames(dir, '甲').at(-1), seq: 3 }) // 游标按 seq 推进且仅成功回执后前进
+  const r1 = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.ok(r1.stdout.includes('seq=3'), r1.stdout) // 读取输出展示 seq（游标推进依据）
+  assert.equal(send('乙', '别的发送者').code, 0)
+  assert.equal(boxMsgs(dir, 'coordinator').find((m) => m.subject === '别的发送者').seq, 1) // seq 按发送者各自单调
+
+  // 场景2：崩溃注入 + 游标损坏 → 全量重投（at-least-once）且新消息 seq 仍单调（发件箱文件下界兜底）
+  const crash = send('甲', '崩溃注入', { BUS_CRASH_AFTER_DELIVER: '1' })
+  assert.equal(crash.code, 70)
+  writeFileSync(join(dir, BUS_REL, '_outbox', '甲', 'cursor.json'), '{corrupt') // 游标损坏
+  assert.equal(send('甲', '恢复后新消息').code, 0)
+  const after = boxMsgs(dir, 'coordinator').filter((m) => m.from === '甲')
+  const seqs = after.map((m) => m.seq).sort((a, b) => a - b)
+  assert.equal(new Set(after.map((m) => m.id)).size, after.length) // 重投幂等同 id
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5], JSON.stringify(seqs)) // 崩溃消息 seq=4 同 id 幂等重投（单副本）；新消息 seq=5 不回退
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, BUS_REL, '_outbox', '甲', 'cursor.json'), 'utf-8')),
+    { cursor: outboxNames(dir, '甲').at(-1), seq: 5 })
+
+  // 场景3：--since-seq 增量读取 + 旧版无 seq 消息语义 + 空结果文案 + --all-boxes 组合被拒
+  assert.equal(runBus(dir, ['ack', '--box', 'coordinator', '--all']).code, 0)
+  const r2 = runBus(dir, ['read', '--box', 'coordinator', '--since-seq', '4'])
+  assert.ok(r2.stdout.includes('subject=恢复后新消息') && r2.stdout.includes('seq=5'), r2.stdout)
+  assert.ok(!r2.stdout.includes('subject=三'), r2.stdout) // seq≤4 的旧消息不再展示
+  // 旧版遗留消息（无 seq 字段）直写收件箱：全量读可见、增量读隐藏（视为 0）
+  const legacy = { id: 'mlegacy0001', from: '丙', to: 'coordinator', subject: '旧版消息', body: 'b', files: [], ts: 1, read: false }
+  writeFileSync(join(dir, BUS_REL, 'coordinator', '0000000000001-mlegacy0001.json'), JSON.stringify(legacy))
+  const full = runBus(dir, ['read', '--box', 'coordinator'])
+  assert.ok(full.stdout.includes('subject=旧版消息'), full.stdout) // 全量读可见
+  const inc = runBus(dir, ['read', '--box', 'coordinator', '--since-seq', '0'])
+  assert.ok(!inc.stdout.includes('subject=旧版消息'), inc.stdout) // 0 > 0 为假：增量读隐藏
+  // T11 建议①：--since-seq 负值 clamp 至 0（否则旧版无 seq 消息「仅全量读可见」的文档语义被负 N 破坏）
+  const neg = runBus(dir, ['read', '--box', 'coordinator', '--since-seq', '-5'])
+  assert.equal(neg.code, 0)
+  assert.ok(!neg.stdout.includes('subject=旧版消息'), neg.stdout)
+  assert.ok(neg.stdout.includes('subject=恢复后新消息'), neg.stdout) // clamp 后行为与 since-seq 0 一致
+  const none = runBus(dir, ['read', '--box', 'coordinator', '--since-seq', '99'])
+  assert.ok(none.stdout.includes('无 seq>99 的新消息'), none.stdout)
+  const bad = runBus(dir, ['read', '--all-boxes', '--since-seq', '1'])
+  assert.equal(bad.code, 1)
+  assert.ok(bad.stderr.includes('--since-seq 需与 --box 搭配'), bad.stderr)
+
+  // 场景4：与 --unread + 过代过滤 + skip-round 叠加共存
+  const dir2 = makeBusDir(t, 's1b-compat')
+  writeBusBoard(dir2, { T1: { id: 'T1', title: 'x', status: 'running', dep: [], attempt_id: 'A1', attempt_revoked: [] } })
+  const send2 = (subj, task, att) => {
+    const extra = task ? ['--task', task, '--attempt', att] : []
+    return runBus(dir2, ['send', '--from', '丁', '--to', 'coordinator', '--subject', subj, '--body', 'b', ...extra])
+  }
+  assert.equal(send2('过期新消息', 'T1', 'A0').code, 0) // seq=1，读取时归档
+  assert.equal(send2('已读旧消息').code, 0) // seq=2
+  assert.equal(runBus(dir2, ['ack', '--box', 'coordinator', '--id',
+    boxMsgs(dir2, 'coordinator').find((m) => m.subject === '已读旧消息').id]).code, 0)
+  assert.equal(send2('未读新消息').code, 0) // seq=3
+  const r3 = runBus(dir2, ['read', '--box', 'coordinator', '--unread', '--since-seq', '2'])
+  assert.equal(r3.code, 0)
+  assert.ok(r3.stdout.includes('subject=未读新消息') && r3.stdout.includes('seq=3'), r3.stdout)
+  assert.ok(!r3.stdout.includes('已读旧消息') && !r3.stdout.includes('过期新消息'), r3.stdout) // --unread 与增量各自过滤
+  // 全量读：过期消息（seq≤2，前轮被增量过滤跳过，本轮时点快照照常归档）+ 未读新消息照常展示
+  const r4 = runBus(dir2, ['read', '--box', 'coordinator', '--unread'])
+  assert.ok(r4.stdout.includes('已归档过期消息'), r4.stdout) // 过代过滤照常工作
+  assert.ok(r4.stdout.includes('subject=未读新消息'), r4.stdout)
+  // 过期消息归档后，增量轮询无新消息：走「无 seq>N 的新消息」分支（不误报真空信箱文案）
+  const r5 = runBus(dir2, ['read', '--box', 'coordinator', '--unread', '--since-seq', '3'])
+  assert.ok(r5.stdout.includes('无 seq>3 的新消息'), r5.stdout)
+  assert.ok(!r5.stdout.includes('SKIP_ROUND'), r5.stdout)
+  // skip-round 与增量叠加：过期消息全部归档后清空增量窗口可见集 + 消息全已读 → SKIP_ROUND 照常
+  assert.equal(runBus(dir2, ['ack', '--box', 'coordinator', '--all']).code, 0)
+  assert.equal(send2('过期2', 'T1', 'A0').code, 0)
+  const r6 = runBus(dir2, ['read', '--box', 'coordinator', '--unread', '--since-seq', '3'])
+  assert.ok(r6.stdout.includes('SKIP_ROUND') && r6.stdout.includes('已归档 1 封过期消息'), r6.stdout)
+})
+
+// ── T11/M3 回炉：同发送者并发 send 的 seq 分配互斥（flock 锁文件包裹「扫描+落盘」临界区）──
+// 修复前：并发 send 各自扫到同一 seq 下界 → 重复 seq → 增量消费（--since-seq）按游标单调推进静默漏消息。
+test('T11/M3 并发 seq 互斥：同发送者 6 个并发 send 进程 seq 两两不同且恰为 1..6、消息零丢失（make_id 含 pid 防同毫秒文件名互覆）、增量读取无漏', async (t) => {
+  const dir = makeBusDir(t, 'm3-seqlock')
+  const N = 6
+  const spawnSend = (i) => new Promise((resolve) => {
+    const p = spawn('python3', [BUS, 'send', '--from', '甲', '--to', 'coordinator',
+      '--subject', `并发${i}`, '--body', 'b'], { cwd: dir })
+    let stdout = '', stderr = ''
+    p.stdout.on('data', (d) => { stdout += d })
+    p.stderr.on('data', (d) => { stderr += d })
+    p.on('close', (code) => resolve({ code, stdout, stderr }))
+  })
+  const results = await Promise.all(Array.from({ length: N }, (_, i) => spawnSend(i)))
+  for (const [i, r] of results.entries()) {
+    assert.equal(r.code, 0, `send#${i}: ${r.stdout} ${r.stderr}`)
+    assert.ok(!r.stderr.includes('Traceback'), r.stderr)
+  }
+  const msgs = boxMsgs(dir, 'coordinator')
+  assert.equal(msgs.length, N, '消息零丢失')
+  assert.equal(new Set(msgs.map((m) => m.id)).size, N, 'id 全局唯一（同毫秒跨进程不互覆）')
+  const seqs = msgs.map((m) => m.seq).sort((a, b) => a - b)
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6], `并发 seq 应互斥且连续：${JSON.stringify(seqs)}`)
+  // 增量消费无漏：游标锚点 0 起读可见全部
+  const r = runBus(dir, ['read', '--box', 'coordinator', '--since-seq', '0'])
+  assert.equal(r.code, 0)
+  for (let i = 0; i < N; i++) assert.ok(r.stdout.includes(`subject=并发${i}`), r.stdout)
+})
+
+// ── T11/M4 回炉：同毫秒双发时文件名序（ts+随机 id）与 seq 序可倒置，flush_outbox 改按 (seq, name) 投递 ──
+// 修复前：名称序先投高 seq → 游标（seq 锚点）越过未投的低 seq → 增量消费永久漏掉低 seq 消息（评审实测 seq 不可见）。
+test('T11/M4 同毫秒投递序倒置：发件箱按 (seq,name) 投递——崩溃注入下先投低 seq；恢复后低 seq 补投不落后游标，增量读取无永久漏', (t) => {
+  const dir = makeBusDir(t, 'm4-order')
+  const out = join(dir, '.expert-bus', '_outbox', '甲')
+  mkdirSync(out, { recursive: true })
+  // 直写发件箱两封同 ts 消息，构造「文件名序与 seq 序倒置」：seq2 的 id 字典序 < seq1
+  const e = (id, seq, subj) => ({ id, from: '甲', to: 'coordinator', subject: subj, body: 'b', files: [], ts: 1000, read: false, seq })
+  writeFileSync(join(out, '0000000001000-mz9999.json'), JSON.stringify(e('mz9999', 1, '低序高名')))
+  writeFileSync(join(out, '0000000001000-ma1111.json'), JSON.stringify(e('ma1111', 2, '高序低名')))
+  // 崩溃注入：flush 投出第一封即 exit 70——修复后第一封应是低 seq（mz9999, seq=1）；修复前名称序先投 seq2
+  const crash = runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', '触发flush', '--body', 'b'],
+    { BUS_CRASH_AFTER_DELIVER: '1' })
+  assert.equal(crash.code, 70)
+  const first = boxMsgs(dir, 'coordinator')
+  assert.equal(first.length, 1, `崩溃注入后收件箱应恰有 1 封：${JSON.stringify(first)}`)
+  assert.equal(first[0].seq, 1, `应先投低 seq（名称序会先投 seq2）：${JSON.stringify(first)}`)
+  assert.equal(first[0].id, 'mz9999')
+  // 恢复后正常 send：补投 seq2 + 挂起的触发flush(seq3) + 新消息 seq4，全部可见
+  assert.equal(runBus(dir, ['send', '--from', '甲', '--to', 'coordinator', '--subject', '恢复后', '--body', 'b']).code, 0)
+  const all = boxMsgs(dir, 'coordinator').map((m) => m.seq).sort((a, b) => a - b)
+  assert.deepEqual(all, [1, 2, 3, 4], JSON.stringify(all))
+  // 增量游标越过处无永久漏：--since-seq 3 只见 seq4；低 seq 已全数在低游标侧投递完毕
+  const inc = runBus(dir, ['read', '--box', 'coordinator', '--since-seq', '3'])
+  assert.ok(inc.stdout.includes('subject=恢复后'), inc.stdout)
+  assert.ok(!inc.stdout.includes('低序高名') && !inc.stdout.includes('高序低名') && !inc.stdout.includes('触发flush'), inc.stdout)
+  assert.equal(JSON.parse(readFileSync(join(out, 'cursor.json'), 'utf-8')).seq, 4)
+})
+
+// ── T11 编排者裁决回炉：主解析板缺失+兄弟板在场 = 降级中间态「只确认不归档」──
+// 归档动作仅在权威板（显式 --board 或在场主解析板）发生；跨板救援 stderr 区分「主板缺失」「主板不匹配」。
+test('T11/裁决回炉：主解析板缺失+兄弟板在场=降级中间态只确认不归档（未确认/被撤销均保留不杀）；显式 --board 权威板在场仍归档；救援 stderr 区分主板缺失/主板不匹配', (t) => {
+  const mkSibling = (dir, tasks) => {
+    mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+    writeFileSync(join(dir, '.expert-taskboards', 'expert-orchestrator-v26.json'),
+      JSON.stringify({ tasks, seq: 2, revision: 7 }))
+  }
+  const send = (dir, subj, att) =>
+    runBus(dir, ['send', '--from', '专家', '--to', 'coordinator', '--subject', subj, '--body', '产物: x', '--task', 'T1', '--attempt', att])
+  const sibling = { T1: { id: 'T1', title: '当前任务', status: 'running', dep: [], attempt_id: 'A1' } }
+
+  // 场景1（缺失措辞）：主解析板缺失、兄弟板确认 → 保留 + stderr「主解析板缺失」（区别于「不匹配」）
+  const dir1 = makeBusDir(t, 'rule-missing')
+  mkSibling(dir1, sibling)
+  assert.equal(send(dir1, '缺失板救援', 'A1').code, 0)
+  const r1 = runBus(dir1, ['read', '--box', 'coordinator'])
+  assert.equal(r1.code, 0, r1.stderr)
+  assert.ok(r1.stdout.includes('缺失板救援'), r1.stdout)
+  assert.ok(r1.stderr.includes('主解析板缺失'), r1.stderr)
+  assert.ok(r1.stderr.includes('已由候选板 expert-orchestrator-v26.json 确认为当前代际'), r1.stderr)
+  assert.equal(boxMsgs(dir1, 'coordinator').length, 1)
+
+  // 场景2（降级不归档）：兄弟板未确认当前代际 → 修复前被陈旧兄弟板归档（评审实测的洞）；现原样保留
+  const dir2 = makeBusDir(t, 'rule-degraded')
+  mkSibling(dir2, sibling)
+  assert.equal(send(dir2, '降级不归档', 'A0').code, 0)
+  const r2 = runBus(dir2, ['read', '--box', 'coordinator'])
+  assert.equal(r2.code, 0)
+  assert.ok(r2.stdout.includes('降级不归档'), r2.stdout) // 保留在收件箱
+  assert.ok(!r2.stdout.includes('已归档过期消息'), r2.stdout) // 不归档
+  assert.equal(boxMsgs(dir2, 'coordinator').length, 1)
+  assert.ok(!existsSync(join(dir2, '.expert-bus', '_archive', 'coordinator')), '不产生归档')
+
+  // 场景3（降级撤销也不归档）：兄弟板记录撤销 → 无权威板在场时同样只确认不归档（留待权威板恢复后处置）
+  const dir3 = makeBusDir(t, 'rule-degraded-rev')
+  mkSibling(dir3, { T1: { ...sibling.T1, attempt_revoked: ['A0'] } })
+  assert.equal(send(dir3, '降级撤销保留', 'A0').code, 0)
+  const r3 = runBus(dir3, ['read', '--box', 'coordinator'])
+  assert.equal(r3.code, 0)
+  assert.ok(r3.stdout.includes('降级撤销保留'), r3.stdout)
+  assert.equal(boxMsgs(dir3, 'coordinator').length, 1)
+  // 场景4（权威板在场仍归档）：同一现场改用显式 --board（该板即权威）→ 照常归档（撤销权威）
+  const r4 = runBus(dir3, ['read', '--box', 'coordinator',
+    '--board', join(dir3, '.expert-taskboards', 'expert-orchestrator-v26.json')])
+  assert.equal(r4.code, 0)
+  assert.ok(r4.stdout.includes('已归档过期消息') && r4.stdout.includes('attempt 已撤销'), r4.stdout)
+  assert.equal(boxMsgs(dir3, 'coordinator').length, 0)
+
+  // 场景5（不匹配措辞）：主解析板在场但无此任务、兄弟板确认 → 「在主解析板不匹配」（与场景1 缺失措辞对照）
+  const dir5 = makeBusDir(t, 'rule-mismatch')
+  writeBusBoard(dir5, { T2: { id: 'T2', title: '别的任务', status: 'running', dep: [], attempt_id: 'A1', attempt_revoked: [] } })
+  mkSibling(dir5, sibling)
+  assert.equal(send(dir5, '不匹配措辞', 'A1').code, 0)
+  const r5 = runBus(dir5, ['read', '--box', 'coordinator'])
+  assert.equal(r5.code, 0, r5.stderr)
+  assert.ok(r5.stderr.includes('在主解析板不匹配'), r5.stderr)
+  assert.ok(!r5.stderr.includes('主解析板缺失'), r5.stderr)
+  assert.ok(r5.stdout.includes('不匹配措辞'), r5.stdout)
+  assert.equal(boxMsgs(dir5, 'coordinator').length, 1)
+
+  // 场景6（建议⑤盲区回填：candidate_boards 遗留板分支）：遗留 .expert-taskboard.json 在场即主解析板
+  // （default_board 遗留优先）——损坏时 unrecoverable 而非宽松候选的「告警跳过」：证明遗留板追加经
+  // seen 去重后不会把自己降级成宽松候选（宽松板损坏只告警，严格板损坏必须 fail closed）。
+  const dir6 = makeBusDir(t, 'rule-legacy')
+  writeFileSync(join(dir6, '.expert-taskboard.json'), '{not-json')
+  mkSibling(dir6, sibling)
+  assert.equal(send(dir6, '遗留板损坏', 'A1').code, 0)
+  const r6 = runBus(dir6, ['read', '--box', 'coordinator'])
+  assert.equal(r6.code, 1)
+  assert.equal(r6.json.error, 'unrecoverable')
+  assert.equal(r6.json.unrecoverable, true)
+  assert.ok(!r6.stderr.includes('Traceback'), r6.stderr)
+  assert.equal(boxMsgs(dir6, 'coordinator').length, 1) // 不归档不丢弃
+})
+
 // (d) 零第三方 import + 既有调用方式回归（SKILL.md 第 9 节 bus.py 全部既有调用不传新参数行为不变）
 test('WP-2 (d) bus.py 零第三方 import（import 落进标准库白名单）+ 既有调用方式全流程回归', (t) => {
   const src = readFileSync(BUS, 'utf-8')
-  const stdlib = new Set(['argparse', 'json', 'os', 'random', 'sys', 'time'])
+  const stdlib = new Set(['argparse', 'fcntl', 'glob', 'json', 'os', 'random', 'sys', 'time'])
   const found = []
   for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
     for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
@@ -2476,4 +2774,252 @@ test('WP-4b (i5) 二轮回炉：含未知顶层键的 v2.6 板首个命令收编
   const r2 = runTb(dir, ['list'])
   assert.equal(r2.code, 1)
   assert.equal(r2.json.error, 'unrecoverable')
+})
+
+// ── T11/S2 滑动无进展 watchdog + 孤儿 adopt（v2.7）：heartbeat/nudge 重臂 + reclaim 前查落盘
+// 完成报告（有→adopt 而非重试，selftest 断言 d）+ 全部变更走既有事件追加路径 + 既有命令契约零变化。
+/** 写一封 bus 消息到指定落盘位置（watchdog 完成报告证据夹具）。 */
+const writeBusMsg = (dir, relUnderBus, msg) => {
+  const d = join(dir, '.expert-bus', relUnderBus)
+  mkdirSync(d, { recursive: true })
+  writeFileSync(join(d, `${String(msg.ts).padStart(13, '0')}-${msg.id}.json`), JSON.stringify(msg))
+}
+const readTask = (dir, tid) => JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8')).tasks[tid]
+
+test('T11/S2-a 滑动无进展 watchdog：heartbeat 重臂并清零 nudge；nudge 重臂窗口连续计数；达到上限且无完成证据 → reclaim（撤销代际回 ready，旧代际迟到汇报 stale_attempt）', (t) => {
+  const dir = makeBoardDir(t, 's2-watchdog')
+  assert.equal(runTb(dir, ['create', '任务A']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲', '--attempt', 'A1']).code, 0)
+  // 心跳：running 任务报活，重臂窗口 + 清零 nudge
+  const hb = runTb(dir, ['heartbeat', 'T1', '--attempt', 'A1'])
+  assert.equal(hb.code, 0, hb.stdout + hb.stderr)
+  assert.ok(hb.stdout.includes('T1 [running]'), hb.stdout)
+  assert.ok(hb.stdout.includes('revision='), hb.stdout) // 写命令末行 revision 契约
+  const afterHb = readTask(dir, 'T1')
+  assert.ok(afterHb.heartbeat_at > 0 && afterHb.nudges === 0, JSON.stringify(afterHb))
+  const errHb = runTb(dir, ['heartbeat', 'T1', '--attempt', 'A0'])
+  assert.equal(errHb.code, 1) // 旧代际心跳按代际校验拒绝（与 progress 同语义）
+  assert.equal(errHb.json.error, 'stale_attempt')
+  // watchdog 第1跑：nudge 1/2（窗口 0 → 立即可判定，确定性）
+  const w1 = runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2'])
+  assert.equal(w1.code, 0, w1.stdout + w1.stderr)
+  assert.ok(w1.stdout.includes('nudge=1/2') && w1.stdout.includes('已 nudge'), w1.stdout)
+  assert.equal(readTask(dir, 'T1').nudges, 1)
+  // 心跳响应 → nudge 清零：健康的长任务永不升级
+  assert.equal(runTb(dir, ['heartbeat', 'T1', '--attempt', 'A1']).code, 0)
+  const w2 = runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2'])
+  assert.ok(w2.stdout.includes('nudge=1/2'), w2.stdout) // 从 1 重新计，不是 2/2
+  // 连续两次无响应 → nudge 2/2 → 第三跑升级 reclaim
+  assert.ok(runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2']).stdout.includes('nudge=2/2'))
+  const w4 = runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2'])
+  assert.ok(w4.stdout.includes('已 reclaim') && w4.stdout.includes('reclaim=1'), w4.stdout)
+  const t1 = readTask(dir, 'T1')
+  assert.equal(t1.status, 'ready')
+  assert.ok((t1.attempt_revoked || []).includes('A1'), JSON.stringify(t1)) // 孤儿代际撤销
+  assert.equal(t1.owner, '') // owner 释放
+  assert.equal(t1.nudges, 0)
+  assert.ok((t1.checkpoints || []).some((c) => c.note.startsWith('watchdog: reclaim')), JSON.stringify(t1.checkpoints))
+  // 旧代际迟到汇报被拒（撤销生效）
+  const late = runTb(dir, ['progress', 'T1', '迟到汇报', '--attempt', 'A1'])
+  assert.equal(late.code, 1)
+  assert.equal(late.json.error, 'stale_attempt')
+})
+
+test('T11/S2-b 断言 d：watchdog reclaim 前发现落盘完成报告则 adopt 而非重试——归档/收件箱/发件箱三来源采纳；进度汇报/跨代际/非 owner 不误判；adopt 解锁下游依赖', (t) => {
+  const setup = (label) => {
+    const dir = makeBoardDir(t, label)
+    assert.equal(runTb(dir, ['create', '任务A', '--desc', '完成标准X']).code, 0)
+    assert.equal(runTb(dir, ['claim', 'T1', '乙', '--attempt', 'A1']).code, 0)
+    return dir
+  }
+  const baseMsg = { id: 'mev001', from: '乙', to: 'coordinator', subject: 'T1 完成', body: '产物: r.md', files: [], ts: 1791443100000, read: false, task: 'T1', attempt_id: 'A1' }
+  // 场景1（断言 d 主路径）：完成报告在归档区（过代过滤误杀/整轮未读的最终去向）→ adopt 而非 reclaim
+  const dir1 = setup('s2-adopt-archive')
+  writeBusMsg(dir1, join('_archive', 'coordinator'), baseMsg)
+  const a1 = runTb(dir1, ['watchdog', '--window-sec', '0', '--max-nudges', '0'])
+  assert.equal(a1.code, 0, a1.stdout + a1.stderr)
+  assert.ok(a1.stdout.includes('已采纳为 done') && a1.stdout.includes('mev001@archive'), a1.stdout)
+  assert.ok(!a1.stdout.includes('已 reclaim'), a1.stdout) // 采纳而非重试
+  const t1 = readTask(dir1, 'T1')
+  assert.equal(t1.status, 'done')
+  assert.ok(t1.summary.startsWith('[watchdog adopt] T1 完成'), t1.summary) // 汇报内容入 summary
+  assert.ok((t1.checkpoints || []).some((c) => c.note.startsWith('watchdog: adopt')), JSON.stringify(t1.checkpoints))
+  assert.equal(t1.attempt_revoked, undefined) // 采纳不撤销代际（工作完成，非孤儿释放）
+  // 场景2：报告在收件箱（已投递未处理）→ adopt
+  const dir2 = setup('s2-adopt-inbox')
+  writeBusMsg(dir2, 'coordinator', baseMsg)
+  assert.ok(runTb(dir2, ['watchdog', '--window-sec', '0', '--max-nudges', '0']).stdout.includes('mev001@inbox'))
+  assert.equal(readTask(dir2, 'T1').status, 'done')
+  // 场景3：报告在发件箱（投递中断挂起）→ adopt
+  const dir3 = setup('s2-adopt-outbox')
+  writeBusMsg(dir3, join('_outbox', '乙'), baseMsg)
+  assert.ok(runTb(dir3, ['watchdog', '--window-sec', '0', '--max-nudges', '0']).stdout.includes('mev001@outbox'))
+  assert.equal(readTask(dir3, 'T1').status, 'done')
+  // 场景4（防误判①）：进度汇报（含「完成」但无交付词汇）不采纳 → reclaim
+  const dir4 = setup('s2-guard-progress')
+  writeBusMsg(dir4, join('_archive', 'coordinator'), { ...baseMsg, subject: 'T1 开工核账完成', body: '已核实环境，开始干活' })
+  const g1 = runTb(dir4, ['watchdog', '--window-sec', '0', '--max-nudges', '0'])
+  assert.ok(g1.stdout.includes('已 reclaim') && !g1.stdout.includes('已采纳'), g1.stdout)
+  assert.equal(readTask(dir4, 'T1').status, 'ready')
+  // 场景5（防误判②）：完成报告是旧代际 → 不采纳
+  const dir5 = setup('s2-guard-attempt')
+  writeBusMsg(dir5, join('_archive', 'coordinator'), { ...baseMsg, attempt_id: 'A0' })
+  assert.ok(runTb(dir5, ['watchdog', '--window-sec', '0', '--max-nudges', '0']).stdout.includes('已 reclaim'))
+  // 场景6（防误判③）：from 非 owner → 不采纳
+  const dir6 = setup('s2-guard-owner')
+  writeBusMsg(dir6, join('_archive', 'coordinator'), { ...baseMsg, from: '别人' })
+  assert.ok(runTb(dir6, ['watchdog', '--window-sec', '0', '--max-nudges', '0']).stdout.includes('已 reclaim'))
+  // 场景7：adopt 解锁下游依赖（与 done 同走 refresh 提升路径）
+  const dir7 = setup('s2-adopt-dep')
+  assert.equal(runTb(dir7, ['create', '下游任务', '--dep', 'T1']).code, 0)
+  writeBusMsg(dir7, join('_archive', 'coordinator'), baseMsg)
+  const a7 = runTb(dir7, ['watchdog', '--window-sec', '0', '--max-nudges', '0'])
+  assert.ok(a7.stdout.includes('依赖已满足，自动转 ready: T2'), a7.stdout)
+  assert.equal(readTask(dir7, 'T2').status, 'ready')
+})
+
+// ── T11/M1+M2 回炉：adopt 完成报告判定——对抗词汇不误采纳（M1）、完成须在 subject（M1）、
+// [交付] 强证据直接采纳（M1③，协议文本由 T12 写入、本任务只实现识别）、合规报告不漏采纳（M2）。──
+test('T11/M1+M2 回炉：检查点模板词汇/负向词汇的过程汇报不误采纳；完成须在 subject；[交付] 强证据直接采纳且不受负向词误伤、身份约束仍生效；合规报告（subject 无任务 id 字面）采纳不 reclaim', (t) => {
+  const setup = (label) => {
+    const dir = makeBoardDir(t, label)
+    assert.equal(runTb(dir, ['create', '任务A', '--desc', '完成标准X']).code, 0)
+    assert.equal(runTb(dir, ['claim', 'T1', '乙', '--attempt', 'A1']).code, 0)
+    return dir
+  }
+  const base = { id: 'mev100', from: '乙', to: 'coordinator', subject: '', body: '', files: [], ts: 1791443200000, read: false, task: 'T1', attempt_id: 'A1' }
+  const verdict = (label, msg) => {
+    const dir = setup(label)
+    writeBusMsg(dir, join('_archive', 'coordinator'), msg)
+    return [dir, runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '0'])]
+  }
+  const adopted = (r) => r.stdout.includes('已采纳为 done')
+  const reclaimed = (r) => r.stdout.includes('已 reclaim')
+
+  // M1 对抗①：body 引用协议检查点模板词汇（含交付词汇、「完成」在 body）→ 不采纳（评审实测误采纳现场）
+  const [, g1] = verdict('m1-tpl', { ...base, id: 'mev101', subject: 'T1 检查点', body: '已完成环境核账；产物: build/x.log' })
+  assert.ok(reclaimed(g1) && !adopted(g1), g1.stdout)
+  // M1 对抗②：完成在 subject + 交付词汇，但 body 含负向词汇 → 不采纳（负向守卫压过交付词汇）
+  const [, g2] = verdict('m1-neg', { ...base, id: 'mev102', subject: 'T1 完成', body: '进行中，下一步联调，产物: x.md' })
+  assert.ok(reclaimed(g2) && !adopted(g2), g2.stdout)
+  // M1② 正向对照：完成在 subject + 交付词汇 + 无负向词 → 采纳（守卫不误杀真完成报告）
+  const [, ok1] = verdict('m1-pos', { ...base, id: 'mev103', subject: 'T1 完成', body: '产物: r.md 已落盘' })
+  assert.ok(adopted(ok1), ok1.stdout)
+  // M1③ 强证据：[交付] 前缀直接采纳（body 为空亦然）
+  const [, ok2] = verdict('m1-mark', { ...base, id: 'mev104', subject: '[交付] T1 登录页', body: '' })
+  assert.ok(adopted(ok2), ok2.stdout)
+  // M1③ 强证据不受负向词误伤：显式协议标记=与直改主板同信任级别，免词汇启发
+  const [, ok3] = verdict('m1-mark2', { ...base, id: 'mev105', subject: '[交付] T1', body: '后续计划：回归由编排者安排' })
+  assert.ok(adopted(ok3), ok3.stdout)
+  // M1③ 强证据身份约束仍生效：旧代际的 [交付] 报告不采纳
+  const [, g3] = verdict('m1-mark-att', { ...base, id: 'mev106', subject: '[交付] T1', attempt_id: 'A0' })
+  assert.ok(reclaimed(g3), g3.stdout)
+  // M2 合规报告：subject 无任务 id 字面（硬约束按结构化字段精确匹配）→ 采纳而非 reclaim
+  const [dirM2, ok4] = verdict('m2-compat', { ...base, id: 'mev107', subject: '登录页完成', body: '产物: pages/login.tsx' })
+  assert.ok(adopted(ok4), ok4.stdout)
+  assert.equal(readTask(dirM2, 'T1').status, 'done')
+})
+
+// ── T11 建议②③ 回炉：adopt 记录实际执行者（executors 对齐手工 done --by 审计丰富度）；
+// 有变更轮次的汇总行也输出 healthy 计数（健康任务与变更同轮可见）。──
+test('T11/建议②③ 回炉：adopt 落 executors（show 可见实际执行者）；健康+变更混合轮汇总行含 healthy=1', async (t) => {
+  const dir = makeBoardDir(t, 'adopt-audit')
+  assert.equal(runTb(dir, ['create', '任务A', '--desc', '完成标准X']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '乙', '--attempt', 'A1']).code, 0)
+  writeBusMsg(dir, join('_archive', 'coordinator'), {
+    id: 'mev200', from: '乙', to: 'coordinator', subject: 'T1 完成', body: '产物: r.md',
+    files: [], ts: 1791443300000, read: false, task: 'T1', attempt_id: 'A1',
+  })
+  await new Promise((res) => setTimeout(res, 1300)) // 让 T1 活动时点落后 1s 滑动窗口（跨进程时钟最小间隔之上）
+  assert.equal(runTb(dir, ['create', '任务B']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T2', '丙', '--attempt', 'B1']).code, 0)
+  const w = runTb(dir, ['watchdog', '--window-sec', '1', '--max-nudges', '0'])
+  assert.equal(w.code, 0, w.stdout + w.stderr)
+  assert.ok(w.stdout.includes('已采纳为 done'), w.stdout) // T1：变更轮（无进展 > 窗口 + 有落盘完成报告）
+  assert.ok(/healthy=1/.test(w.stdout), w.stdout) // T2：窗口内健康（建议③：变更轮也输出 healthy 计数）
+  // 建议②：adopt 显式落 executors（对齐手工 done --by 审计），show 可追溯
+  const t1 = readTask(dir, 'T1')
+  assert.equal(t1.status, 'done')
+  assert.ok(Array.isArray(t1.executors) && t1.executors.length === 1 &&
+    t1.executors[0].name === '乙' && typeof t1.executors[0].time === 'string', JSON.stringify(t1.executors))
+  const sh = runTb(dir, ['show', 'T1'])
+  assert.ok(sh.stdout.includes('实际执行者: 乙['), sh.stdout)
+})
+
+// ── T11 建议⑤ 测试盲区回填：heartbeat 对非 running 任务的状态守卫（taskboard.py:914）；
+// heartbeat/watchdog 带 --expected-revision 的 CAS 路径（stale 拒绝零落盘、命中正常写入）。──
+test('T11/建议⑤ 回填：heartbeat 对 pending/done 任务拒绝（状态守卫、零落盘）；heartbeat/watchdog 带 --expected-revision 走 CAS（stale_revision 拒绝不落盘，命中正常写入）', (t) => {
+  // 状态守卫：非 running 一律拒绝（评审点 taskboard.py:914）
+  const dir = makeBoardDir(t, 'hb-guard')
+  assert.equal(runTb(dir, ['create', '任务A']).code, 0)
+  const p = runTb(dir, ['heartbeat', 'T1']) // pending
+  assert.equal(p.code, 1)
+  assert.ok(p.stderr.includes('只有 running 可心跳'), p.stderr)
+  assert.equal(readTask(dir, 'T1').heartbeat_at, undefined) // 零落盘
+  assert.equal(runTb(dir, ['claim', 'T1', '甲', '--attempt', 'A1']).code, 0)
+  assert.equal(runTb(dir, ['done', 'T1', '收口']).code, 0)
+  const d = runTb(dir, ['heartbeat', 'T1']) // done
+  assert.equal(d.code, 1)
+  assert.ok(d.stderr.includes('只有 running 可心跳'), d.stderr)
+  // CAS：heartbeat
+  const dir2 = makeBoardDir(t, 'hb-cas')
+  assert.equal(runTb(dir2, ['create', '任务A']).code, 0)
+  assert.equal(runTb(dir2, ['claim', 'T1', '甲', '--attempt', 'A1']).code, 0)
+  const rev1 = revOf(runTb(dir2, ['list']).stdout)
+  const stale = runTb(dir2, ['heartbeat', 'T1', '--attempt', 'A1', '--expected-revision', String(rev1 - 1)])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  assert.equal(readTask(dir2, 'T1').heartbeat_at, undefined) // 拒绝且零落盘
+  const hb = runTb(dir2, ['heartbeat', 'T1', '--attempt', 'A1', '--expected-revision', String(rev1)])
+  assert.equal(hb.code, 0, hb.stdout + hb.stderr) // 命中当前 revision 正常写入
+  assert.ok(revOf(hb.stdout) > rev1)
+  assert.ok(readTask(dir2, 'T1').heartbeat_at > 0)
+  // CAS：watchdog
+  const rev2 = revOf(runTb(dir2, ['list']).stdout)
+  const wStale = runTb(dir2, ['watchdog', '--window-sec', '0', '--max-nudges', '2', '--expected-revision', String(rev2 - 1)])
+  assert.equal(wStale.code, 1)
+  assert.equal(wStale.json.error, 'stale_revision')
+  assert.equal(readTask(dir2, 'T1').nudges, 0) // 拒绝且零落盘
+  const wOk = runTb(dir2, ['watchdog', '--window-sec', '0', '--max-nudges', '2', '--expected-revision', String(rev2)])
+  assert.equal(wOk.code, 0, wOk.stdout + wOk.stderr)
+  assert.equal(readTask(dir2, 'T1').nudges, 1)
+  assert.ok(wOk.stdout.includes('nudge=1/2'), wOk.stdout)
+})
+
+test('T11/S2-c watchdog/heartbeat 走既有事件追加路径：单事件携带全部变更任务快照、健康任务零变更零事件、replay 一致', (t) => {
+  const dir = makeBoardDir(t, 's2-events')
+  assert.equal(runTb(dir, ['create', '任务A']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T1', '甲', '--attempt', 'A1']).code, 0)
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const evCount = () => readFileSync(evPath, 'utf-8').trim().split('\n').length
+  const count0 = evCount()
+  // 健康任务（窗口内）：零变更零事件，revision 不前进
+  const healthy = runTb(dir, ['watchdog', '--window-sec', '3600', '--max-nudges', '2'])
+  assert.equal(healthy.code, 0)
+  assert.ok(healthy.stdout.includes('全部健康') && healthy.stdout.includes('未做任何变更'), healthy.stdout)
+  assert.equal(evCount(), count0)
+  // 一次 watchdog 多任务变更合入单事件（T1 nudge + T2 adopt 两任务同事件）
+  assert.equal(runTb(dir, ['create', '任务B']).code, 0)
+  assert.equal(runTb(dir, ['claim', 'T2', '乙', '--attempt', 'B1']).code, 0)
+  const before = evCount()
+  assert.equal(runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '5']).code, 0) // 两任务各 nudge 一次
+  const evs = readFileSync(evPath, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.equal(evCount(), before + 1, '多任务变更应合入单个 watchdog 事件')
+  const ev = evs.at(-1)
+  assert.equal(ev.type, 'watchdog')
+  assert.ok(ev.args.window_sec === 0 && ev.args.max_nudges === 5, JSON.stringify(ev.args)) // args 记录命令意图
+  assert.deepEqual(Object.keys(ev.after).sort(), ['T1', 'T2'])
+  assert.ok(ev.after.T1.nudges === 1 && ev.after.T2.nudges === 1, JSON.stringify(ev.after))
+  // heartbeat 事件同样入流（含 heartbeat_at 快照字段），replay 折叠一致
+  assert.equal(runTb(dir, ['heartbeat', 'T1', '--attempt', 'A1']).code, 0)
+  const hbEv = JSON.parse(readFileSync(evPath, 'utf-8').trim().split('\n').at(-1))
+  assert.equal(hbEv.type, 'heartbeat')
+  assert.ok(hbEv.after.T1.heartbeat_at > 0 && hbEv.after.T1.nudges === 0, JSON.stringify(hbEv.after.T1))
+  const rp = runTb(dir, ['replay'])
+  assert.equal(rp.code, 0, rp.stdout + rp.stderr)
+  assert.ok(rp.stdout.includes('已从事件流重放折叠状态'), rp.stdout)
+  // 既有命令输出契约零变化抽查：claim/done/progress 行为不变（WP-1 兼容用例已全覆盖，此处锁 watchdog 共存）
+  const st = runTb(dir, ['status'])
+  assert.equal(st.code, 0)
+  assert.ok(st.stdout.includes('进行中: T1') || st.stdout.includes('进行中: T1 T2') || st.stdout.includes('T1'), st.stdout)
 })

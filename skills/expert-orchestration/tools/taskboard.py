@@ -35,6 +35,16 @@
     ① hook 找不到门禁脚本（taskboard.py 被移动/卸载）；② python3 不可用（command -v 检测，hook 头部拦截，
     装回 python3 后门禁自动恢复）；③ 任务板缺失（含 archive 归档把板移走后——归档收口属预期流程，hook 不再阻塞
     提交，提示重新 --install-hook 或 --uninstall-hook）。脚本在、python3 在、板在而三查不过则拒绝提交（fail closed）。
+滑动无进展 watchdog + 孤儿 adopt（v2.7，WP-4b/S2）：
+  heartbeat <id>：running 任务心跳——重臂窗口并清零 nudge 计数（长任务报活的最小信号，不产检查点）。
+  watchdog：扫描 running 任务的滑动无进展窗口（activity=max(updated,heartbeat_at,nudged_at)；claim
+    新代际/progress/heartbeat 重臂，健康的长任务永不因跑得久被杀）。窗口到期 nudge（计数+重臂一个
+    窗口），连续 --max-nudges（默认 2）次无响应升级：先在落盘信箱（coordinator 收件箱、_archive 归档、
+    _outbox/<owner> 发件箱）检索本任务本 attempt 本 owner 的完成报告（subject/body 含任务 id+「完成」
+    +交付词汇，多条取 ts 最新）——有证据 adopt 为 done（汇报内容入 summary，工作比它的 agent 活得久），
+    无证据 reclaim（撤销当前代际防迟到汇报、清 owner 回 ready）。nudge/reclaim/adopt 均落检查点轨迹
+    （watchdog: 前缀）；所有变更走既有事件追加路径（watchdog/heartbeat 为写命令，单事件携带全部变更
+    任务 after 快照），新字段 heartbeat_at/nudges/nudged_at 随快照折叠只增不减，既有命令输出零变化。
 验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
   verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
 事件溯源化核心（v2.7）：
@@ -331,6 +341,10 @@ def _event_args(a):
         return {'reason': a.reason or ''}
     if c == 'progress':
         return {'note': a.note}
+    if c == 'heartbeat':
+        return {'attempt': a.attempt}
+    if c == 'watchdog':
+        return {'window_sec': a.window_sec, 'max_nudges': a.max_nudges, 'bus_root': a.bus_root or ''}
     if c == 'reassign':
         return {'attempt_id': a.attempt_id, 'owner': a.owner}
     if c == 'set_dependencies':
@@ -340,10 +354,11 @@ def _event_args(a):
     return {}  # retry/recover 等无附加意图
 
 
+# 写命令事件上下文：main 派发前武装（pre 快照供差分、并按需充当收编种子），save() 据此落事件。
 # 写命令白名单：与 save() 调用方一一对应。读命令（list/show/status/deps/metrics）与
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
 _WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
-                         'reassign', 'set_dependencies', 'verify'))
+                         'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog'))
 
 
 def _arm_event_ctx(a, data):
@@ -795,6 +810,8 @@ def cmd_claim(a, data, path):
         if old and old != a.attempt:
             t.setdefault('attempt_revoked', []).append(old)  # 转派即撤销旧代际
         t['attempt_id'] = a.attempt
+        _reset_nudges(t)  # 新代际=新起点：旧代积攒的未响应 nudge 不带入（watchdog 从头计窗）
+        t.pop('heartbeat_at', None)
     t['status'] = 'running'
     if a.owner:
         t['owner'] = a.owner
@@ -864,9 +881,187 @@ def cmd_progress(a, data, path):
     ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
     t.setdefault('checkpoints', []).append({'time': ts, 'note': a.note})
     t['updated'] = now_ms()
+    _reset_nudges(t)  # 检查点=活着的证据：滑动无进展窗口重臂，连续未响应 nudge 计数清零
     save(path, data)
     show(t)
     print(f"  最新检查点({len(t['checkpoints'])}): [{ts}] {a.note}")
+
+
+# ── 滑动无进展 watchdog + 孤儿 adopt（v2.7，WP-4b/S2）────────────────────────
+# 语义（对齐 swarm watchdog 原型）：
+#   滑动窗口而非固定超时——activity = max(updated, heartbeat_at, nudged_at)，claim/progress/heartbeat/
+#   reassign 都会推进它；「健康的孩子永远不会因为跑得久被杀」。窗口到期先 nudge（记数 + 置 nudged_at
+#   重臂一个窗口），连续 max_nudges 次 nudge 无响应才升级：升级时先在落盘信箱（收件箱/归档/发件箱）
+#   里找本任务本 attempt 的完成报告——找到则 adopt（采纳为 done，工作比它的 agent 活得久），找不到才
+#   reclaim（撤销代际、释放回 ready）。计数与状态判定以事件流折叠状态为准，所有变更走既有事件追加路径
+#   （watchdog/heartbeat 均为写命令，一个事件携带全部变更任务的 after 快照），既有命令 stdout/stderr
+#   零变化；新字段 heartbeat_at/nudges/nudged_at 随任务快照折叠，向后兼容只增不减。
+WATCHDOG_ACTIVITY_FIELDS = ('heartbeat_at', 'nudged_at')
+
+
+def _reset_nudges(t):
+    """活着的证据（claim 新代际/progress/heartbeat）：清零连续未响应 nudge 计数。"""
+    t['nudges'] = 0
+    t.pop('nudged_at', None)
+
+
+def cmd_heartbeat(a, data, path):
+    """heartbeat <id>：running 任务的心跳——重臂滑动无进展窗口并清零 nudge 计数（长任务主动报活，
+    代替「必须产出检查点」的最小信号）。带 --attempt 时按代际校验（与 progress 同语义）。"""
+    t = get_task(data, a.id)
+    check_attempt(a, t)
+    if t['status'] != 'running':
+        sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 running 可心跳")
+    t['heartbeat_at'] = now_ms()
+    _reset_nudges(t)
+    t['updated'] = t['heartbeat_at']
+    save(path, data)
+    show(t)
+
+
+def _completion_evidence(tid, t, bus_root):
+    """孤儿 adopt 证据（S2 断言 d）：在落盘信箱里找本任务、本 attempt、本 owner 的完成报告。
+    检查位置：收件箱 coordinator/、归档 _archive/coordinator/（过代过滤误杀/整轮未读的最终去向）、
+    发件箱 _outbox/<owner>/（投递中断的挂起副本）——「落盘即算送达」是 adopt 的立足点。
+    完成报告判定（T11 回炉 M1/M2，确定性启发，针对本工作区实际汇报约定）：
+    - 硬约束（缺一不可）：task 与 attempt_id 均与当前任务一致（防跨代采纳）、from==owner；
+    - 强证据：subject 以「[交付]」开头 → 直接构成采纳证据（协议级显式交付标记，协议文本由 T12 写入，
+      本工具只负责识别；能伪造该标记即能直改主板，同信任级别，不再叠加词汇启发）；
+    - 词汇启发（无强证据时）：① body 不含负向词汇「继续/进行中/下一步/开始/即将/计划/待」任一——
+      协议检查点模板词汇（「已完成…；产物:路径」）类过程汇报的负向守卫，防中途汇报被误标 done；
+      ② 「完成」须出现在 subject（过程汇报的「完成」多在 body 叙述）；③ subject+body 含交付词汇
+      （产物/改动/交付/文件/路径）。任务 id 字面不再是必要条件（M2：合规完成报告 subject 可无任务
+      id 字面——硬约束已按结构化字段精确匹配，字面冗余检查只会把合规报告误判 reclaim、让证据随
+      代际作废）。多条命中取 ts 最新（最终报告晚于过程汇报）。返回 (msg, 位置标记) 或 (None, '')。"""
+    if not t.get('owner') or not t.get('attempt_id'):
+        return None, ''
+    locations = [
+        ('inbox', os.path.join(bus_root, 'coordinator')),
+        ('archive', os.path.join(bus_root, '_archive', 'coordinator')),
+        ('outbox', os.path.join(bus_root, '_outbox', t['owner'])),
+    ]
+    delivery_words = ('产物', '改动', '交付', '文件', '路径')
+    negative_words = ('继续', '进行中', '下一步', '开始', '即将', '计划', '待')  # M1①：过程汇报负向守卫（只看 body，规格如此）
+    delivery_mark = '[交付]'  # M1③：协议交付标记强证据（识别先行，协议文本 T12 落地）
+    best, best_loc, best_ts = None, '', -1
+    for loc, d in locations:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if not name.endswith('.json'):
+                continue
+            try:
+                with open(os.path.join(d, name), encoding='utf-8') as f:
+                    m = json.load(f)
+            except Exception:
+                continue  # 信箱残件不阻塞 watchdog（bus.py 侧有自己的损坏语义）
+            if not isinstance(m, dict):
+                continue
+            if m.get('task') != tid or m.get('attempt_id') != t.get('attempt_id') or m.get('from') != t.get('owner'):
+                continue
+            subject, body = m.get('subject', '') or '', m.get('body', '') or ''
+            if not subject.startswith(delivery_mark):  # 强证据路径：身份约束外免词汇启发（见 docstring 威胁模型）
+                if any(w in body for w in negative_words):  # M1①：负向词汇守卫——body 含过程词汇不作完成证据
+                    continue
+                if '完成' not in subject:  # M1②：「完成」须在 subject（过程汇报的「完成」多在 body 叙述）
+                    continue
+                if not any(w in f'{subject} {body}' for w in delivery_words):
+                    continue
+            ts = m.get('ts') if isinstance(m.get('ts'), int) and not isinstance(m.get('ts'), bool) else 0
+            if ts > best_ts:
+                best, best_loc, best_ts = m, loc, ts
+    return best, best_loc
+
+
+def cmd_watchdog(a, data, path):
+    """watchdog：扫描全部 running 任务的滑动无进展窗口；到期 nudge（重臂），连续 max_nudges 次无响应
+    升级——先查落盘完成报告（任务板检查点轨迹已由 activity 覆盖：检查点即 progress，天然重臂窗口；
+    完成报告落盘证据在 bus 收件箱/归档/发件箱），有证据 adopt 为 done，无证据 reclaim 回 ready 并撤销
+    当前代际。全部变更合入一个 watchdog 事件（after 快照差分），stdout 为新增命令自有契约；
+    adopt 显式记录实际执行者（executors，对齐手工 done --by 审计），汇总行输出 healthy 计数。"""
+    window_ms = max(0, a.window_sec) * 1000
+    max_nudges = max(0, a.max_nudges)
+    bus_root = a.bus_root or os.path.join(os.getcwd(), '.expert-bus')
+    now = now_ms()
+    adopted, reclaimed, nudged, changed = 0, 0, 0, 0
+    healthy = 0
+    lines = []
+    for tid in sorted(data['tasks'], key=lambda x: int(x[1:])):
+        t = data['tasks'][tid]
+        if t['status'] != 'running':
+            continue
+        activity = max([t.get('updated', 0)] + [t.get(k, 0) or 0 for k in WATCHDOG_ACTIVITY_FIELDS])
+        stale_s = max(0, now - activity) // 1000
+        if now - activity <= window_ms:
+            healthy += 1  # 健康：窗口内有过活着的证据，永不因跑得久被盯上
+            continue
+        nudges = t.get('nudges') or 0
+        if nudges < max_nudges:
+            t['nudges'] = nudges + 1
+            t['nudged_at'] = now  # nudge 重臂一个窗口；连续无响应计数不清零（progress/heartbeat 才清）
+            ts = datetime.datetime.fromtimestamp(now / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            t.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"watchdog: nudge 第{t['nudges']}次（无进展 {stale_s}s，window={a.window_sec}s）"})
+            t['updated'] = now
+            nudged += 1
+            changed += 1
+            lines.append(f"{tid} [running] owner={t['owner'] or '（未分配）'} 无进展 {stale_s}s "
+                         f"nudge={t['nudges']}/{max_nudges} → 已 nudge（重臂 window={a.window_sec}s，等 heartbeat/progress 响应）")
+            continue
+        m, loc = _completion_evidence(tid, t, bus_root)
+        att = t.get('attempt_id') or ''
+        if m is not None:
+            summary = f"{m.get('subject', '')}：{(m.get('body') or '')[:160]}"
+            t['status'] = 'done'
+            t['summary'] = f"[watchdog adopt] {summary}"
+            ts = datetime.datetime.fromtimestamp(now / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            t.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"watchdog: adopt（发现落盘完成报告 {m.get('id')}@{loc}，attempt={att}）→ done"})
+            # 采纳建议②：对齐手工 done --by 的审计丰富度——adopt 是异常路径（专家进程已死、由 watchdog
+            # 代收），显式落 executors（证据消息 from==owner 即实际执行者），show/metrics 事后可追溯。
+            t.setdefault('executors', []).append({'name': m.get('from') or t.get('owner') or '未知', 'time': ts})
+            t['updated'] = now
+            adopted += 1
+            changed += 1
+            lines.append(f"{tid} [running] owner={t['owner'] or '（未分配）'} 无进展 {stale_s}s nudge={nudges}/{max_nudges}"
+                         f" → 已采纳为 done（落盘完成报告 {m.get('id')}@{loc}）；完成标准：{t.get('desc', '')[:60]}")
+        else:
+            orig_owner = t.get('owner') or '未分配'
+            t['status'] = 'ready'
+            if att:
+                t.setdefault('attempt_revoked', []).append(att)  # 孤儿代际撤销：旧 attempt 的迟到汇报按 stale_attempt 拒
+                t.pop('attempt_id', None)
+            t['owner'] = ''
+            t['nudges'] = 0
+            t.pop('nudged_at', None)
+            t.pop('heartbeat_at', None)
+            ts = datetime.datetime.fromtimestamp(now / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            t.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"watchdog: reclaim（{max_nudges} 次 nudge 无响应且无落盘完成证据）→ ready；attempt {att or '（无）'} 已撤销"})
+            t['updated'] = now
+            reclaimed += 1
+            changed += 1
+            lines.append(f"{tid} [running] owner=（原 {orig_owner}）无进展 {stale_s}s nudge={nudges}/{max_nudges}"
+                         f" → 已 reclaim（无落盘完成证据；attempt {att or '（无）'} 撤销，转 ready 待重新派工）")
+    if not lines:
+        if healthy:
+            print(f"watchdog: {healthy} 个 running 任务全部健康（window={a.window_sec}s 内均有活动证据，未做任何变更）")
+        else:
+            print(f"watchdog: 无 running 任务（window={a.window_sec}s max_nudges={max_nudges}）")
+        return
+    if changed:
+        promoted = refresh(data)
+        save(path, data)
+        if promoted:
+            lines.append('依赖已满足，自动转 ready: ' + ' '.join(promoted))
+    else:
+        lines.append('（本轮无变更）')
+    print(f"watchdog: window={a.window_sec}s max_nudges={max_nudges} bus_root={bus_root}")
+    for ln in lines:
+        print(ln)
+    # 采纳建议③：有变更轮次也输出 healthy 计数（健康任务不因同轮有变更而不可见；无变更轮次的
+    # 「全部健康」分支本就带计数，两分支口径一致）。
+    print(f"watchdog: nudge={nudged} adopt={adopted} reclaim={reclaimed} healthy={healthy}")
 
 
 def cmd_recover(a, data, path):
@@ -893,6 +1088,8 @@ def cmd_reassign(a, data, path):
     if old and old != a.attempt_id:
         t.setdefault('attempt_revoked', []).append(old)
     t['attempt_id'] = a.attempt_id
+    _reset_nudges(t)  # 新代际=新起点：旧代积攒的未响应 nudge 不带入
+    t.pop('heartbeat_at', None)
     if a.owner:
         t['owner'] = a.owner
     t['updated'] = now_ms()
@@ -1250,6 +1447,16 @@ def main():
     p = sub.add_parser('fail'); p.add_argument('id'); p.add_argument('reason', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_fail)
     p = sub.add_parser('retry'); p.add_argument('id'); add_write_args(p); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser('progress'); p.add_argument('id'); p.add_argument('note'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_progress)
+    p = sub.add_parser('heartbeat'); p.add_argument('id'); add_attempt_arg(p); add_write_args(p)
+    p.set_defaults(fn=cmd_heartbeat,
+                   help='running 任务心跳：重臂滑动无进展窗口并清零 nudge 计数（watchdog 用，长任务报活）')
+    p = sub.add_parser('watchdog')
+    p.add_argument('--window-sec', type=int, default=1800, help='滑动无进展窗口秒数（默认 1800；0=立即可判定，测试/演练用）')
+    p.add_argument('--max-nudges', type=int, default=2, help='连续 nudge 无响应上限（默认 2；达到后升级 adopt/reclaim）')
+    p.add_argument('--bus-root', help='完成报告落盘信箱根目录，默认 <cwd>/.expert-bus（收件箱/归档/发件箱均纳入检索）')
+    add_write_args(p)
+    p.set_defaults(fn=cmd_watchdog,
+                   help='滑动无进展看门狗：到期 nudge 重臂，连续无响应先查落盘完成报告（有→adopt 为 done，无→reclaim 回 ready 并撤销代际）')
     p = sub.add_parser('metrics'); p.set_defaults(fn=cmd_metrics)
 
     p = sub.add_parser('recover'); add_write_args(p); p.set_defaults(fn=cmd_recover)

@@ -50,6 +50,16 @@
 | 🧙 **原生专家工具** | `list_experts`（浏览合并花名册，紧凑/展开双模式）、`summon_expert`（白纸精召：persona 经 sanitizePersona 注入，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝，task 8000 码点上限）、`summon_experts`（批量 ≤8、并发 4、部分成功语义）。递归防护：spawn 子代理带六项 toolFilter deny（不可再召唤专家、不可嵌套 subagent/fork、不可 workflow），工具 schema default 3 纵深兜底——单层委派，无失控专家树 |
 | 📚 **每专家经验池 + persona 方法论分层**（v2.4.0） | summon 自动尾部注入 `expert-lessons/<slug>.md` 该专家历史教训（≤2000 字符，按字符截断，2K 上限，无命中零变化）；persona frontmatter `method:` + `<!-- methods-cut -->` 瘦身注入+按需深读指针（Top-5 bundled-core 已分层，fail-safe 全量回退，合入经预注册 A/B 实验门禁，档案见 `docs/internal/experiments/`）；`list_experts` 显式标注跨源 conflict/shadowed，自定义专家删除支持清理。已知限制：设置面板「清空已删除」按钮 UI 待接线（RPC 契约已就位） |
 
+## 🆕 v2.6 新特性
+
+| 特性 | 说明 |
+|------|------|
+| 🔒 **任务板并发正确性**（WP-1） | 全部写操作携带 `expected_revision` 乐观锁（旧 revision 返回具名错误且不落盘）；attempt 代际——转派撤销旧代际，旧代际的 done/汇报被拒；板文件损坏返回显式 `unrecoverable` 错误而非静默空列表；依赖写入前全图环检测 |
+| 📮 **消息总线 at-least-once**（WP-2） | 游标仅在收到成功回执后前进（投递中途崩溃可重投）；携带已撤销 attempt 的消息读取时归档、不进收件箱；收件箱仅剩过期消息时返回显式 skip-round 提示 |
+| 🛡️ **门禁执法平面**（WP-3，opt-in） | 零依赖 commit-msg hook（消息格式 + 任务存在性 + 文件范围三查），仅在用户显式开启时安装进你的仓库；验证回执绑定逐文件 SHA-256 范围指纹——回执后任一文件变动即失效 |
+| ⚡ **派工即回写**（WP-4a） | `summon_expert` 从召唤任务书解析任务 id，专家运行前自动认领（in_progress + owner）；失败放行并显式提示，不阻断派工 |
+| ⚙️ **宿主设置页迁移**（WP-8a） | 插件用户配置迁至宿主 schemastery 命名空间（插件配置页），全部写操作带 `expectedRevision` 乐观并发；注册失败时降级放行，绝不阻断插件装载 |
+
 ## 📦 安装
 
 > 前置：Node.js 22+ 的 DSH 环境；`python3`（任务板与消息总线）；可选安装 [dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents)（Agency 花名册——**本插件已解耦对它的依赖**：不装时协议完整可用、自动走自带专家库兜底；装了其花名册也只视为额外来源）。内置 `trim-cli` 技能的 scripts wrapper 与 bin 二进制不在本包内（files 白名单不含），需按 trim-cli skill 文档另行获取。
@@ -60,7 +70,17 @@
 dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator
 ```
 
-### 方式 B：手动安装
+### 方式 B：让 Agent 帮你安装
+
+把下面这段话直接粘进任意 DSH 会话即可（无需先切到本预设）：
+
+```text
+请帮我安装 dsh-expert-orchestrator 插件：执行
+`dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator`，
+装完后提醒我重启 DSH，并在会话预设选择器中选择「专家编排模式」。
+```
+
+### 方式 C：手动安装
 
 ```bash
 git clone https://github.com/mario841859784/dsh-expert-orchestrator.git
@@ -73,7 +93,7 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 
 自 DSH **0.1.7-alpha** 起，agent preset 是**由 bundle patch 携带的声明行**：一个 `name: '@deepseek-ai/dsh-agent-preset'`、Loader 行 id 为 `preset-<id>` 的插入行，完整 Cordis 组合内联在其 `config.plugins` 里。旧版目录机制（`~/.dsh/.agent-presets/<id>/` 下放 `preset.yml` + `agent.cordis.yml`）**已无任何读取方**——只部署目录的 preset 永远不会出现在会话预设选择器中。本插件因此把组合内联进自身 bundle patch（`cordis.patch.yml` 的 `preset-expert-orchestrator` 行），正常安装插件即可，重启 DSH 后预设即可见可选。`~/.dsh/.agent-presets/expert-orchestrator/` 目录继续作为 preset 的**运行时数据根**（技能、专家、经验池、专家来源）；声明行里的 `skill-filesystem` 用与部署器相同的 `DSH_HOME || ~/.dsh` 公式解析该目录。
 
-**DSH 版本要求（v2.5.1+）：`engines.dsh >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0`**——声明行机制已在 DSH 0.1.7-alpha.2 上验证，并适配 DSH 0.2.0-rc.1；`@deepseek-ai/dsh-tools` peer 为 `>=0.1.6-alpha.1 <0.1.7-0 || >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0`，覆盖历史上支持的 0.1.6-alpha 线。
+**DSH 版本要求（v2.6.0+）：`engines.dsh >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0 || >=0.2.1-0 <0.3.0-0`**——声明行机制已在 DSH 0.1.7-alpha.2 上验证，并适配 DSH 0.2.0-rc.1；0.2.1-alpha 分支为现宿主线（`0.2.1-alpha.1`）新增，因为严格 semver 下预发布版本不会命中比较器元组不同的区间（`(0,2,1)` ≠ `(0,2,0)`）。`@deepseek-ai/dsh-tools` peer 为 `>=0.1.6-alpha.1 <0.1.7-0 || >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0 || >=0.2.1-0 <0.3.0-0`，覆盖历史上支持的 0.1.6-alpha 线。验证范围（用户裁决 1B，v2.6.0）：本轮仅实测现宿主 `0.2.1-alpha.1`（热挂载/静态声明校验范围）；`0.1.7-alpha.2` 线本轮未复测——peer 分支保持覆盖、以静态兼容为准；需重启宿主的端到端验证待用户重启后补测。
 
 ### 部署策略（与其他 preset 插件不同）
 
@@ -133,6 +153,8 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 ## ✅ 兼容性说明
 
 本 preset 不硬编码任何特定部署的工具名（搜索/浏览器/外部 API），所有机制基于 DSH 标准工具 + 两个零依赖 Python 脚本，可直接跨环境使用。
+
+**宿主代际实测状态（v2.6.0，用户裁决 1B）**：本轮发布门禁仅对现宿主 `0.2.1-alpha.1` 做了实测（npm pack 产物完整性、tarball 独立加载、声明一致性、PROTOCOL 刷新沙箱演练——均通过）；`0.1.7-alpha.2` 线的 peer/engines 声明保持覆盖但本轮未复测，以静态兼容为准；真实插件装载、summon 端到端、任务板读写、设置页渲染、commit-msg hook 安装执行等需要重启宿主的验证，标注为**待用户重启宿主后补测**。
 
 ## 🤝 致谢
 

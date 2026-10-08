@@ -23,17 +23,36 @@ A DeepSeek Harness (DSH) **agent preset plugin**: once installed, DSH gets an "E
 - **Native expert tools** — `list_experts` (browse the merged roster, compact/expanded modes), `summon_expert` (single white-paper summon: persona injected via sanitizePersona, resolution exact → aliases → unambiguous title, shadowed/disabled rejected, 8K-char task cap), and `summon_experts` (batch ≤8, concurrency 4, partial-success semantics). Recursion protection: spawned sub-agents get a six-entry `toolFilter` deny list (no expert-tool re-summoning, no `subagent`/`subagent_fork` nesting, no `workflow`) with the tool schema default depth 3 as a backstop — one level of delegation, no runaway expert trees.
 - **Per-expert lesson pool & persona method layering (v2.4.0)** — summon auto-appends a per-expert lesson hint (≤2000 chars, character-level truncation) from `expert-lessons/<slug>.md`; persona frontmatter `method:` + `<!-- methods-cut -->` split injects a slim persona with an on-demand deep-read pointer (top-5 bundled-core experts layered, fail-safe full-text fallback; gated by a pre-registered A/B experiment, archive in `docs/internal/experiments/`); `list_experts` marks cross-source conflicts/shadowed entries explicitly, and custom-expert deletions support cleanup. Known limitations: the settings-panel "purge deleted" button UI is pending (RPC contract in place).
 
+## What's new in v2.6
+
+- **Concurrency-safe taskboard** — every write carries `expected_revision` (CAS optimistic locking; a stale revision returns a named error and never touches the board); task attempt generations reject done/report from revoked attempts; corrupted board files return an explicit `unrecoverable` error instead of a silently empty list; dependency cycles are rejected before write.
+- **At-least-once message bus** — the bus cursor advances only after a success receipt (a crash mid-delivery re-delivers); messages from revoked attempts are archived on read, never shown in the inbox; an inbox with only expired messages returns an explicit skip-round hint.
+- **Opt-in enforcement plane** — a zero-dependency `commit-msg` hook (message format + task existence + file scope) installs into your repo only on explicit request; verification receipts bind per-file SHA-256 scope fingerprints, so any file change after a receipt invalidates it.
+- **Auto-claim on dispatch** — `summon_expert` claims task ids parsed from the summon brief (in_progress + owner) before the expert runs; fail-open with a visible hint.
+- **Host settings page** — plugin configuration moved onto the host schemastery namespace (插件配置 page) with `expectedRevision` optimistic concurrency on every write; registration is fail-open and never blocks plugin load.
+
 ## Install
 
 ```bash
 dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator
 ```
 
+### Let an agent install it for you
+
+Paste this into any DSH chat (the orchestrator preset itself is not required):
+
+```text
+Please install the dsh-expert-orchestrator plugin for me: run
+`dsh plugin --profile web add github:mario841859784/dsh-expert-orchestrator`,
+then remind me to restart DSH and pick "专家编排模式 / Expert Orchestrator"
+from the session preset picker.
+```
+
 or manually copy the package into a bundle location and restart DSH, then pick **专家编排模式 / Expert Orchestrator** from the session preset picker. Requires `python3`; the [dsh-agency-agents](https://github.com/MichengAI/dsh-agency-agents) roster plugin is **optional coexistence, not a dependency** — this plugin no longer depends on it: the merged-roster protocol works fully without it, and when it is installed its roster is treated as just an additional source. The bundled `trim-cli` skill's scripts wrapper and `bin` binary are not part of this package (excluded from the `files` whitelist); fetch them separately per the trim-cli skill docs.
 
 ### How the preset is registered (v2.5.0+)
 
-**DSH compatibility (v2.5.1+): `engines.dsh >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0`** — the declaration-row preset mechanism is verified against DSH 0.1.7-alpha.2 and adapted to DSH 0.2.0-rc.1; `@deepseek-ai/dsh-tools` peer accepts `>=0.1.6-alpha.1 <0.1.7-0 || >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0` to cover the historically supported 0.1.6-alpha line.
+**DSH compatibility (v2.6.0+): `engines.dsh >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0 || >=0.2.1-0 <0.3.0-0`** — the declaration-row preset mechanism is verified against DSH 0.1.7-alpha.2 and adapted to DSH 0.2.0-rc.1; the 0.2.1-alpha branch was added for the current host line (`0.2.1-alpha.1`) because strict semver never matches a prerelease against a comparator on a different `[major, minor, patch]` tuple. `@deepseek-ai/dsh-tools` peer accepts `>=0.1.6-alpha.1 <0.1.7-0 || >=0.1.7-alpha.2 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0 || >=0.2.1-0 <0.3.0-0`. Verification scope (user ruling 1B, v2.6.0): only the running host `0.2.1-alpha.1` was exercised this release, via hot-mountable and static-declaration checks; the `0.1.7-alpha.2` line was **not re-tested this round** — its peer branches are kept and compatibility rests on static analysis; end-to-end checks that require a host restart are deferred until the user restarts.
 
 Since DSH **0.1.7-alpha**, agent presets are **declaration rows carried by bundle patches** — a `preset-<id>` row named `@deepseek-ai/dsh-agent-preset` whose `config.plugins` holds the full Cordis entry list. The legacy `~/.dsh/.agent-presets/<id>/` directory (`preset.yml` + `agent.cordis.yml`) is **no longer read by anything**: a preset deployed only as that directory never appears in the preset picker. This plugin therefore declares the preset inline in its own bundle patch (`cordis.patch.yml`, row `preset-expert-orchestrator`), so a normal plugin install is sufficient — installing the bundle, restarting DSH, and the preset shows up in the session mode picker. The deployed `~/.dsh/.agent-presets/expert-orchestrator/` directory remains the preset's **runtime data root** (skills, experts, lessons, expert sources); the declaration's `skill-filesystem` row resolves it with the same `DSH_HOME || ~/.dsh` formula the deployer uses.
 

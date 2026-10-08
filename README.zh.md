@@ -117,7 +117,7 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
       name: '/绝对路径/dsh-expert-orchestrator/lib/index.js'
 ```
 
-升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`，共 10 项），且 `skills/expert-orchestration/experts/` 现只含 11 个 bundled core 专家、按 PROTOCOL 随版本刷新；USER_DATA（`lessons.md`、`expert-sources/`——下载的来源包与合并花名册）只缺才补、绝不覆盖。升级到本版本后首次运行时，历史上适配过的专家副本会一次性迁移进 `expert-sources/legacy-adapted/`（冻结本地来源，默认启用）而非被删除。宿主层本地挂载不受该覆盖影响。
+升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`、`skills/expert-gestures`，共 11 项），且 `skills/expert-orchestration/experts/` 现只含 11 个 bundled core 专家、按 PROTOCOL 随版本刷新；USER_DATA（`lessons.md`、`expert-sources/`——下载的来源包与合并花名册）只缺才补、绝不覆盖。升级到本版本后首次运行时，历史上适配过的专家副本会一次性迁移进 `expert-sources/legacy-adapted/`（冻结本地来源，默认启用）而非被删除。宿主层本地挂载不受该覆盖影响。
 
 存量迁移提示：若此前在 `agent.cordis.yml` 中手工加过 `expert-orchestrator-deploy` 条目，升级前应先迁移到宿主层 `cordis.patch.yml`，否则 VERSION 变更刷新会用出厂版覆盖该条目、静默断掉本地链路。
 
@@ -126,6 +126,14 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 1. 安装并重启 DSH，会话选择「专家编排模式」预设（或设为默认）。
 2. 直接交代任务即可：编排者自动分诊、请 PM 规划、委派专家。
 3. 大型任务可随时插话调整；里程碑与 commit 前会自动过评审 + PM 检查点。
+
+### 零 token 专家手势（v2.7）：`/expert-名称`
+
+内置 11 位专家已注册为 **modelInvocable:false 宿主技能**（`skills/expert-gestures/expert-<name>.md`，与 preset 声明一并由 `scripts/gen-preset-declaration.mjs` 从 bundled-core 花名册生成）：在消息里直接输入 `/expert-<名称>`（如 `/expert-backend-engineer`、`/expert-tech-writer`），宿主 pre-step 钩子会**确定性注入**对应手势技能——不消耗模型调用、无模型自主决策环节（此类技能不进模型技能目录，模型经 skill 工具调用会被宿主拒绝，因此不产生任何 token 目录开销）。
+
+手势注入后，persona 仍按文件层前置链现场解析：**项目层 `<cwd>/.dsh/experts/<name>.md` > 全局层 `~/.dsh/experts/<name>.md` > 内置 `skills/expert-orchestration/experts/<name>.md`**（仅按 name 精确匹配，与 summon_expert 语义同源；改文件立即生效）。三层全部未命中时手势显式报加载失败，不会凭记忆模拟专家。
+
+边界与冲突裁决：手势**仅覆盖稳定花名册**——文件层专家（随建随变）与来源包专家（随来源管理）不注册手势；手势名与既有技能同名冲突由宿主确定性裁决（同层 rank 升序：项目 `.dsh/skills`=100 < 项目 `.agents/skills`=200 < 本 preset 手势=300 < 全局 `~/.dsh/skills`=400 < `~/.agents/skills`=500；跨层就近层整体胜出，败者告警忽略）——用户项目层自建同名技能确定性地优先于手势。两代宿主（0.1.7-alpha.2 与 0.2.x）技能声明行格式与手势机制逐维一致（验证记录见 `docs/internal/verification/`）；已部署 preset 的手势层随下一次 VERSION 标记刷新生效（需重启级验证的项见该记录「待用户重启后补测」）。
 
 ## 📚 专家来源项目
 

@@ -51,6 +51,8 @@ import {
   resolveFileExpert,
   scanExpertDir,
 } from '../lib/expert-files.js'
+import { copyFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { readFileSync } from 'node:fs'
 
 const PERSONA_LIMIT = 100000 // 与 tools.js MAX_PERSONA_CHARS 一致
@@ -4979,4 +4981,230 @@ test('WP-6a 回炉 m7: 非普通文件（FIFO/.md 命名目录）isFile() 过滤
   const entries = scanExpertDir(dir, 'project', warn)
   assert.deepEqual(entries.map((e) => e.name), ['真实专家'])
   assert.ok(warns.some((m) => m.includes('nested.md') && m.includes('不是普通文件')), warns.join(' | '))
+})
+
+// ── T14（WP-6b）：/expert- 零 token 用户手势——声明生成 + 手势技能文件 ────────
+
+import {
+  buildDeclarationPatch,
+  deriveGestureDeclarationLine,
+  gestureSkillName,
+  GESTURE_HEADER_APPENDIX,
+  GESTURE_SKILL_DIR,
+  parseGestureMount,
+  readRoster,
+  renderGestureSkill,
+  SKILL_NAME_RE,
+} from '../lib/expert-gestures.js'
+import { CORE_EXPERTS } from '../lib/index.js'
+import { cpSync } from 'node:fs'
+import { relative } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+const T14_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+const T14_AGENT = readFileSync(join(T14_ROOT, 'agent.cordis.yml'), 'utf8')
+const T14_PATCH = readFileSync(join(T14_ROOT, 'cordis.patch.yml'), 'utf8')
+const T14_EXPERTS_DIR = join(T14_ROOT, 'skills', 'expert-orchestration', 'experts')
+const T14_GESTURES_DIR = join(T14_ROOT, GESTURE_SKILL_DIR)
+
+test('T14: 手势技能名派生——expert- 前缀 + 与两代宿主 SKILL_NAME 同规；非法专家名构建期硬失败', () => {
+  assert.equal(gestureSkillName('backend-engineer'), 'expert-backend-engineer')
+  assert.equal(String(SKILL_NAME_RE), '/^[a-z0-9]+(?:-[a-z0-9]+)*$/')
+  for (const n of CORE_EXPERTS.map((f) => f.replace(/\.md$/, ''))) {
+    assert.ok(SKILL_NAME_RE.test(gestureSkillName(n)), n)
+  }
+  for (const bad of ['后端工程师', 'Backend-Engineer', 'a b', '', 'a_b', 'a.b']) {
+    assert.throws(() => gestureSkillName(bad), /技能名规则/)
+  }
+})
+
+test('T14: 花名册读取（构建期严格）——坏文件/重名/缺目录硬失败；正常 roster 确定性排序', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 't14-roster-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeExpertMd(dir, 'b-second.md', ['name: beta-expert', 'title: 乙专家'], '乙正文')
+  writeExpertMd(dir, 'a-first.md', ['name: alpha-expert', 'title: 甲专家'], '甲正文')
+  const roster = readRoster(dir)
+  assert.deepEqual(roster.map((e) => e.skill), ['expert-alpha-expert', 'expert-beta-expert'])
+  assert.equal(roster[0].title, '甲专家')
+  // 构建期严格语义（区别于运行时文件层的告警跳过）：坏文件 → 抛错
+  writeExpertMd(dir, 'c-broken.md', ['title: 无名氏'], '正文')
+  assert.throws(() => readRoster(dir), /解析失败.*构建期严格/s)
+  rmSync(join(dir, 'c-broken.md'))
+  // 同名 → 抛错
+  writeExpertMd(dir, 'd-dup.md', ['name: alpha-expert'], '重复正文')
+  assert.throws(() => readRoster(dir), /同名专家/)
+  rmSync(join(dir, 'd-dup.md'))
+  // 缺目录 → 抛错
+  assert.throws(() => readRoster(join(dir, 'missing')), /不可读/)
+})
+
+test('T14: 手势技能文件内容——frontmatter 三键、零 legacy 键、三层加载链与 fail-closed 文案', () => {
+  const md = renderGestureSkill({ name: 'backend-engineer', title: '后端工程师', skill: 'expert-backend-engineer' })
+  const fm = md.slice(0, md.indexOf('---\n\n#') + 4)
+  // frontmatter 恰三键；两代宿主都拒绝 legacy invocation 键（整文件被忽略），绝不书写
+  assert.ok(fm.startsWith('---\nname: expert-backend-engineer\n'), fm)
+  assert.match(fm, /^disable-model-invocation: true$/m)
+  assert.doesNotMatch(fm, /^modelInvocable:/m)
+  assert.doesNotMatch(fm, /^userInvocable:/m)
+  assert.doesNotMatch(fm, /^disableModelInvocation:/m)
+  assert.match(fm, /^description: .+\n/gm)
+  // 确定性加载链：项目 > 全局 > 内置，仅 name 精确匹配
+  assert.ok(md.includes('.dsh/experts/backend-engineer.md'), '项目层')
+  assert.ok(md.includes('环境变量 || ~/.dsh>/experts/backend-engineer.md'), '全局层')
+  assert.ok(md.includes('../expert-orchestration/experts/backend-engineer.md'), '内置兜底（相对本技能目录）')
+  assert.ok(md.includes('.agent-presets/expert-orchestrator/skills/expert-orchestration/experts/backend-engineer.md'), '内置公式路径')
+  assert.ok(md.includes('仅按 name 精确匹配'))
+  // fail-closed：三层未命中显式失败，禁止凭记忆模拟
+  assert.ok(md.includes('persona 加载失败'))
+  assert.ok(md.includes('禁止凭记忆模拟专家'))
+  // title 缺省回落专家名（确定性，不抛错）
+  const fallback = renderGestureSkill({ name: 'qa-test-engineer' })
+  assert.ok(fallback.startsWith('---\nname: expert-qa-test-engineer\n'))
+  assert.ok(fallback.includes('qa-test-engineer（qa-test-engineer）——用户手势 /expert-qa-test-engineer'))
+})
+
+test('T14: 声明生成可加性——花名册非空恰增两处（挂载行+头注块），剥离后与空花名册输出逐字节相等', () => {
+  const roster = readRoster(T14_EXPERTS_DIR)
+  const emptyPatch = buildDeclarationPatch(T14_AGENT, [])
+  const fullPatch = buildDeclarationPatch(T14_AGENT, roster)
+  // 空花名册：声明面零手势痕迹（gen 脚本空输入幂等的静态面）
+  assert.ok(!emptyPatch.includes('expert-gestures'))
+  assert.ok(!emptyPatch.includes(GESTURE_HEADER_APPENDIX.slice(0, 40)))
+  // 非空：恰一行 expert-gestures 挂载行，紧跟既有 skills 挂载行之后
+  const fullLines = fullPatch.split('\n')
+  const skillIdx = fullLines.findIndex((l) => l.includes("', 'skills')"))
+  const gestureIdx = fullLines.findIndex((l) => l.includes("', 'expert-gestures')"))
+  assert.ok(skillIdx > 0 && gestureIdx === skillIdx + 1, `挂载行位置 skills@${skillIdx} gestures@${gestureIdx}`)
+  assert.equal(fullLines.filter((l) => l.includes("', 'expert-gestures')")).length, 1)
+  assert.equal(deriveGestureDeclarationLine(fullLines[skillIdx]), fullLines[gestureIdx])
+  // 形态断言（回炉 M1）：派生挂载行必须保留 skills 段——旧缺陷（替换掉 'skills'）
+  // 与正确形态在该子串断言下同命中，故以完整形态子串锁死
+  assert.ok(fullLines[gestureIdx].includes("', 'skills', 'expert-gestures')"), '派生挂载行保留 skills 段（回炉 B1/M1）')
+  // 头注块恰一次，且位于 - insert: 之前
+  assert.equal(fullPatch.split(GESTURE_HEADER_APPENDIX).length - 1, 1)
+  assert.ok(fullPatch.indexOf(GESTURE_HEADER_APPENDIX) < fullPatch.indexOf('- insert:'))
+  // 可加性：full − 头注块 − 挂载行 === empty（零回归不变量；空输出=手势化前声明面，
+  // 已对 git HEAD 逐字节实测 13483B 一致）
+  const stripped = fullPatch.replace(GESTURE_HEADER_APPENDIX, '').split('\n').filter((l) => !l.includes("', 'expert-gestures')")).join('\n')
+  assert.equal(stripped, emptyPatch)
+})
+
+test('T14: build 产物一致（验收③）——提交的 cordis.patch.yml 与手势文件即生成器输出', () => {
+  const roster = readRoster(T14_EXPERTS_DIR)
+  assert.equal(roster.length, CORE_EXPERTS.length, '花名册=11 位 bundled-core')
+  assert.deepEqual(
+    roster.map((e) => `${e.name}.md`).sort(),
+    [...CORE_EXPERTS].sort(),
+    '注册面与 CORE_EXPERTS 花名册一一对应',
+  )
+  // cordis.patch.yml 逐字节可复现
+  assert.equal(T14_PATCH, buildDeclarationPatch(T14_AGENT, roster))
+  // 手势文件集合与内容逐字节可复现
+  const files = readdirSync(T14_GESTURES_DIR).sort()
+  const expected = roster.map((e) => `${e.skill}.md`).sort()
+  assert.deepEqual(files, expected)
+  for (const e of roster) {
+    const p = join(T14_GESTURES_DIR, `${e.skill}.md`)
+    assert.equal(readFileSync(p, 'utf8'), renderGestureSkill(e), `${e.skill}.md 逐字节一致`)
+  }
+  // 父根扫描惰性前提：手势目录内无 SKILL.md（宿主对缺 SKILL.md 的目录条目静默跳过）
+  assert.equal(existsSync(join(T14_GESTURES_DIR, 'SKILL.md')), false)
+  // 结构性命名空间隔离：手势名与既有两技能不撞
+  const existing = ['expert-orchestration', 'trim-cli']
+  assert.equal(roster.some((e) => existing.includes(e.skill)), false)
+})
+
+test('T14: gen CLI spawn 实测——两连跑幂等、--check 通过、--empty-roster 回到零手势声明面', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 't14-cli-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  mkdirSync(join(dir, 'lib'), { recursive: true })
+  mkdirSync(join(dir, 'skills', 'expert-orchestration', 'experts'), { recursive: true })
+  copyFileSync(join(T14_ROOT, 'scripts', 'gen-preset-declaration.mjs'), join(dir, 'scripts', 'gen-preset-declaration.mjs'))
+  copyFileSync(join(T14_ROOT, 'lib', 'expert-gestures.js'), join(dir, 'lib', 'expert-gestures.js'))
+  copyFileSync(join(T14_ROOT, 'lib', 'expert-files.js'), join(dir, 'lib', 'expert-files.js'))
+  copyFileSync(join(T14_ROOT, 'agent.cordis.yml'), join(dir, 'agent.cordis.yml'))
+  for (const f of CORE_EXPERTS) copyFileSync(join(T14_EXPERTS_DIR, f), join(dir, 'skills', 'expert-orchestration', 'experts', f))
+  const run = (args) => spawnSync(process.execPath, ['scripts/gen-preset-declaration.mjs', ...args], { cwd: dir, encoding: 'utf8' })
+  // ① 花名册模式：声明+11 手势文件落盘
+  let r = run([])
+  assert.equal(r.status, 0, r.stderr)
+  const patch1 = readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')
+  const gestureFile = join(dir, 'skills', 'expert-gestures', 'expert-backend-engineer.md')
+  assert.equal(existsSync(gestureFile), true)
+  // ② 两连跑幂等 + --check 通过
+  r = run([])
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(readFileSync(join(dir, 'cordis.patch.yml'), 'utf8'), patch1)
+  r = run(['--check'])
+  assert.equal(r.status, 0, r.stderr)
+  // ③ 手势文件被改 → --check 报 drift（exit 1）
+  writeFileSync(gestureFile, '---\nname: tampered\n---\n')
+  r = run(['--check'])
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /gesture skill drift/)
+  // ④ --empty-roster 写模式：声明面回到零手势字节、生成的 stray 文件被清（仅生成名 *.md）
+  r = run(['--empty-roster'])
+  assert.equal(r.status, 0, r.stderr)
+  const emptyPatch = readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')
+  assert.ok(!emptyPatch.includes('expert-gestures'))
+  assert.deepEqual(readdirSync(join(dir, 'skills', 'expert-gestures')), [])
+  // ⑤ --empty-roster --check 通过（幂等）
+  r = run(['--empty-roster', '--check'])
+  assert.equal(r.status, 0, r.stderr)
+})
+
+test('T14: 产物声明形态（回炉 B1/M1）——解析 cordis.patch.yml 产物的挂载公式：挂载根含 skills 段、第二根=skills/expert-gestures、与手势文件落盘路径对齐', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 't14-shape-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  // 解析**提交的产物**（而非生成器源码行为）：评审 B1 盲区正是「断言生成器输出==生成器输出」
+  const { dirs } = parseGestureMount(T14_PATCH, home)
+  assert.equal(dirs.length, 2, 'skill-filesystem customSkillDirs 恰两条挂载公式')
+  const [skillsRoot, gesturesRoot] = dirs
+  assert.equal(skillsRoot, join(home, '.agent-presets', 'expert-orchestrator', 'skills'), 'root#1=…/expert-orchestrator/skills')
+  assert.equal(gesturesRoot, join(skillsRoot, 'expert-gestures'), 'root#2=root#1/expert-gestures（skills 段必须在）')
+  assert.equal(gesturesRoot, join(home, '.agent-presets', 'expert-orchestrator', 'skills', 'expert-gestures'), 'root#2=<dst>/skills/expert-gestures（部署器 refreshEntry 落盘位置）')
+  // 手势文件目标路径形态：仓库落盘相对路径与解析出的部署目标相对形态逐字一致
+  assert.equal(relative(T14_ROOT, T14_GESTURES_DIR), join('skills', 'expert-gestures'))
+  const roster = readRoster(T14_EXPERTS_DIR)
+  for (const e of roster) assert.equal(existsSync(join(T14_ROOT, relative(T14_ROOT, T14_GESTURES_DIR), `${e.skill}.md`)), true, `${e.skill}.md 在部署同形相对路径上`)
+  // 鉴别力自证：评审 B1 的错误形态（丢 'skills' 段）必须被本解析判错——若产物回归旧形态，
+  // 下面的替换不生效、buggyDirs 与 dirs 同值 → notEqual 红
+  const buggy = T14_PATCH.replace("', 'skills', 'expert-gestures')", "', 'expert-gestures')")
+  const { dirs: buggyDirs } = parseGestureMount(buggy, home)
+  assert.notEqual(buggyDirs[1], join(buggyDirs[0], 'expert-gestures'), '旧缺陷形态（<dst>/expert-gestures，部署器永不创建）被解析判错')
+})
+
+test('T14: 部署面端到端（回炉 M1）——解析产物声明挂载 → 真实宿主 FileSystemSkillProvider 注册 13 技能（宿主模块不可用即跳过）', async (t) => {
+  const mods = process.env.DSH_HOST_MODULES || '/vol2/@appcenter/Harness/server/node_modules'
+  let FileSystemSkillProvider
+  try {
+    ;({ FileSystemSkillProvider } = await import(pathToFileURL(join(mods, '@deepseek-ai/dsh-skill-filesystem/lib/index.js')).href))
+  } catch (err) {
+    t.skip(`宿主模块不可用（${mods}）：${err?.message ?? err}`)
+    return
+  }
+  const home = mkdtempSync(join(tmpdir(), 't14-e2e-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const { dirs } = parseGestureMount(T14_PATCH, home)
+  // 模拟部署器布局（lib/index.js refreshEntry：包内 skills/ 整树复制到 <dst>/skills/）
+  cpSync(join(T14_ROOT, 'skills'), dirs[0], { recursive: true })
+  let candidates
+  try {
+    const provider = new FileSystemSkillProvider(
+      { get: () => undefined, logger: { warn: () => {}, info: () => {}, error: () => {} } },
+      { signal: new AbortController().signal, invalidate: () => {} },
+      { includeDefaultRoots: false, watch: false, customSkillDirs: dirs, dshHome: home, agentsHome: home, bundledSkillDir: home, providerName: 't14-selftest-e2e' },
+    )
+    candidates = await provider.list({ cwd: home })
+  } catch (err) {
+    t.skip(`宿主 FileSystemSkillProvider 调用面不兼容（${mods}）：${err?.message ?? err}`)
+    return
+  }
+  // 按产物形态注册计数=预期：13 = 2 既有（expert-orchestration/trim-cli）+ 11 手势
+  const names = candidates.map((c) => c.name)
+  assert.equal(names.length, 13, `注册计数=13，实得 ${names.length}：${names.join(', ')}`)
+  assert.equal(new Set(names).size, 13, '无重名')
+  assert.ok(names.includes('expert-orchestration') && names.includes('trim-cli') && names.includes('expert-backend-engineer'), '既有+手势同面注册')
+  assert.equal(candidates.filter((c) => c.invocation?.modelInvocable === false).length, 11, '11 手势 modelInvocable:false')
 })

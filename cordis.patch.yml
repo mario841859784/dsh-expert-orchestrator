@@ -30,6 +30,18 @@
 #   bundled expert-orchestration skill resolves wherever the plugin deployed.
 #   `baseUrl` is NOT usable here: under declaration-row mounts it points at the
 #   preset registry's own resolution base, not at this preset.
+# - `/expert-<name>` zero-token user gestures (v2.7 WP-6b / T14): the
+#   skill-filesystem row below ALSO mounts `skills/expert-gestures/` — one
+#   generated skill per bundled-core expert, frontmatter
+#   `disable-model-invocation: true` (modelInvocable:false). The host pre-step
+#   hook injects such skills ONLY for the `/expert-<name>` user gesture
+#   (SKILL_GESTURE scan → deterministic synthetic user message, zero model
+#   invocations) and never lists them in the model skill catalog; the persona
+#   resolves through the file layer (project > global) before the bundled
+#   expert file — the same chain as summon_expert. The gesture declaration
+#   line is generated from the bundled-core roster by
+#   scripts/gen-preset-declaration.mjs; an empty roster reproduces this patch
+#   WITHOUT the gesture line (and without this note), byte for byte.
 - insert:
   - id: dsh-expert-orchestrator
     name: dsh-expert-orchestrator
@@ -117,6 +129,7 @@
           config:
             customSkillDirs:
               - !!js "process.getBuiltinModule('node:path').join(process.env.DSH_HOME || process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.dsh'), '.agent-presets', 'expert-orchestrator', 'skills')"
+              - !!js "process.getBuiltinModule('node:path').join(process.env.DSH_HOME || process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.dsh'), '.agent-presets', 'expert-orchestrator', 'skills', 'expert-gestures')"
 
         - id: tool-skill
           name: '@deepseek-ai/dsh-tool-skill'

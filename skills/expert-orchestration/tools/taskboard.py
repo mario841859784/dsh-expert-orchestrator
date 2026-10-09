@@ -85,6 +85,25 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
     无证据 reclaim（撤销当前代际防迟到汇报、清 owner 回 ready）。nudge/reclaim/adopt 均落检查点轨迹
     （watchdog: 前缀）；所有变更走既有事件追加路径（watchdog/heartbeat 为写命令，单事件携带全部变更
     任务 after 快照），新字段 heartbeat_at/nudges/nudged_at 随快照折叠只增不减，既有命令输出零变化。
+per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭 opt-in）：
+  DSH_EXPERT_TOOL_BUDGET 显式开启后，执行面写命令（claim/progress/heartbeat/done/fail/own/vote）派发前做
+  事件溯源计数——计数唯一事实源是事件流（验收 a：模型自报不入境，bus 消息/检查点文本/任何叙述性内容
+  都不进计数输入）；seed/budget 系统事件与编排面命令（create/approve/reject/retry/recover/reassign/
+  set_dependencies/verify/watchdog）永不计入，budget 事件不计入同时封死「记录档位→计数增长→再记录」的
+  自激回路。三档语义固定、阈值可配（DSH_EXPERT_TOOL_BUDGET_ALARM/_WRAPUP/_INTERRUPT，默认 200/250/300，
+  须 alarm ≤ wrap-up ≤ interrupt，非法配置 fail-open 整体不启用并 stderr 告警）：告警档 alarm 非阻断
+  （stderr 开销提示+档位章随本命令事件落账）；收尾档 wrap-up 非阻断（收敛指令+章）；中断档 interrupt
+  当场拒绝推进类调用（claim/progress/heartbeat/own）——首次拒绝落 type='budget' 系统事件（interrupt 章+
+  refused 标记+检查点，revision+1）保证档位行为事件可见（验收 b），后续拒绝幂等零事件防刷屏；交付出口
+  done/fail/vote 永不拒绝（中断=强迫交付而非堵死交付）。fail-safe：拒绝发生在任何命令变更之前（命令
+  自身零写），预算事件只追加簿记（不动 status/owner/代际），任务板状态不受损。计数只读绝不写事件流
+  （防计数自激）；计数失败 fail-open 放行（预算是成本护栏非正确性屏障）。budget <id> 只读盘点（--json
+  data.budget 携带 enabled/thresholds/epoch/stamped/budgets，零写零事件）；budget <id> --reset 编排者
+  显式重置计数纪元（跨代累计语义下的唯一放行出口，事件+检查点留痕）。计数 per-(任务,专家) 跨 attempt/
+  跨 reclaim 累计——#20 自动续领复用 claim 路径即自动同受预算约束（reclaim 不清计数）；与 watchdog
+  互补不冲突：watchdog 管时间窗无进展（activity 重臂），预算管调用量发散（事件计数）——interrupt 档
+  拒绝 heartbeat/progress 使窗口自然到期、watchdog nudge→reclaim 接管，二者串联闭环；档位章不触碰
+  updated（档位章不是活动信号，不重臂 watchdog 窗口）。
 验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
   verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
 机器可读结构化输出通道（v2.8 S1，T17）：全局 --json 开关——开启后 stdout 恰一行 JSON 信封、
@@ -158,6 +177,22 @@ REVIEW_ROUND_LIMIT = 2       # m 票评审轮次上限：fail 生效（=needs_re
 # --findings 长度上限（v2.7 T19 回炉，建议③）：码点数，超限硬拒（零事件零落盘）而非静默截断——
 # 截断会丢评审要点且 repair desc 以 findings 为据；口径与断点恢复 prompt 预算（lib RESUME_PROMPT_MAX_CHARS）对齐。
 FINDINGS_MAX_CHARS = 4000
+
+# ── #16 per-(任务,专家) 工具调用硬预算（v2.8 M8-2 / WP-7 ①，T27）─────────────
+# 事件溯源计数（验收 a）：计数唯一事实源=事件流 <板>.events.jsonl——模型自报（bus 消息/检查点
+# 文本/任何叙述性内容）不入境；系统事件（seed/budget）与编排面命令（create/approve/reject/retry/
+# recover/reassign/set_dependencies/verify/watchdog）永不计入，budget 事件不计入同时封死
+# 「记录档位 → 计数增长 → 再记录」的自激回路。三档（验收 b，语义固定、阈值可配）：alarm 告警
+# （非阻断提示+档位章）/ wrap-up 收尾（非阻断收敛指令+章）/ interrupt 中断（推进类调用当场拒绝、
+# 首次拒绝落 budget 事件、交付出口 done/fail/vote 永不拒绝）。默认关闭（DSH_EXPERT_TOOL_BUDGET
+# 显式开启，与 DSH_EXPERT_CWD_LOCK opt-in 同哲学）：未开启时写路径零变化（不读事件流、不加章、
+# 不拒绝）。_BUDGET_EVAL 为 cmd_budget → _structured_data 的 --json data 载荷进程内暂存（_EVT_CTX 同款）。
+BUDGET_TIER_RANK = {'alarm': 1, 'wrap-up': 2, 'interrupt': 3}
+BUDGET_COUNTED_TYPES = frozenset(('claim', 'progress', 'heartbeat', 'done', 'fail', 'own', 'vote'))
+BUDGET_REFUSABLE_TYPES = frozenset(('claim', 'progress', 'heartbeat', 'own'))  # 推进类；done/fail/vote=交付出口
+DEFAULT_BUDGET_THRESHOLDS = {'alarm': 200, 'wrap-up': 250, 'interrupt': 300}
+_BUDGET_EVAL = {'payload': None}
+
 
 
 def _mvote_active(t):
@@ -477,6 +512,8 @@ def _event_args(a):
         return {'files': list(a.files or [])}
     if c == 'own':
         return {'paths': list(a.paths or [])}
+    if c == 'budget':
+        return {'reset': bool(getattr(a, 'reset', False))}
     return {}  # retry/recover/approve/reject 等无附加意图
 
 
@@ -485,7 +522,7 @@ def _event_args(a):
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
 _WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
                          'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve',
-                         'reject', 'vote', 'own'))
+                         'reject', 'vote', 'own', 'budget'))
 
 
 def _arm_event_ctx(a, data):
@@ -1637,6 +1674,283 @@ def cmd_watchdog(a, data, path):
     print(f"watchdog: nudge={nudged} adopt={adopted} reclaim={reclaimed} healthy={healthy}")
 
 
+# ── #16 per-(任务,专家) 工具调用硬预算（v2.8 M8-2 / WP-7 ①，T27）─────────────
+# 执法面唯一落点（专家经 bash 直呼 taskboard.py，JS lib 拦不到也不该拦）；lib/budget.js 只做
+# budget --json 信封的 summon 消费面（#20 自动续领亦复用 claim 路径即自动受预算约束）。
+
+
+def budget_enabled(env=None):
+    """预算总开关（T27 裁定：默认关闭，显式开启——与 DSH_EXPERT_CWD_LOCK 同款 opt-in 语义）：
+    DSH_EXPERT_TOOL_BUDGET 置 '0'/''/未设置 = 关（写路径零变化：不读事件流、不加章、不拒绝），
+    置任何其他值 = 开。预算门含阻断型档位（interrupt 拒绝调用），破坏性默认不由工具单方面
+    引入；排障可临时置 '0'（须在专家派发环境生效——专家进程继承派发时环境）。"""
+    env = os.environ if env is None else env
+    flag = env.get('DSH_EXPERT_TOOL_BUDGET')
+    return not (flag is None or flag == '' or flag == '0')
+
+
+def budget_thresholds(env=None):
+    """三档阈值解析：DSH_EXPERT_TOOL_BUDGET_ALARM / _WRAPUP / _INTERRUPT 各为十进制整数 ≥1；
+    未设置回默认（200/250/300——即使显式开启，缺省阈值也高到不干扰正常任务，二档保守原则）。
+    非法（非整数 / <1 / 违背 alarm ≤ wrap-up ≤ interrupt）返回 None：预算按未启用处理并 stderr
+    告警——配置错误 fail-open，绝不因配置笔误炸掉执行面（对齐 hook 降级语义）。"""
+    env = os.environ if env is None else env
+    th = {}
+    for tier, key in (('alarm', 'DSH_EXPERT_TOOL_BUDGET_ALARM'),
+                      ('wrap-up', 'DSH_EXPERT_TOOL_BUDGET_WRAPUP'),
+                      ('interrupt', 'DSH_EXPERT_TOOL_BUDGET_INTERRUPT')):
+        raw = env.get(key)
+        if raw is None or raw == '':
+            th[tier] = DEFAULT_BUDGET_THRESHOLDS[tier]
+            continue
+        try:
+            v = int(str(raw).strip(), 10)
+        except ValueError:
+            print(f'警告：预算阈值配置非法（{key}={raw!r} 非十进制整数）——预算按未启用处理（fail-open）', file=sys.stderr)
+            return None
+        if v < 1:
+            print(f'警告：预算阈值配置非法（{key}={raw!r} 须 ≥1）——预算按未启用处理（fail-open）', file=sys.stderr)
+            return None
+        th[tier] = v
+    if not (th['alarm'] <= th['wrap-up'] <= th['interrupt']):
+        print(f"警告：预算阈值须 alarm ≤ wrap-up ≤ interrupt（当前 alarm={th['alarm']} "
+              f"wrap-up={th['wrap-up']} interrupt={th['interrupt']}）——预算按未启用处理（fail-open）", file=sys.stderr)
+        return None
+    return th
+
+
+def budget_tier(count, th):
+    """档位判定（语义固定、阈值可配）：计数达到 interrupt 阈值=中断档、达到 wrap-up=收尾档、
+    达到 alarm=告警档（thresholds 已保证 alarm ≤ wrap-up ≤ interrupt，高档优先）。"""
+    if not th:
+        return None
+    if count >= th['interrupt']:
+        return 'interrupt'
+    if count >= th['wrap-up']:
+        return 'wrap-up'
+    if count >= th['alarm']:
+        return 'alarm'
+    return None
+
+
+def budget_counts(events, task_id, epoch=0):
+    """事件溯源计数（验收 a 的唯一计数实现）：只认事件流中可归因到 (task_id, 专家) 的执行面
+    写命令事件。归因规则：vote 以 args.by 落款（陪审员身份，非任务 owner）；其余类型取 after
+    快照 owner（claim 后快照 owner 即认领方；done --by 仅审计不改归因——计数按调用方=owner）。
+    状态护栏：只计任务处于执行/终态（running/done/failed）的触碰——done needs_revision 的原任务
+    回 ready 与自动生成的 repair（pending）、下游改挂（pending/ready）天然不计入，防多任务 after
+    快照的幽灵归因。模型自报不入境：计数输入只有事件流结构化字段，bus 消息/检查点文本永不解析。
+    epoch（纪元）：只计 seq > epoch 的事件（budget --reset 推进，缺省 0=全史累计）。"""
+    counts = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        seq = ev.get('seq')
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq <= epoch:
+            continue
+        typ = ev.get('type')
+        if typ not in BUDGET_COUNTED_TYPES:
+            continue
+        after = ev.get('after')
+        if not isinstance(after, dict):
+            continue
+        args = ev.get('args') if isinstance(ev.get('args'), dict) else {}
+        for tid, snap in after.items():
+            if tid != task_id or not isinstance(snap, dict):
+                continue
+            expert = args.get('by') if typ == 'vote' else snap.get('owner')
+            if not isinstance(expert, str) or not expert:
+                continue
+            status = snap.get('status')
+            if status == 'running' or (typ == 'done' and status == 'done') or (typ == 'fail' and status == 'failed'):
+                counts[expert] = counts.get(expert, 0) + 1
+    return counts
+
+
+def _budget_epoch_of(t):
+    """任务快照中的计数纪元（budget --reset 写入，缺省 0=全史累计）。"""
+    b = (t or {}).get('budget') or {}
+    e = b.get('epoch')
+    return e if isinstance(e, int) and not isinstance(e, bool) and e >= 0 else 0
+
+
+def budget_owner_of(a, t):
+    """预算门的调用方身份：vote 以 --by 落款（陪审员）；claim 取显式 --owner 或既有 owner
+    （gate 时点认领尚未发生，快照 owner 是认领前状态）；其余类型取任务 owner。空串=不可归因
+    （ownerless 任务/无落款投票——预算门跳过，交由命令自身语义处置）。"""
+    if a.cmd == 'vote':
+        return a.by or ''
+    if a.cmd == 'claim':
+        return a.owner or (t.get('owner') or '')
+    return t.get('owner') or ''
+
+
+def _budget_stamp(t, tier, owner, count, th):
+    """档位章（升档时写入任务快照，随所在命令自身事件落账——不加事件、不触 updated：
+    档位章不是活动信号，不重臂 watchdog 窗口，时间面与调用量面互补不串扰）。"""
+    ts = now_ms()
+    t['budget'] = {'tier': tier, 'who': owner, 'count': count, 'at': ts,
+                   **({'epoch': t['budget']['epoch']} if isinstance((t.get('budget') or {}).get('epoch'), int) else {})}
+    stamp = datetime.datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+    action = ('推进类调用此后将被拒绝，交付出口 done/fail 保留' if tier == 'interrupt'
+              else '请收敛：尽快交付 done/fail，勿再展开新阶段' if tier == 'wrap-up'
+              else '注意调用开销')
+    t.setdefault('checkpoints', []).append(
+        {'time': stamp, 'note': f"budget: {tier}（{owner} 执行面调用计数 {count} 达阈值 {th[tier]}）——{action}"})
+
+
+def _append_budget_event(path, data, a, owner, count, th, ts):
+    """追加 type='budget' 系统事件（interrupt 首拒留账）：链式 hash/revision 语义与 commit_event
+    一致（revision+1=一次板写；after 只携带预算簿记快照），视图原子重写。防御：事件流为空时
+    放弃留账——「计数>0 且事件流为空」互斥（计数源自事件流），该形态只可能来自手工损坏，
+    保折叠不变量（首事件必须能作收编种子）优先于留账；拒绝本身照常生效。"""
+    prev_seq, prev_hash = _prev_of_log(path)
+    if prev_seq == 0:
+        print('警告：预算拒绝留账跳过（事件流为空，与计数>0 互斥——疑似手工损坏；拒绝仍生效）', file=sys.stderr)
+        return
+    new_rev = int(data.get('revision', 0)) + 1
+    data['revision'] = new_rev
+    ev = {'seq': prev_seq + 1, 'ts': ts, 'type': 'budget',
+          'args': {'action': 'refuse', 'cmd': a.cmd, 'task': a.id, 'owner': owner,
+                   'count': count, 'tier': 'interrupt', 'thresholds': dict(th)},
+          'after': {a.id: data['tasks'][a.id]},
+          'board_seq': int(data.get('seq', 0)), 'revision': new_rev, 'prev': prev_hash}
+    ev['state_hash'] = _state_hash(data)  # 先算状态 hash，事件 hash 覆盖含 state_hash 的全部其余字段
+    ev['hash'] = _event_hash(ev)
+    _append_event(path, ev)
+    save_view(path, {'tasks': data['tasks'], 'seq': int(data.get('seq', 0)), 'revision': new_rev,
+                     'event_seq': ev['seq'], 'event_state_hash': ev['state_hash']})
+
+
+def _budget_refuse(a, data, path, t, owner, count, th):
+    """interrupt 档拒绝（验收 b 中断档行为面）：推进类调用当场拒绝。首次拒绝落一条
+    type='budget' 系统事件（interrupt 章+refused 标记+检查点）保证「达阈值触发对应档位行为
+    且事件可见」，后续拒绝读快照 refused 标记幂等跳过——拒绝绝不刷事件。fail-safe：拒绝发生
+    在任何命令变更之前（命令自身零写、零事件），预算事件只追加簿记（不动 status/owner/代际/
+    updated——拒绝不重臂 watchdog 窗口，预算卡死的任务交 watchdog 时间面接管）。"""
+    b = t.get('budget') or {}
+    ts = now_ms()
+    if not b.get('refused'):
+        t['budget'] = {**({'epoch': b['epoch']} if isinstance(b.get('epoch'), int) else {}),
+                       'tier': 'interrupt', 'who': owner, 'count': count, 'at': ts,
+                       'refused': True, 'refused_cmd': a.cmd}
+        stamp = datetime.datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('checkpoints', []).append(
+            {'time': stamp,
+             'note': f"budget: interrupt（{owner} 执行面调用计数 {count} 达硬预算 {th['interrupt']}，拒绝 {a.cmd}）——"
+                     '交付出口 done/fail 保留；推进类调用已停，续作交编排者处置（换人/--reset 重置/收口）'})
+        _append_budget_event(path, data, a, owner, count, th, ts)
+    raise BoardError('budget_interrupted', task=a.id, owner=owner, count=count, tier='interrupt',
+                     refused_cmd=a.cmd, threshold=th['interrupt'],
+                     hint='执行面调用已达硬预算（事件流计数），本次调用被拒且未落账；交付出口（done/fail）不受影响'
+                          '——请立即收敛交付，或 fail 交回编排者处置（编排者可 budget --reset 显式重置或改派他人）')
+
+
+def budget_gate(a, data, path):
+    """#16 预算门（写命令派发前，main 派发点调用）：执行面命令（BUDGET_COUNTED_TYPES）按
+    「本次调用前已完成的事件流计数」定档——计数只读（绝不写事件流，防自激）；alarm/wrap-up
+    非阻断（升档章随本命令自身事件落账 + stderr 提示）；interrupt 拒推进类调用（首拒落
+    budget 事件），交付出口 done/fail/vote 永不拒绝。计数/评估内部错误 fail-open（stderr
+    告警放行）——预算是成本护栏非正确性屏障；BoardError（板损坏 unrecoverable）原样上抛
+    不吞。任务不存在/不可归因（ownerless）→ 交由命令自身语义处置，预算门不越位。"""
+    if not budget_enabled():
+        return
+    th = budget_thresholds()
+    if th is None:
+        return  # 阈值非法：budget_thresholds 已 stderr 告警，按未启用处理（fail-open）
+    tid = getattr(a, 'id', None)
+    t = data['tasks'].get(tid) if isinstance(tid, str) else None
+    if not isinstance(t, dict):
+        return
+    owner = budget_owner_of(a, t)
+    if not owner:
+        return
+    try:
+        count = budget_counts(read_events(path), tid, _budget_epoch_of(t)).get(owner, 0)
+    except BoardError:
+        raise  # 板损坏按全局 unrecoverable 语义上抛，绝不吞
+    except Exception as e:
+        print(f'警告：预算计数失败（本次放行，fail-open）：{e}', file=sys.stderr)
+        return
+    tier = budget_tier(count, th)
+    if tier == 'interrupt' and a.cmd in BUDGET_REFUSABLE_TYPES:
+        _budget_refuse(a, data, path, t, owner, count, th)  # 内部 raise BoardError('budget_interrupted')
+        return
+    if tier:
+        announced = BUDGET_TIER_RANK.get((t.get('budget') or {}).get('tier'), 0)
+        if BUDGET_TIER_RANK[tier] > announced:
+            _budget_stamp(t, tier, owner, count, th)  # 升档章随本命令自身事件落账（零额外事件）
+        if tier == 'interrupt':
+            print(f"[budget] 硬预算已到（计数 {count}/{th['interrupt']}）：本调用为交付出口（done/fail），"
+                  '请立即完成交付或 fail 交回编排者', file=sys.stderr)
+        elif tier == 'wrap-up':
+            print(f"[budget] 收尾档（计数 {count}/{th['wrap-up']}）：请立即收敛——尽快交付 done/fail，"
+                  '勿再展开新阶段', file=sys.stderr)
+        else:
+            print(f"[budget] 告警档（计数 {count}/{th['alarm']}）：注意执行面调用开销，保持收敛", file=sys.stderr)
+
+
+def budget_evaluate(data, path, tid):
+    """只读预算评估（验收 a 的机器消费面，cmd_budget 用）：per-(任务,专家) 事件流计数+档位。
+    本函数绝不写事件流/视图——计数读与写隔离，封死「计数动作自身产生事件」的自激回路。"""
+    t = data['tasks'].get(tid)
+    th = budget_thresholds() if budget_enabled() else None
+    counts = {}
+    if th is not None:
+        try:
+            counts = budget_counts(read_events(path), tid, _budget_epoch_of(t))
+        except BoardError:
+            raise
+        except Exception as e:
+            print(f'警告：预算计数读取失败（按 0 计，fail-open）：{e}', file=sys.stderr)
+    budgets = [{'owner': owner, 'count': counts[owner], 'tier': budget_tier(counts[owner], th)}
+               for owner in sorted(counts)]
+    return {'enabled': th is not None, 'thresholds': th, 'epoch': _budget_epoch_of(t),
+            'stamped': (t.get('budget') or None) if isinstance(t, dict) else None,
+            'budgets': budgets}
+
+
+def cmd_budget(a, data, path):
+    """budget <id>（#16，T27）：per-(任务,专家) 工具调用硬预算盘点/重置。缺省（无 --reset）为
+    只读评估——零写零事件（计数以事件流为唯一事实源，读路径绝不产生事件，验收 (a) 反自激）；
+    --json 信封 data.budget 携带 {enabled,thresholds,epoch,stamped,budgets:[{owner,count,tier}]}
+    （v2.8 S1 机器消费面契约，报告型命令 data 恒非空）。--reset 为编排者显式重置：计数纪元
+    推进到当前事件 seq（此前历史计数不再计入——per-(任务,专家) 跨代累计语义下的唯一放行出口，
+    事件+检查点留痕），档位章与拒绝标记一并清除。budget 自身是编排面命令，不计入任何专家
+    预算、也不受预算门约束。"""
+    t = get_task(data, a.id)
+    if a.reset:
+        ts = now_ms()
+        epoch = int(data.get('event_seq', 0) or 0)
+        t['budget'] = {'epoch': epoch, 'reset_at': ts}
+        t['updated'] = ts
+        stamp = datetime.datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('checkpoints', []).append(
+            {'time': stamp,
+             'note': f'budget: reset（编排者显式重置计数纪元 → 事件 seq≥{epoch} 重新计数；档位章与拒绝标记已清除）'})
+        save(path, data)
+        show(t)
+        print(f'预算纪元已重置: {a.id}（事件 seq≥{epoch} 重新计数）')
+    payload = budget_evaluate(data, path, a.id)
+    _BUDGET_EVAL['payload'] = payload
+    th = payload.get('thresholds') or {}
+    if payload.get('enabled'):
+        print(f"budget {a.id}: 开关=开（alarm={th.get('alarm')} wrap-up={th.get('wrap-up')} "
+              f"interrupt={th.get('interrupt')}）纪元=seq≥{payload.get('epoch', 0)}")
+    else:
+        print(f'budget {a.id}: 开关=关（DSH_EXPERT_TOOL_BUDGET 未开启，计数与档位不生效；'
+              '开启后执行面命令按事件流计数）')
+    if payload.get('stamped'):
+        s = payload['stamped']
+        print(f"  档位章: {s.get('tier')} by {s.get('who')} @计数{s.get('count')}"
+              + ('（已发生 interrupt 拒绝）' if s.get('refused') else ''))
+    for row in payload.get('budgets') or []:
+        print(f"  {row['owner']}: 已计 {row['count']} 次 → 档位 {row['tier'] or '（未达档）'}")
+    if not (payload.get('budgets') or []):
+        print('  （无归因计数——仅执行面命令 claim/progress/heartbeat/done/fail/own/vote 计入，'
+              '编排面与系统事件不计）')
+
+
 def cmd_recover(a, data, path):
     """recover：全部 running 任务回 ready（会话中断后的兜底恢复）。m 票任务（T20 回炉，评审重要-1）：
     回 ready 即重新评审——清空票箱、重置轮次，防旧票跨轮残留跨入新轮计票（假 pass 生效或假僵局）；
@@ -1967,6 +2281,16 @@ def _structured_data(a, data):
     install/uninstall-hook 不支持。"""
     if a.cmd == 'list':
         return {'tasks': [data['tasks'][k] for k in sorted(data['tasks'], key=lambda x: int(x[1:]))]}
+    if a.cmd == 'budget':
+        # #16（T27）：预算盘点是报告型命令——data 恒携带 budget 载荷（enabled/thresholds/epoch/
+        # stamped/budgets），不落「报告型命令 data={}」的机器消费面问题（前轮评审备忘(2)）。
+        out = {}
+        tid = getattr(a, 'id', None)
+        if isinstance(tid, str) and tid in data.get('tasks', {}):
+            out['task'] = data['tasks'][tid]
+        if _BUDGET_EVAL.get('payload') is not None:
+            out['budget'] = _BUDGET_EVAL['payload']
+        return out
     tid = getattr(a, 'id', None)
     if isinstance(tid, str) and tid in data.get('tasks', {}):
         return {'task': data['tasks'][tid]}
@@ -2131,6 +2455,9 @@ def main():
     p = sub.add_parser('verify'); p.add_argument('id'); p.add_argument('files', nargs='*', help='文件范围清单；缺省=重算既有回执输出 fresh/stale'); add_write_args(p); p.set_defaults(fn=cmd_verify)
     p = sub.add_parser('own', help='工件归属门禁（#22）：登记任务工件归属；与其他开放任务冲突时具名拒绝 artifact_owned')
     p.add_argument('id'); p.add_argument('paths', nargs='+', help='工件路径清单（文件/目录均可，声明意图不要求已存在）'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_own)
+    p = sub.add_parser('budget', help='#16 工具调用硬预算（默认关闭，DSH_EXPERT_TOOL_BUDGET 显式开启）：per-(任务,专家) '
+                                      '事件流计数与三档档位盘点；--reset 编排者显式重置计数纪元（事件留痕）')
+    p.add_argument('id'); p.add_argument('--reset', action='store_true', help='重置预算计数纪元（编排者裁决；写命令：清档位章与拒绝标记，事件+检查点留痕）'); add_write_args(p); p.set_defaults(fn=cmd_budget)
     p = sub.add_parser('replay'); p.set_defaults(fn=cmd_replay,
                                                  help='显式从事件流重放折叠状态并重写视图文件（幂等；崩溃演练/人工核对）')
     p = sub.add_parser('_hook-check', help=argparse.SUPPRESS)  # commit-msg hook 内部入口，非用户命令
@@ -2164,6 +2491,10 @@ def main():
             data = load(path)
             check_revision(a, data)  # 写命令的 CAS 校验，锁内针对最新落盘状态（读命令无该参数，透传为不校验）
             _arm_event_ctx(a, data)  # 事件溯源：写命令派发前武装事件上下文（pre 快照/收编种子）
+            if a.cmd in BUDGET_COUNTED_TYPES:
+                # #16 预算门（T27）：升档章随本命令自身事件落账；interrupt 档在此当场拒绝
+                # （首拒落 budget 系统事件）——拒绝发生在命令体之前，命令自身零写零事件。
+                budget_gate(a, data, path)
             if json_mode:
                 # S1 结构化通道：人类可读 stdout 整体静默（_JsonSink 吞掉），信封是唯一 stdout 载荷；
                 # stderr（视图重建告警/门禁告警等诊断面）不受影响，退出码语义与缺省完全一致。

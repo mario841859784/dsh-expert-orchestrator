@@ -41,10 +41,12 @@ import {
   rosterCandidates,
   sanitizePersona,
   splitPersona,
+  summonBudgetHint,
   trustedBusMessages,
   withLessonHint,
   withProfileConstraints,
 } from '../lib/tools.js'
+import { budgetMaybeEnabled, budgetNoticeFromEnvelope } from '../lib/budget.js'
 import {
   EXPERT_PROFILE_FIELDS,
   EXPERT_PROFILES_FILENAME,
@@ -6626,4 +6628,341 @@ test('T26 taskboard own 工件归属门禁（真实子进程）：冲突具名�
   assert.match(escBlocked.stdout, /artifact_owned/)
   // 事件溯源：own 随事件流折叠一致
   ok('replay')
+})
+
+// ── T27 #16 per-(任务,专家) 工具调用硬预算（v2.8 M8-2 / WP-7 ①）────────────────
+// 用例构造视角（自指断言盲区防御）：全部以独立消费方视角用真实子进程产生事件流 fixture，
+// 断言计数与档位行为只看事件流/折叠视图产物；「模型自报不计入」= 显式负向用例（bus 自报
+// 消息/检查点文本中的数字均不入境）。开关沿 T26 惯例：DSH_EXPERT_TOOL_BUDGET 默认关闭
+// opt-in，DSH_EXPERT_TOOL_BUDGET_ALARM/_WRAPUP/_INTERRUPT 三档阈值。
+
+const BUDGET_ENV_KEYS = ['DSH_EXPERT_TOOL_BUDGET', 'DSH_EXPERT_TOOL_BUDGET_ALARM',
+  'DSH_EXPERT_TOOL_BUDGET_WRAPUP', 'DSH_EXPERT_TOOL_BUDGET_INTERRUPT']
+
+/** T27 预算 env 守卫：清掉部署环境可能注入的预算开关/阈值（隔离基线），结束恢复。 */
+const guardT27BudgetEnv = (t) => {
+  const saved = {}
+  for (const k of BUDGET_ENV_KEYS) {
+    saved[k] = process.env[k]
+    delete process.env[k]
+  }
+  t.after(() => {
+    for (const k of BUDGET_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  })
+}
+
+const makeT27BudgetBoard = (t, label) => {
+  const dir = mkdtempSync(join(tmpdir(), `t27-budget-${label}-`))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const boardPath = join(dir, '.expert-taskboards', 'default.json') // 标准板位（locateAutoClaimBoard 可定位）
+  const tb = (args, env = {}) => {
+    const r = spawnSync('python3', [TASKBOARD, '--board', boardPath, ...args], {
+      encoding: 'utf-8', env: { ...process.env, ...env },
+    })
+    let json = null
+    try { json = JSON.parse((r.stdout ?? '').trim()) } catch { /* 非信封输出（多行人类可读）不解析 */ }
+    return { ...r, json }
+  }
+  const ok = (...args) => {
+    const r = tb(args)
+    assert.equal(r.status, 0, args.join(' ') + ' → ' + r.stderr)
+    return r
+  }
+  const board = () => JSON.parse(readFileSync(boardPath, 'utf-8'))
+  const events = () => readFileSync(boardPath + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  return { dir, boardPath, tb, ok, board, events }
+}
+
+test('T27 #16 (a) 计数以事件流为准：执行面命令逐次计入、编排面/系统事件不计入；--json data.budget 机器消费面（data 恒非空）', (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok } = makeT27BudgetBoard(t, 'count')
+  ok('create', '任务A', '--owner', '后端工程师')
+  ok('claim', 'T1', '后端工程师') // 1
+  ok('progress', 'T1', 'p1') // 2
+  ok('progress', 'T1', 'p2') // 3
+  ok('heartbeat', 'T1') // 4
+  ok('own', 'T1', 'x.py') // 5
+  ok('done', 'T1', '交付') // 6
+  // 编排面/系统命令落事件但不归因（create/recover/watchdog）
+  ok('create', '任务B')
+  ok('recover')
+  ok('watchdog', '--window-sec', '1800')
+  // 缺省（未开启）：data.budget 恒存在（报告型命令 data={} 问题面不存在），enabled=false 不计数
+  const off = JSON.parse(ok('--json', 'budget', 'T1').stdout)
+  assert.equal(off.ok, true)
+  assert.equal(off.cmd, 'budget')
+  assert.equal(off.data.budget.enabled, false, '缺省=不启用预算（opt-in）')
+  assert.equal(off.data.budget.thresholds, null)
+  assert.deepEqual(off.data.budget.budgets, [], '关闭时不计数')
+  // 开启后评估：恰好 6 次（claim+2 progress+heartbeat+own+done），编排面事件一次不多计
+  const ev = JSON.parse(tb(['--json', 'budget', 'T1'], { DSH_EXPERT_TOOL_BUDGET: '1' }).stdout)
+  assert.equal(ev.data.budget.enabled, true)
+  assert.deepEqual(ev.data.budget.thresholds, { alarm: 200, 'wrap-up': 250, interrupt: 300 }, '缺省阈值回默认（高阈值不干扰正常任务）')
+  assert.deepEqual(ev.data.budget.budgets, [{ owner: '后端工程师', count: 6, tier: null }])
+  // ownerless 任务（create 未带 owner 且从未被 claim）无归因
+  const ev2 = JSON.parse(tb(['--json', 'budget', 'T2'], { DSH_EXPERT_TOOL_BUDGET: '1' }).stdout)
+  assert.deepEqual(ev2.data.budget.budgets, [])
+  // 档位判定与阈值联动（只读评估不改状态）
+  const ev3 = JSON.parse(tb(['--json', 'budget', 'T1'], {
+    DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '3',
+    DSH_EXPERT_TOOL_BUDGET_WRAPUP: '5', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '6',
+  }).stdout)
+  assert.deepEqual(ev3.data.budget.budgets, [{ owner: '后端工程师', count: 6, tier: 'interrupt' }])
+})
+
+test('T27 #16 (a) 负向：模型自报不计入——bus 自报消息与检查点文本中的数字均不入境', (t) => {
+  guardT27BudgetEnv(t)
+  const { dir, tb, ok } = makeT27BudgetBoard(t, 'selfreport')
+  ok('create', '任务A', '--owner', '后端工程师')
+  ok('claim', 'T1', '后端工程师')
+  ok('progress', 'T1', 'p1')
+  // bus 自报：专家在信箱自称「已调用 999 次」——bus 消息不是事件流，计数不闻不问
+  const bs = spawnSync('python3', [BUS, 'send', '--from', '后端工程师', '--to', 'coordinator', '--task', 'T1',
+    '--attempt', 'a27-selfreport', '--subject', '进度自报',
+    '--body', '模型自报：我已调用 999 次工具，预算将尽'], { cwd: dir, encoding: 'utf-8' })
+  assert.equal(bs.status, 0, bs.stderr)
+  const ev = JSON.parse(tb(['--json', 'budget', 'T1'], { DSH_EXPERT_TOOL_BUDGET: '1' }).stdout)
+  assert.deepEqual(ev.data.budget.budgets, [{ owner: '后端工程师', count: 2, tier: null }],
+    'bus 自报不计入（仍为事件流真实计数 2）')
+  // 检查点文本里的数字也不入境：progress 文本自称 5000 次 → 计数只 +1（=3），与文本无关
+  ok('progress', 'T1', '自报：本专家已调用 5000 次工具')
+  const ev2 = JSON.parse(tb(['--json', 'budget', 'T1'], { DSH_EXPERT_TOOL_BUDGET: '1' }).stdout)
+  assert.equal(ev2.data.budget.budgets[0].count, 3, '文本数字不进计数（仅调用本身 +1）')
+})
+
+test('T27 #16 (b) 三档：alarm/wrap-up 升档章+检查点随命令事件可见；interrupt 拒推进类（首拒落 budget 事件、幂等零事件）、交付出口 done 永不拒；fail-safe 板无损', async (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok, board, events } = makeT27BudgetBoard(t, 'tiers')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '2', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '4', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '6' }
+  ok('create', '任务A', '--owner', '后端工程师')
+  // 序数 1（claim，前置计数 0）→ 无档位章
+  const rClaim = tb(['claim', 'T1', '后端工程师'], th)
+  assert.equal(rClaim.status, 0, rClaim.stderr)
+  assert.equal(board().tasks.T1.budget, undefined, '未达阈值无章')
+  // 序数 2（progress，前置计数 1）→ 仍无章；序数 3（前置 2=ALARM）→ alarm 章 + stderr 提示
+  assert.equal(tb(['progress', 'T1', 'p1'], th).status, 0)
+  const rAlarm = tb(['progress', 'T1', 'p2'], th)
+  assert.equal(rAlarm.status, 0, rAlarm.stderr)
+  assert.ok(rAlarm.stderr.includes('[budget] 告警档'), rAlarm.stderr)
+  assert.equal(board().tasks.T1.budget.tier, 'alarm')
+  assert.equal(board().tasks.T1.budget.count, 2)
+  // 前置计数 3（< wrap-up 4）：档内维持不加新章
+  assert.equal(tb(['progress', 'T1', 'p3'], th).status, 0)
+  assert.equal(board().tasks.T1.budget.tier, 'alarm', '档内维持不重复盖章')
+  // 序数 5（前置 4=WRAPUP）→ wrap-up 章 + 收敛指令
+  const rWrap = tb(['progress', 'T1', 'p4'], th)
+  assert.equal(rWrap.status, 0, rWrap.stderr)
+  assert.ok(rWrap.stderr.includes('[budget] 收尾档'), rWrap.stderr)
+  assert.equal(board().tasks.T1.budget.tier, 'wrap-up')
+  // 升档章随命令自身事件落账（验收 b 事件可见）：对应 progress 事件的 after 快照携带 budget
+  const alarmEv = events().find((e) => e.type === 'progress' && e.after?.T1?.budget?.tier === 'alarm')
+  const wrapEv = events().find((e) => e.type === 'progress' && e.after?.T1?.budget?.tier === 'wrap-up')
+  assert.ok(alarmEv && wrapEv, 'alarm/wrap-up 章均可在事件流中观测')
+  assert.ok(board().tasks.T1.checkpoints.some((c) => c.note.startsWith('budget: alarm')))
+  assert.ok(board().tasks.T1.checkpoints.some((c) => c.note.startsWith('budget: wrap-up')))
+  // 序数 6（前置 5=WRAPUP 维持）→ 仍 wrap-up；序数 7（前置 6=INTERRUPT）→ 推进类调用被拒：
+  // 具名 budget_interrupted + 首拒落 budget 系统事件
+  assert.equal(tb(['progress', 'T1', 'p5'], th).status, 0)
+  assert.equal(board().tasks.T1.budget.tier, 'wrap-up', '档内维持不重复盖章')
+  const beforeRefuse = events().length
+  const refuse = tb(['progress', 'T1', 'p6'], th)
+  assert.equal(refuse.status, 1)
+  assert.equal(refuse.json.error, 'budget_interrupted')
+  assert.equal(refuse.json.count, 6)
+  assert.equal(refuse.json.refused_cmd, 'progress')
+  assert.ok(refuse.json.hint.includes('done/fail'), '拒绝信息含交付出口指引')
+  const budgetEvs = events().filter((e) => e.type === 'budget')
+  assert.equal(budgetEvs.length, 1, '首次拒绝恰落一条 budget 系统事件（事件可见）')
+  assert.equal(budgetEvs[0].args.action, 'refuse')
+  assert.equal(budgetEvs[0].args.tier, 'interrupt')
+  assert.equal(budgetEvs[0].after.T1.budget.refused, true)
+  assert.equal(budgetEvs[0].after.T1.status, 'running', '拒绝事件不动任务状态（fail-safe）')
+  assert.equal(board().tasks.T1.budget.refused, true)
+  assert.equal(board().tasks.T1.status, 'running')
+  // 幂等：后续拒绝零事件（不刷屏）
+  const refuse2 = tb(['heartbeat', 'T1'], th)
+  assert.equal(refuse2.status, 1)
+  assert.equal(refuse2.json.error, 'budget_interrupted')
+  assert.equal(events().length, beforeRefuse + 1, '再次拒绝零新事件（幂等防刷屏）')
+  // 交付出口：interrupt 档下 done 永不拒（中断=强迫交付而非堵死交付）
+  const rDone = tb(['done', 'T1', '收尾交付'], th)
+  assert.equal(rDone.status, 0, rDone.stdout + rDone.stderr)
+  assert.ok(rDone.stderr.includes('[budget] 硬预算已到'), rDone.stderr)
+  assert.equal(board().tasks.T1.status, 'done')
+  // fail-safe：全链状态无损（hash 链校验经 replay/status/budget 全通过）
+  assert.equal(tb(['status']).status, 0)
+  assert.equal(tb(['replay']).status, 0)
+  const ev = JSON.parse(tb(['--json', 'budget', 'T1'], th).stdout)
+  assert.equal(ev.ok, true)
+  assert.equal(ev.data.budget.stamped.refused, true)
+  const progressEvents = events().filter((e) => e.type === 'progress')
+  assert.equal(progressEvents.length, 5, '被拒的调用未落任何事件（p6 不存在）')
+})
+
+test('T27 #16 默认关闭：未开启时高计数零盖章零拒绝；DSH_EXPERT_TOOL_BUDGET=0 显式关同效', (t) => {
+  guardT27BudgetEnv(t)
+  const cases = [
+    { label: 'offdefault', env: {} },
+    { label: 'off0', env: { DSH_EXPERT_TOOL_BUDGET: '0', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '1', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '1' } },
+  ]
+  for (const c of cases) {
+    const { tb, ok, board } = makeT27BudgetBoard(t, c.label)
+    ok('create', '任务A', '--owner', '后端工程师')
+    ok('claim', 'T1', '后端工程师')
+    for (let i = 1; i <= 10; i++) ok('progress', 'T1', `p${i}`) // 11 次执行面调用，远超任何小阈值
+    const r = tb(['show', 'T1'], c.env)
+    assert.equal(r.status, 0, r.stderr)
+    assert.ok(!r.stderr.includes('[budget]'), '零预算提示')
+    assert.equal(board().tasks.T1.budget, undefined, '零档位章（写路径零变化）')
+    assert.equal(tb(['progress', 'T1', 'p11'], c.env).status, 0, '零拒绝')
+    const ev = JSON.parse(tb(['--json', 'budget', 'T1'], c.env).stdout)
+    assert.equal(ev.data.budget.enabled, false)
+  }
+})
+
+test('T27 #16 阈值配置：非法 fail-open 整体不启用+stderr 告警（非整数/<1/乱序）', (t) => {
+  guardT27BudgetEnv(t)
+  const badCases = [
+    { label: 'nan', env: { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: 'abc', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '2', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '3' }, why: '非十进制整数' },
+    { label: 'zero', env: { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '0', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '2', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '3' }, why: '须 ≥1' },
+    { label: 'order', env: { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '5', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '3', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '3' }, why: 'alarm ≤ wrap-up ≤ interrupt' },
+  ]
+  for (const c of badCases) {
+    const { tb, ok } = makeT27BudgetBoard(t, c.label)
+    ok('create', '任务A', '--owner', '后端工程师')
+    const rClaim = tb(['claim', 'T1', '后端工程师'], c.env)
+    assert.equal(rClaim.status, 0, rClaim.stderr)
+    assert.ok(rClaim.stderr.includes('预算按未启用处理'), `非法阈值 stderr 告警（${c.why}）: ${rClaim.stderr}`)
+    // fail-open：执行面照常，零章零拒
+    const rProgress = tb(['progress', 'T1', 'p1'], c.env)
+    assert.equal(rProgress.status, 0, rProgress.stderr)
+    assert.ok(!rProgress.stderr.includes('[budget]'))
+    const ev = JSON.parse(tb(['--json', 'budget', 'T1'], c.env).stdout)
+    assert.equal(ev.data.budget.enabled, false, '非法配置=整体不启用')
+    assert.equal(ev.data.budget.thresholds, null)
+  }
+})
+
+test('T27 #16 纪元重置与 #20 接口：reclaim 后同专家 re-claim 计数跨代累计且达阈值被拒（自动续领同受预算）；--reset 显式重置后重新计数', async (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok, board, events } = makeT27BudgetBoard(t, 'epoch')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '2', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '3', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '4' }
+  ok('create', '任务A', '--owner', '后端工程师')
+  assert.equal(tb(['claim', 'T1', '后端工程师'], th).status, 0) // 1（pre 0 无章）
+  assert.equal(tb(['progress', 'T1', 'p1'], th).status, 0) // 2（pre 1 < 2 无章）
+  assert.equal(tb(['progress', 'T1', 'p2'], th).status, 0) // 3（pre 2=ALARM 章）
+  assert.equal(tb(['progress', 'T1', 'p3'], th).status, 0) // 4（pre 3=WRAPUP 章）
+  assert.equal(board().tasks.T1.budget.tier, 'wrap-up')
+  // watchdog reclaim（窗口 0 + max-nudges 0 直接升级；无落盘完成证据 → reclaim 回 ready）
+  await new Promise((r) => setTimeout(r, 30)) // 让活动时点落后窗口（跨进程时钟最小间隔之上）
+  const wd = tb(['watchdog', '--window-sec', '0', '--max-nudges', '0'], th)
+  assert.equal(wd.status, 0, wd.stderr)
+  assert.ok(wd.stdout.includes('reclaim'), wd.stdout)
+  assert.equal(board().tasks.T1.status, 'ready')
+  assert.equal(board().tasks.T1.owner, '')
+  // #20 接口断言（自动续领形态=同专家 re-claim）：计数跨代累计=4 ≥ INTERRUPT → claim 同样被拒
+  // ——自动续领复用 claim 路径即自动受预算约束，无法绕过预算空转。
+  const reClaim = tb(['claim', 'T1', '后端工程师'], th)
+  assert.equal(reClaim.status, 1)
+  assert.equal(reClaim.json.error, 'budget_interrupted')
+  assert.equal(reClaim.json.refused_cmd, 'claim')
+  assert.equal(reClaim.json.count, 4, '跨代累计计数（reclaim 不清预算）')
+  // 编排者显式重置（跨代累计语义下唯一放行出口）：纪元推进 → 计数归零 → re-claim 放行
+  const reset = tb(['budget', 'T1', '--reset'], th)
+  assert.equal(reset.status, 0, reset.stderr)
+  assert.equal(board().tasks.T1.budget.tier, undefined, '档位章清除')
+  assert.equal(board().tasks.T1.budget.refused, undefined, '拒绝标记清除')
+  assert.ok(Number.isInteger(board().tasks.T1.budget.epoch) && board().tasks.T1.budget.epoch > 0)
+  assert.ok(board().tasks.T1.checkpoints.some((c) => c.note.startsWith('budget: reset')))
+  const resetEvs = events().filter((e) => e.type === 'budget' && e.args?.reset === true)
+  assert.equal(resetEvs.length, 1, 'reset 写命令自身事件留痕（type=budget, args.reset）')
+  // 重置后重新计数：claim+progress 放行，计数只在纪元内累计（评估档位按纪元内计数现算）
+  assert.equal(tb(['claim', 'T1', '后端工程师'], th).status, 0)
+  assert.equal(tb(['progress', 'T1', 'p1-renewed'], th).status, 0)
+  const ev = JSON.parse(tb(['--json', 'budget', 'T1'], th).stdout)
+  assert.deepEqual(ev.data.budget.budgets, [{ owner: '后端工程师', count: 2, tier: 'alarm' }],
+    '纪元外历史（4 次）不再计入，纪元内 claim+progress=2（2≥ALARM 现算 alarm 档）')
+  assert.equal(ev.data.budget.epoch, board().tasks.T1.budget.epoch)
+})
+
+test('T27 #16 JS 消费面：budgetNoticeFromEnvelope 三档翻译/未启用/坏信封 fail-open；budgetMaybeEnabled 开关', (t) => {
+  guardT27BudgetEnv(t)
+  const mk = (budget) => ({ ok: true, cmd: 'budget', data: { task: { id: 'T1' }, budget }, revision: 1 })
+  const th = { alarm: 200, 'wrap-up': 250, interrupt: 300 }
+  // 三档文案（owner 命中才提示；档位语义与 taskboard.py 一一对应）
+  const alarm = budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 200, tier: 'alarm' }] }), '后端工程师')
+  assert.ok(alarm.includes('【预算】') && alarm.includes('alarm 告警档') && alarm.includes('200/200'))
+  const wrap = budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 250, tier: 'wrap-up' }] }), '后端工程师')
+  assert.ok(wrap.includes('wrap-up 收尾档') && wrap.includes('立即收敛'))
+  const interrupt = budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 301, tier: 'interrupt' }] }), '后端工程师')
+  assert.ok(interrupt.includes('interrupt 档') && interrupt.includes('done/fail 仍开放') && interrupt.includes('--reset'))
+  // 未达档/owner 不匹配/未启用/坏信封 → ''（零变化 fail-open）
+  assert.equal(budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 3, tier: null }] }), '后端工程师'), '')
+  assert.equal(budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '甲', count: 300, tier: 'interrupt' }] }), '后端工程师'), '')
+  assert.equal(budgetNoticeFromEnvelope(mk({ enabled: false, thresholds: null, epoch: 0, stamped: null, budgets: [] }), '后端工程师'), '')
+  assert.equal(budgetNoticeFromEnvelope({ ok: false, error: 'command_failed' }, '后端工程师'), '')
+  assert.equal(budgetNoticeFromEnvelope(null, '后端工程师'), '')
+  assert.equal(budgetNoticeFromEnvelope('garbage', '后端工程师'), '')
+  assert.equal(budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th }), '后端工程师'), '', '缺 budgets 数组 fail-open')
+  // 开关语义与 taskboard.py budget_enabled 逐字一致
+  assert.equal(budgetMaybeEnabled({}), false)
+  assert.equal(budgetMaybeEnabled({ DSH_EXPERT_TOOL_BUDGET: '' }), false)
+  assert.equal(budgetMaybeEnabled({ DSH_EXPERT_TOOL_BUDGET: '0' }), false)
+  assert.equal(budgetMaybeEnabled({ DSH_EXPERT_TOOL_BUDGET: '1' }), true)
+  assert.equal(budgetMaybeEnabled({ DSH_EXPERT_TOOL_BUDGET: 'on' }), true)
+})
+
+test('T27 #16 summonBudgetHint：预算开启时消费 budget --json 信封产提示行；关闭/无任务 id/板不可定位/任务不存在全 fail-open 空串', async (t) => {
+  guardT27BudgetEnv(t)
+  const { dir, tb, ok } = makeT27BudgetBoard(t, 'hint')
+  ok('create', '任务A', '--owner', '后端工程师')
+  ok('claim', 'T1', '后端工程师')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '2', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '9' }
+  assert.equal(tb(['progress', 'T1', 'p1'], th).status, 0) // pre 0 → 无档
+  assert.equal(tb(['progress', 'T1', 'p2'], th).status, 0) // pre 1=ALARM → 告警档
+  // 板唯一定位 + 显式 id：达档 owner 命中 → 提示行（计数 3=claim+2 progress，2=WRAPUP → wrap-up 档；
+  // env 显式注入——生产路径读 process.env，runTaskboard 同 env 贯通到子进程）
+  const on = await summonBudgetHint('继续推进 T1', '后端工程师', dir, 15000, th)
+  assert.ok(on.includes('【预算】') && on.includes('wrap-up 收尾档'), on)
+  // 预算关闭（默认态）：零提示
+  const off = await summonBudgetHint('继续推进 T1', '后端工程师', dir, 15000)
+  assert.equal(off, '')
+  // 无任务 id / 板不可定位 / 任务不存在：fail-open 空串
+  assert.equal(await summonBudgetHint('无任务引用', '后端工程师', dir, 15000, th), '')
+  assert.equal(await summonBudgetHint('T1 继续', '后端工程师', join(dir, 'no-such-sub'), 15000, th), '')
+  assert.equal(await summonBudgetHint('T999 继续', '后端工程师', dir, 15000, th), '')
+})
+
+test('T27 #16 summon 接线 E2E：告警档续派附【预算】提示行（answer 尾，非阻断）；预算关闭零提示', async (t) => {
+  guardT26Env(t)
+  guardT27BudgetEnv(t)
+  const f = makeT26Fixture(t, 'budget-e2e')
+  const boardPath = join(f.root, '.expert-taskboards', 'default.json')
+  const tb = (args, env = {}) =>
+    spawnSync('python3', [TASKBOARD, '--board', boardPath, ...args], { cwd: f.root, encoding: 'utf-8', env: { ...process.env, ...env } })
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '2', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '9' }
+  assert.equal(tb(['create', '任务A', '--owner', '甲']).status, 0)
+  assert.equal(tb(['claim', 'T1', '甲']).status, 0)
+  assert.equal(tb(['progress', 'T1', 'p1'], th).status, 0)
+  assert.equal(tb(['progress', 'T1', 'p2'], th).status, 0) // 计数 3=claim+2 progress，2=WRAPUP → 收尾档
+  // 预算开启：summon 续派（任务书引用 T1）→ answer 尾附【预算】提示行
+  process.env.DSH_EXPERT_TOOL_BUDGET = th.DSH_EXPERT_TOOL_BUDGET
+  process.env.DSH_EXPERT_TOOL_BUDGET_ALARM = th.DSH_EXPERT_TOOL_BUDGET_ALARM
+  process.env.DSH_EXPERT_TOOL_BUDGET_WRAPUP = th.DSH_EXPERT_TOOL_BUDGET_WRAPUP
+  process.env.DSH_EXPERT_TOOL_BUDGET_INTERRUPT = th.DSH_EXPERT_TOOL_BUDGET_INTERRUPT
+  try {
+    const r = await f.summon.execute({ expert: '甲', task: '请继续 T1 的收尾工作' }, { agent: {} })
+    assert.ok(r.answer.includes('【预算】'), r.answer)
+    assert.ok(r.answer.includes('wrap-up 收尾档'), r.answer)
+    assert.ok(r.answer.includes('【auto-claim】'), 'auto-claim 提示行共存（同通道）')
+  } finally {
+    for (const k of BUDGET_ENV_KEYS) delete process.env[k]
+  }
+  // 预算关闭：同任务续派零提示（默认态零变化）
+  const r2 = await f.summon.execute({ expert: '甲', task: '请继续 T1 的收尾工作' }, { agent: {} })
+  assert.ok(!r2.answer.includes('【预算】'), r2.answer)
+  assert.ok(r2.answer.includes('【auto-claim】'), 'auto-claim 行为不受影响')
 })

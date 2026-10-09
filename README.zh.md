@@ -50,6 +50,15 @@
 | 🧙 **原生专家工具** | `list_experts`（浏览合并花名册，紧凑/展开双模式）、`summon_expert`（白纸精召：persona 经 sanitizePersona 注入，解析链 exact→aliases→无歧义 title，shadowed/disabled 拒绝，task 8000 码点上限）、`summon_experts`（批量 ≤8、并发 4、部分成功语义）。递归防护：spawn 子代理带六项 toolFilter deny（不可再召唤专家、不可嵌套 subagent/fork、不可 workflow），工具 schema default 3 纵深兜底——单层委派，无失控专家树 |
 | 📚 **每专家经验池 + persona 方法论分层**（v2.4.0） | summon 自动尾部注入 `expert-lessons/<slug>.md` 该专家历史教训（≤2000 字符，按字符截断，2K 上限，无命中零变化）；persona frontmatter `method:` + `<!-- methods-cut -->` 瘦身注入+按需深读指针（Top-5 bundled-core 已分层，fail-safe 全量回退，合入经预注册 A/B 实验门禁，档案见 `docs/internal/experiments/`）；`list_experts` 显式标注跨源 conflict/shadowed，自定义专家删除支持清理。已知限制：设置面板「清空已删除」按钮 UI 待接线（RPC 契约已就位） |
 
+## 🆕 v2.8 新特性
+
+| 特性 | 说明 |
+|------|------|
+| 🛡️ **委派安全门禁**（WP-7） | 围绕 `summon_expert` 的四层可审计执法：**origin chain 链路溯源**——每次派发在任务书末行追加标记，链上出现重复 (专家, cwd) 对即拒绝且报错含完整链路、深度由链长推导（默认开启，A/B 实验档案见 `docs/internal/experiments/`）；**四小门禁**——工件归属登记（`taskboard.py own`，冲突具名 `artifact_owned`）、A→B→A 委派振荡告警（非阻断）、effort 能力预检、per-cwd 写锁（`DSH_EXPERT_CWD_LOCK=1`，同 cwd 第二位写型专家当场拒绝而非排队）；**per-专家工具调用硬预算**（`DSH_EXPERT_TOOL_BUDGET`，默认关闭）——事件溯源计数（模型自报不计入）、三档（告警/收尾/中断——交付出口永不拒绝）、`budget <id> [--reset]`；**idle-edge 自动续领**（`DSH_EXPERT_IDLE_RECLAIM=1`，默认关闭）——最后一位在途专家成功收尾时经既有 claim 路径以 owner=编排者 领取 ready 无 owner 任务，领取≠派工、绝不自动召唤专家 |
+| 🧩 **per-专家档案与 prompt 瘦身**（WP-6 余项） | `~/.dsh/expert-profiles.json`（全局层）+ `<当前目录>/.dsh/expert-profiles.json`（项目层覆盖）按专家调 model / toolFilter 白黑名单 / skills / MCP server 白名单 / effort，每次 summon 现场重读（热改文件下次召唤即生效）；toolFilter 收窄与递归防护 deny 求并不放宽、空 allow fail-closed；persona 中 `<!-- tools: … -->…<!-- /tools -->` 标记段在点名工具对该专家全部不可见时整段剪除 |
+| 🧾 **评审台账收口** | v2.7 评审后置 14 项台账全部处置：`taskboard.py --json` 结构化信封、bus 信箱根约定成文、归档同秒碰撞唯一后缀、视图超前/损坏归档板升格 `unrecoverable`，另四项书面裁定留档 |
+| 🔌 **兼容性** | `engines.dsh` / `@deepseek-ai/dsh-tools` 区间自 2.6.0 起未变（静态 semver 矩阵复验，记录见 `docs/internal/verification/`）；PROTOCOL 刷新清单维持 14 项 |
+
 ## 🆕 v2.7 新特性
 
 | 特性 | 说明 |
@@ -125,7 +134,7 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
       name: '/绝对路径/dsh-expert-orchestrator/lib/index.js'
 ```
 
-升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`、`skills/expert-gestures`，共 11 项），且 `skills/expert-orchestration/experts/` 现只含 11 个 bundled core 专家、按 PROTOCOL 随版本刷新；USER_DATA（`lessons.md`、`expert-sources/`——下载的来源包与合并花名册）只缺才补、绝不覆盖。升级到本版本后首次运行时，历史上适配过的专家副本会一次性迁移进 `expert-sources/legacy-adapted/`（冻结本地来源，默认启用）而非被删除。宿主层本地挂载不受该覆盖影响。
+升级语义：插件 `VERSION` 变更时会用安装包内容覆盖 PROTOCOL 文件（`agent.cordis.yml`、`preset.yml`、`skills/expert-orchestration/SKILL.md`、`skills/expert-orchestration/routing.md`、`skills/expert-orchestration/tools/taskboard.py`、`skills/expert-orchestration/tools/bus.py`、`skills/trim-cli/SKILL.md`、`skills/trim-cli/manifest.json`、`skills/trim-cli/entries`、`skills/trim-cli/reference`、`skills/expert-gestures`），外加现只含 11 个 bundled core 专家、按 PROTOCOL 随版本刷新的 `skills/expert-orchestration/experts/`，以及 `skills/expert-orchestration/source-registry.json` 与 `skills/expert-orchestration/roster-aliases.json`——共 14 项（PROTOCOL 刷新）。USER_DATA（`lessons.md`、`expert-sources/`——下载的来源包与合并花名册）只缺才补、绝不覆盖。升级到本版本后首次运行时，历史上适配过的专家副本会一次性迁移进 `expert-sources/legacy-adapted/`（冻结本地来源，默认启用）而非被删除。宿主层本地挂载不受该覆盖影响。
 
 存量迁移提示：若此前在 `agent.cordis.yml` 中手工加过 `expert-orchestrator-deploy` 条目，升级前应先迁移到宿主层 `cordis.patch.yml`，否则 VERSION 变更刷新会用出厂版覆盖该条目、静默断掉本地链路。
 

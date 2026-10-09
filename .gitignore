@@ -6,6 +6,9 @@ node_modules/
 .expert-lessons.md
 .expert-taskboard.json.tmp
 
+# 任务板目录（cwd 唯一板解析会在仓库内留下 board.json/.lock 运行态残件，不入库；T40）
+.expert-taskboards/
+
 # gh CLI state 残留目录，防误提交
 .local/
 

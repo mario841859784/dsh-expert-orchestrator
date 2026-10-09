@@ -5346,6 +5346,140 @@ test('T17/S1 (j4) lib 解析面结构化守卫：auto-claim 走 --json 信封通
   assert.ok(TOOLS_SRC.includes('parseTaskboardEnvelope'), '信封解析器应在位')
 })
 
+// ── T2 (v2.9) --json 报告型命令 data 载荷补齐（T32-2 遗留）：watchdog/replay ──
+// 独立消费方视角：真实子进程 + 真实板 fixture；人类面输出与 --json data 字段交叉核对（同源断言），
+// 并与板态/视图/事件流独立对账——防「测试断言实现自己写的字段名」空转（评审经验移交项）。
+test('T2 (v2.9) watchdog --json data：五计数与人类面汇总行同源、与板态一致；信封带 revision（无变更轮次不动）', (t) => {
+  // 真实板 fixture：直接落 JSON 板文件（无事件流 → 首写收编），时间戳受控 → stale/healthy 判定确定；
+  // 同构 fixture 双份：A 走人类面、B 走 --json 面，产出「人类面 vs data」同源核对（两份各自实测）。
+  const mkFixture = (label) => {
+    const dir = makeBoardDir(t, label)
+    mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
+    mkdirSync(join(dir, '.expert-bus', 'coordinator'), { recursive: true })
+    const now = Date.now()
+    const mk = (id, title, owner, attempt) => ({
+      id, title, owner, dep: [], desc: `完成标准 ${id}`, status: 'running',
+      created: now - 120_000, updated: now - 60_000, summary: '', fail: '', attempt_id: attempt,
+    })
+    writeFileSync(join(dir, BOARD_REL), JSON.stringify({
+      tasks: { T1: mk('T1', '任务A', '甲', 'att-w1'), T2: mk('T2', '任务B', '乙', 'att-w2') },
+      seq: 2, revision: 2,
+    }))
+    // T1 的落盘完成报告（adopt 证据：task/attempt_id/from 硬约束 + [交付] 强证据，免词汇启发）
+    writeFileSync(join(dir, '.expert-bus', 'coordinator', 'mev-t2a.json'), JSON.stringify(
+      { id: 'mev-t2a', task: 'T1', attempt_id: 'att-w1', from: '甲', subject: '[交付] T1 完成', body: '产物: x', ts: now }))
+    return dir
+  }
+  const SUMMARY_RE = /watchdog: nudge=(\d+) adopt=(\d+) reclaim=(\d+) healthy=(\d+)/
+  const HEALTHY_RE = /watchdog: (\d+) 个 running 任务全部健康/
+  const dirA = mkFixture('t2-wd-human')
+  const dirB = mkFixture('t2-wd-json')
+  // 三轮确定性序列：①双 nudge（changed=2）→ ②nudge 重臂后全健康（无变更早退）→ ③升级 T1 adopt / T2 reclaim
+  const rounds = [
+    { args: ['--window-sec', '5', '--max-nudges', '1'], changed: 2, revision: 3 },
+    { args: ['--window-sec', '5', '--max-nudges', '1'], changed: 0, revision: 3 },
+    { args: ['--window-sec', '0', '--max-nudges', '1'], changed: 2, revision: 4 },
+  ]
+  const humanOuts = rounds.map(({ args }) => {
+    const r = runTb(dirA, ['watchdog', ...args])
+    assert.equal(r.code, 0, r.stdout + r.stderr)
+    return r.stdout
+  })
+  const jsonEnvs = rounds.map(({ args }) => {
+    const r = runTb(dirB, ['--json', 'watchdog', ...args])
+    assert.equal(r.code, 0, r.stdout + r.stderr)
+    assert.equal(r.stderr, '', '--json 面 stderr 零污染')
+    assert.equal(r.stdout.trim().split('\n').length, 1, 'stdout 恰一行 JSON 信封')
+    return r.json
+  })
+  // ① data 五计数 == 人类面计数（有变更轮走汇总行、无变更轮走「全部健康」行——两分支各自同源核对）
+  jsonEnvs.forEach((env, i) => {
+    assert.equal(env.ok, true)
+    assert.equal(env.cmd, 'watchdog')
+    const sm = humanOuts[i].match(SUMMARY_RE)
+    if (sm) {
+      assert.deepEqual(env.data,
+        { adopted: Number(sm[2]), reclaimed: Number(sm[3]), nudged: Number(sm[1]), healthy: Number(sm[4]), changed: rounds[i].changed },
+        `第 ${i + 1} 轮 data 与人类面汇总行不同源: ${JSON.stringify(env.data)}`)
+    } else {
+      const hm = humanOuts[i].match(HEALTHY_RE)
+      assert.ok(hm, `人类面既无汇总行也无健康行: ${JSON.stringify(humanOuts[i])}`)
+      assert.deepEqual(env.data,
+        { adopted: 0, reclaimed: 0, nudged: 0, healthy: Number(hm[1]), changed: 0 },
+        `第 ${i + 1} 轮 data 与人类面健康行不同源: ${JSON.stringify(env.data)}`)
+    }
+    assert.equal(env.data.changed, env.data.nudged + env.data.adopted + env.data.reclaimed, 'changed=三类变更之和')
+  })
+  // ② 信封 revision：写轮次自增、无变更轮次不动（S1 现有信封逻辑——watchdog 带 revision，用例锁定）
+  assert.equal(jsonEnvs[0].revision, 3, '首写收编（seed revision 延续）+ 本命令事件 → 2+1')
+  assert.equal(jsonEnvs[1].revision, 3, '无变更轮次 revision 不动')
+  assert.equal(jsonEnvs[2].revision, 4)
+  // ③ data 与板态一致（独立消费方视角）：adopt=1 ↔ T1 done（adopt 审计落档）；reclaim=1 ↔ T2 回 ready
+  const showTask = (id) => JSON.parse(runTb(dirB, ['--json', 'show', id]).stdout).data.task
+  const t1 = showTask('T1')
+  assert.equal(t1.status, 'done')
+  assert.ok(t1.summary.startsWith('[watchdog adopt]'), t1.summary)
+  const t2 = showTask('T2')
+  assert.equal(t2.status, 'ready')
+  assert.equal(t2.owner, '', 'reclaim 释放 owner')
+  assert.deepEqual(t2.attempt_revoked, ['att-w2'], 'reclaim 撤销代际')
+  // ④ 第④分支（无 running 任务）：data 恒非空全零，revision 不动
+  const w4 = runTb(dirB, ['--json', 'watchdog', '--window-sec', '5'])
+  assert.deepEqual(w4.json.data, { adopted: 0, reclaimed: 0, nudged: 0, healthy: 0, changed: 0 })
+  assert.equal(w4.json.revision, 4)
+  const w4h = runTb(dirA, ['watchdog', '--window-sec', '5'])
+  assert.ok(w4h.stdout.includes('watchdog: 无 running 任务'), w4h.stdout)
+})
+
+test('T2 (v2.9) replay --json data：四字段与人类面重放行同源、与视图/事件流独立对账一致；空板 event_seq=0、state_hash 为空串', (t) => {
+  const dir = makeBoardDir(t, 't2-replay-json')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
+  ok('create', '任务A', '--owner', '甲')
+  ok('create', '任务B')
+  ok('claim', 'T1', '甲')
+  ok('progress', 'T1', '阶段1')
+  // 人类面重放行是既有契约：解析 event_seq/revision/任务数/state_hash（16 位截断显示）
+  const human = ok('replay').stdout
+  const hm = human.match(/已从事件流重放折叠状态: event_seq=(\d+) revision=(\d+) 任务数=(\d+) state_hash=([0-9a-f]{16})/)
+  assert.ok(hm, `人类面重放行形态变化: ${JSON.stringify(human)}`)
+  // --json 面：四字段与人类行同源（state_hash 全值以人类行 16 位截断为前缀交叉核对）
+  const jr = runTb(dir, ['--json', 'replay'])
+  assert.equal(jr.code, 0)
+  assert.equal(jr.stderr, '')
+  assert.equal(jr.stdout.trim().split('\n').length, 1, 'stdout 恰一行 JSON 信封')
+  const env = jr.json
+  assert.equal(env.ok, true)
+  assert.equal(env.cmd, 'replay')
+  assert.equal(env.data.event_seq, Number(hm[1]))
+  assert.equal(env.data.revision, Number(hm[2]))
+  assert.equal(env.data.task_count, Number(hm[3]))
+  assert.match(env.data.state_hash, /^[0-9a-f]{64}$/)
+  assert.ok(env.data.state_hash.startsWith(hm[4]), `state_hash 全值与人类面 16 位截断不同源: ${env.data.state_hash}`)
+  assert.equal(env.revision, env.data.revision, '信封顶层 revision 与 data.revision 同值（S1：replay 带 revision）')
+  // 独立对账①：命令刚重写的折叠视图与 data 一致（消费方不信任命令自述，直接读盘核对）
+  const view = readBoard(join(dir, BOARD_REL))
+  assert.equal(view.event_seq, env.data.event_seq)
+  assert.equal(view.event_state_hash, env.data.state_hash)
+  assert.equal(view.revision, env.data.revision)
+  assert.equal(Object.keys(view.tasks).length, env.data.task_count)
+  // 独立对账②：事件流末事件与 data 一致；replay 幂等——零事件增长，再跑 data 不变
+  const evPath = join(dir, eventsRelOf(BOARD_REL))
+  const evTextBefore = readFileSync(evPath, 'utf-8')
+  const evs = evTextBefore.trim().split('\n').map((l) => JSON.parse(l))
+  assert.equal(evs.length, env.data.event_seq, '事件数=event_seq（replay 不追加事件）')
+  assert.equal(evs.at(-1).seq, env.data.event_seq)
+  assert.equal(evs.at(-1).state_hash, env.data.state_hash)
+  const again = runTb(dir, ['--json', 'replay'])
+  assert.deepEqual(again.json.data, env.data, '幂等：重放 data 不变')
+  assert.equal(readFileSync(evPath, 'utf-8'), evTextBefore, '事件流逐字节未变')
+  // 空板边界：无事件流 → event_seq=0/state_hash=''（与人类面占位口径一致），信封仍带 revision
+  const empty = makeBoardDir(t, 't2-replay-empty')
+  const er = runTb(empty, ['--json', 'replay'])
+  assert.equal(er.code, 0)
+  assert.deepEqual(er.json.data, { event_seq: 0, revision: 0, task_count: 0, state_hash: '' })
+  assert.equal(er.json.revision, 0)
+})
+
 test('T17/A3 视图超前升格 unrecoverable：视图 event_seq 大于事件流末 seq → 拒绝回滚重建（rc=1，事件流与视图零改动、写命令同拒）；簿记非整数仍走通用手改分支', (t) => {
   const dir = makeBoardDir(t, 'viewahead')
   const boardPath = join(dir, BOARD_REL)

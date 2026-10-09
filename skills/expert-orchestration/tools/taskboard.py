@@ -1491,6 +1491,10 @@ def cmd_vote(a, data, path):
 #   （watchdog/heartbeat 均为写命令，一个事件携带全部变更任务的 after 快照），既有命令 stdout/stderr
 #   零变化；新字段 heartbeat_at/nudges/nudged_at 随任务快照折叠，向后兼容只增不减。
 WATCHDOG_ACTIVITY_FIELDS = ('heartbeat_at', 'nudged_at')
+# _WATCHDOG_EVAL 为 cmd_watchdog → _structured_data 的 --json data 载荷进程内暂存
+# （v2.9 T2，_BUDGET_EVAL 同款先例）：五计数在扫描循环内统计，载荷与人类面汇总行
+# （watchdog: nudge=N adopt=N reclaim=N healthy=N）同源，无变更早退分支同样填充。
+_WATCHDOG_EVAL = {'payload': None}
 
 
 def _reset_nudges(t):
@@ -1653,6 +1657,10 @@ def cmd_watchdog(a, data, path):
             changed += 1
             lines.append(f"{tid} [running] owner=（原 {orig_owner}）无进展 {stale_s}s nudge={nudges}/{max_nudges}"
                          f" → 已 reclaim（{why_line}；attempt {att or '（无）'} 撤销，转 ready 待重新派工）")
+    # --json data 载荷（v2.9 T2）：扫描一结束即暂存，无变更早退与有变更两分支同源覆盖
+    #（adopted/reclaimed/nudged/healthy/changed 与人类面汇总行同口径，changed=本轮实际变更数）。
+    _WATCHDOG_EVAL['payload'] = {'adopted': adopted, 'reclaimed': reclaimed,
+                                 'nudged': nudged, 'healthy': healthy, 'changed': changed}
     if not lines:
         if healthy:
             print(f"watchdog: {healthy} 个 running 任务全部健康（window={a.window_sec}s 内均有活动证据，未做任何变更）")
@@ -2276,11 +2284,26 @@ def _structured_data(a, data):
     """--json 信封的 data 载荷（v2.8 S1 机器消费方契约）：
     任务中心命令（args 带 id 且板上存在）给完整任务对象——取自折叠视图权威缓存，与事件流重放
     逐字段一致，含全部簿记字段（未来新增字段对机器消费方透明可见，这正是结构化通道的意义：
-    不再依赖展示层文本行格式）；list 给 id 升序任务数组；其余命令给空对象（cmd/revision 已在
-    信封顶层）。boards 走专用载荷（main 内先行处理）；--json 仅支持任务板子命令面，
+    不再依赖展示层文本行格式）；list 给 id 升序任务数组；watchdog 给五计数报告载荷、replay 给
+    重放对账载荷（v2.9 T2 补齐报告型命令 data 消费面，字段名沿 snake_case 既有风格，消除
+    「报告型命令 data={}」问题）；其余命令给空对象（cmd/revision 已在信封顶层）。
+    boards 走专用载荷（main 内先行处理）；--json 仅支持任务板子命令面，
     install/uninstall-hook 不支持。"""
     if a.cmd == 'list':
         return {'tasks': [data['tasks'][k] for k in sorted(data['tasks'], key=lambda x: int(x[1:]))]}
+    if a.cmd == 'watchdog':
+        # v2.9 T2：cmd_watchdog 扫描后暂存的五计数（与人类面汇总行同源；fn 必经路径，
+        # 防御性 None 检查仅在异常序下退回旧空对象形态，不新增失败面）。
+        out = _WATCHDOG_EVAL.get('payload')
+        return out if isinstance(out, dict) else {}
+    if a.cmd == 'replay':
+        # v2.9 T2：重放对账载荷——四字段与人类面重放行同源同表达式（state_hash 给全值，
+        # 16 字符截断是人类面显示约束；机器消费方拿全值可与事件流末事件 state_hash 直接对账；
+        # 无事件流的旧板/空板 event_seq=0、state_hash=''，与人类面占位口径一致）。
+        return {'event_seq': int(data.get('event_seq', 0)),
+                'revision': int(data.get('revision', 0)),
+                'task_count': len(data['tasks']),
+                'state_hash': data.get('event_state_hash') or ''}
     if a.cmd == 'budget':
         # #16（T27）：预算盘点是报告型命令——data 恒携带 budget 载荷（enabled/thresholds/epoch/
         # stamped/budgets），不落「报告型命令 data={}」的机器消费面问题（前轮评审备忘(2)）。

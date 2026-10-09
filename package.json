@@ -1,7 +1,7 @@
 {
   "name": "dsh-expert-orchestrator",
   "description": "Expert Orchestrator — multi-agent orchestration agent preset for DeepSeek Harness (dsh): triage → PM planning → delegate implementation to domain experts via a merged roster (summon_expert), dependency-DAG taskboard, file message bus, tiered delivery gates, experience pooling. 专家编排模式：多智能体任务编排，分诊、PM 先行规划、专家委派、依赖 DAG 任务板、消息总线并行落盘、分级交付门禁、经验池沉淀。",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {

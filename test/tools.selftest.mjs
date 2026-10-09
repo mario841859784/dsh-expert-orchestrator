@@ -14,9 +14,11 @@ import { fileURLToPath } from 'node:url'
 import {
   autoClaimSummonedTasks,
   buildResumePrompt,
+  claimFailureReason,
   collectResumeProgress,
   createSettlementWatcher,
   detectResumeSeam,
+  expandMcpWhitelistDeny,
   EXPERT_TOOLS_DENY_LIST,
   expertLessonSlug,
   extractPersonaMethod,
@@ -28,17 +30,31 @@ import {
   neutralizePromptTemplates,
   parseBusMessages,
   parseTaskIds,
+  parseToolGuidanceSections,
+  pruneUnavailableToolSections,
   registerExpertTools,
   RESUMABLE_STOP_REASONS,
   RESUME_PROGRESS_MAX_ITEMS,
   RESUME_PROMPT_MAX_CHARS,
   resolveExpert,
+  resolveProfileEffect,
   rosterCandidates,
   sanitizePersona,
   splitPersona,
   trustedBusMessages,
   withLessonHint,
+  withProfileConstraints,
 } from '../lib/tools.js'
+import {
+  EXPERT_PROFILE_FIELDS,
+  EXPERT_PROFILES_FILENAME,
+  globalProfilesPath,
+  loadExpertProfiles,
+  parseExpertProfile,
+  profileForExpert,
+  projectProfilesPath,
+  profilesEnabled,
+} from '../lib/expert-profiles.js'
 import { remoteCleanupCustomDeleted, remoteDeleteCustom, remoteSaveCustom, SOURCE_ID_RE } from '../lib/index.js'
 import {
   FILE_LAYER_SOURCE_ID,
@@ -5526,4 +5542,380 @@ test('T17/T12-minor from 分隔符留档：from 名含「 subject=」分隔串�
   assert.equal(tricky[0].from, '甲', '落款被截断（留档的解析边界）')
   assert.equal(tricky[0].subject, 'x subject=真标题')
   // 失配方向 fail-closed：截断后的 from 无法命中含分隔串的 owner 名（其合法汇报同样失配，两侧同损不扩权）
+})
+
+// ── T15（v2.8 M8-1）：#19 per-expert 异构档案热调 + #17 prompt 瘦身 + T32 备忘(1) ──
+//
+// 断言视角纪律（工具自测自指盲区）：全部以「独立消费方」视角写——纯函数直测 +
+// summon 集成用 mock 宿主捕获 start spec（捕获的是实现传给宿主的 payload，而非
+// 实现自身的输出回读），档案文件用 os.tmpdir() 真实读写验证热调/回滚语义。
+
+/** 档案夹具：root（tmp 工作区）+ dst（最小花名册）+ 双层档案路径 + 写入帮手。 */
+const makeProfileFixture = (t, label) => {
+  const root = mkdtempSync(join(tmpdir(), `t15-profiles-${label}-`))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dst = join(root, 'dst')
+  mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({ core: [{ source: 'bundled-core', file: 'a.md', name: '测试专家' }] }))
+  const homePath = join(root, 'home', EXPERT_PROFILES_FILENAME)
+  const projectPath = join(root, 'ws', '.dsh', EXPERT_PROFILES_FILENAME)
+  const writeProfiles = (experts, path = projectPath) => {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, JSON.stringify({ experts }, null, 2))
+  }
+  return { root, dst, homePath, projectPath, writeProfiles }
+}
+
+/** 档案开关 env 守卫：清掉 DSH_EXPERT_PROFILES（防部署环境注入干扰断言）。 */
+const guardProfilesEnv = (t) => {
+  const saved = process.env.DSH_EXPERT_PROFILES
+  delete process.env.DSH_EXPERT_PROFILES
+  t.after(() => {
+    if (saved === undefined) delete process.env.DSH_EXPERT_PROFILES
+    else process.env.DSH_EXPERT_PROFILES = saved
+  })
+}
+
+/** summon 捕获夹具：mock 宿主捕获每次 start 的完整 spec。registry=工具注册表面，
+ *  schemaNames=ctx.tools.schemas() 枚举面（缺省不提供），capabilities=provider 能力。 */
+const makeProfileSummonCtx = ({ registry = null, schemaNames = null, capabilities = {} } = {}) => {
+  const descriptors = []
+  const specs = []
+  const tools = { register: (d) => descriptors.push(d) }
+  if (registry) tools.get = (n) => (registry.has(n) ? {} : undefined)
+  if (schemaNames) tools.schemas = () => schemaNames.map((name) => ({ name }))
+  return {
+    descriptors,
+    specs,
+    ctx: {
+      tools,
+      subagents: {
+        getProvider: () => ({ capabilities: { persona: true, toolFilter: true, ...capabilities } }),
+        start: async (_provider, opts) => {
+          specs.push(opts)
+          return { result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }
+        },
+      },
+    },
+  }
+}
+
+const summonProfileExpert = async (descriptors, task = '完成任务书') => {
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  return summon.execute({ expert: '测试专家', task }, { agent: {} })
+}
+
+test('T15 #19 档案 (d) 热调：改 model 后新 summon 即生效、回滚恢复原值；快照语义在途 spec 不变', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'hotswap')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  // ① 档案 model=A → 本次 summon 生效
+  f.writeProfiles({ 测试专家: { model: 'model-A' } })
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[0].agentOptions?.model, 'model-A')
+  // ② 运行时热改 model=B（改文件，无重启）→ 新 summon 即生效
+  f.writeProfiles({ 测试专家: { model: 'model-B' } })
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[1].agentOptions?.model, 'model-B')
+  // ③ 快照语义：①的 spec 不被热改触碰（在途 summon/run 不打断——构造性边界）
+  assert.equal(specs[0].agentOptions?.model, 'model-A')
+  // ④ 回滚（恢复原值 A）→ 新 summon 恢复原值
+  f.writeProfiles({ 测试专家: { model: 'model-A' } })
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[2].agentOptions?.model, 'model-A')
+})
+
+test('T15 #19 档案 (d) 回滚到无档案：删除档案文件后新 summon 回到零档案行为（无 agentOptions 键）', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'rollback-none')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { model: 'model-A' } })
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[0].agentOptions?.model, 'model-A')
+  rmSync(f.projectPath) // 回滚 = 恢复原状（档案删除）
+  await summonProfileExpert(descriptors)
+  assert.ok(!('agentOptions' in specs[1]), '无档案 summon 不得携带 agentOptions 键')
+})
+
+test('T15 #19 档案 model 在未声明 agentOptions 能力的 provider 上降级可见（旧代宿主），summon 照常', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'oldgen')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: {} }) // 无 agentOptions 能力
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { model: 'model-A' } })
+  const r = await summonProfileExpert(descriptors)
+  assert.equal(r.answer, 'ok') // summon 照常（降级不阻断）
+  assert.ok(!('agentOptions' in specs[0]), '缺能力 provider 不得传 agentOptions（宿主 assertCapabilities 会拒收）')
+})
+
+test('T15 #17 (c) 收窄剪除：档案 tools.deny 收窄后 persona 中对应 guidance 段不出现，可用工具段保留', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'prune')
+  const registry = new Set(['bash', 'read', 'write'])
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry, capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath }, getExpertContentImpl: () => ({ content: '引言\n\n<!-- tools: bash -->\n用 bash 跑构建与测试。\n<!-- /tools -->\n\n<!-- tools: read -->\n用 read 读文件。\n<!-- /tools -->\n\n结尾' }) })
+  f.writeProfiles({ 测试专家: { tools: { deny: ['bash'] } } })
+  await summonProfileExpert(descriptors)
+  const persona = specs[0].persona
+  assert.ok(!persona.includes('用 bash 跑构建与测试'), '不可用工具的 guidance 段必须剪除')
+  assert.ok(!persona.includes('<!-- tools: bash -->'), '剪除段连标记一并移除')
+  assert.ok(persona.includes('用 read 读文件'), '可用工具的 guidance 段保留')
+  assert.ok(persona.includes('<!-- tools: read -->'), '保留段的标记原样保留（源文本最小变换）')
+  assert.ok(persona.includes('引言') && persona.includes('结尾'), '段外正文不受影响')
+})
+
+test('T15 #17 (c) 组段语义：段内点名工具全部不可见才剪；任一可见即保留（trim.js ②）', async (t) => {
+  const persona = 'A\n\n<!-- tools: bash, read -->\n构建与阅读指引。\n<!-- /tools -->\n\nB'
+  // bash 不可见、read 可见 → 保留
+  assert.ok(pruneUnavailableToolSections(persona, (n) => n === 'read').includes('构建与阅读指引'))
+  // 两个都不可见 → 剪
+  const pruned = pruneUnavailableToolSections(persona, () => false)
+  assert.ok(!pruned.includes('构建与阅读指引'))
+  assert.ok(pruned.includes('A') && pruned.includes('B'))
+})
+
+test('T15 #19 零变化回归：无档案（或档案未配置该专家）时 summon payload 与 persona 逐字节既有行为', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'zerofile')
+  const rawPersona = 'persona 正文\n\n第二行'
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(EXPERT_TOOLS_DENY_LIST), capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: rawPersona }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  // ① 档案文件不存在
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[0].persona, sanitizePersona(rawPersona)) // persona 逐字节（= sanitize 全管线，无额外变换）
+  assert.deepEqual(specs[0].toolFilter.deny, [...EXPERT_TOOLS_DENY_LIST]) // 递归防护 deny 原样
+  assert.ok(!('agentOptions' in specs[0]))
+  assert.ok(!specs[0].persona.includes('专家档案约束'))
+  // ② 档案文件存在但只配置了别的专家 → 该专家仍零变化
+  f.writeProfiles({ 其他专家: { model: 'model-X' } })
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[1].persona, sanitizePersona(rawPersona))
+  assert.ok(!('agentOptions' in specs[1]))
+  assert.deepEqual(specs[1].toolFilter.deny, [...EXPERT_TOOLS_DENY_LIST])
+})
+
+test('T15 #19 档案 tools.allow 白名单 + 递归防护永不放宽（deny 求并）；探测过滤未注册名', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'allow')
+  const registry = new Set(['read', 'bash', ...EXPERT_TOOLS_DENY_LIST])
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry, capabilities: {} })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { tools: { allow: ['read', 'bash', '不存在工具'] } } })
+  await summonProfileExpert(descriptors)
+  assert.deepEqual(specs[0].toolFilter.allow, ['read', 'bash']) // 未注册名探测剔除
+  for (const n of EXPERT_TOOLS_DENY_LIST) assert.ok(specs[0].toolFilter.deny.includes(n), `递归防护 ${n} 永不放宽`)
+})
+
+test('T15 #19 档案 mcp 白名单：非白名单 server 的 mcp__* 工具进 deny，白名单 server 工具不收；#17 联动剪除', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'mcp')
+  const schemaNames = ['bash', 'mcp__serverA__t1', 'mcp__serverA__t2', 'mcp__serverB__t2']
+  const registry = new Set(schemaNames)
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry, schemaNames, capabilities: {} })
+  registerExpertTools(ctx, {
+    dst: f.dst,
+    autoClaimCwd: f.root,
+    profilesPaths: { homePath: f.homePath, projectPath: f.projectPath },
+    getExpertContentImpl: () => ({ content: '<!-- tools: mcp__serverB__t2 -->\nB server 指引。\n<!-- /tools -->\n\n<!-- tools: mcp__serverA__t1 -->\nA server 指引。\n<!-- /tools -->' }),
+  })
+  f.writeProfiles({ 测试专家: { mcp: ['serverA'] } })
+  await summonProfileExpert(descriptors)
+  assert.ok(specs[0].toolFilter.deny.includes('mcp__serverB__t2'))
+  assert.ok(!specs[0].toolFilter.deny.includes('mcp__serverA__t1'))
+  assert.ok(!specs[0].toolFilter.deny.includes('mcp__serverA__t2'))
+  assert.ok(!specs[0].toolFilter.deny.includes('bash'), '非 mcp 工具不受 mcp 白名单影响')
+  assert.ok(!specs[0].persona.includes('B server 指引'), '被白名单挡掉的 mcp 工具 guidance 段联动剪除（#17）')
+  assert.ok(specs[0].persona.includes('A server 指引'))
+})
+
+test('T15 #19 档案 mcp 白名单在无工具枚举面（旧代宿主）下降级可见不生效；skills 白名单注入提示级约束行', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'mcp-no-seam')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(['bash', ...EXPERT_TOOLS_DENY_LIST]) }) // 无 schemas()；探测面须含递归防护名（未注册名会被既有探测纪律剔除）
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { mcp: ['serverA'], skills: ['expert-orchestration', 'trim-cli'] } })
+  await summonProfileExpert(descriptors)
+  assert.ok(!specs[0].toolFilter.deny.some((n) => n.startsWith('mcp__')), '无枚举面不得猜 deny 名（restrict 对未知名 fail-fast）')
+  for (const n of EXPERT_TOOLS_DENY_LIST) assert.ok(specs[0].toolFilter.deny.includes(n), n) // 递归防护照常
+  assert.ok(specs[0].persona.includes('【专家档案约束】可用技能白名单：expert-orchestration、trim-cli；白名单之外的技能一律不要调用。'))
+})
+
+test('T15 #19 档案 DSH_EXPERT_PROFILES=0 整体关闭（排障开关沿 DSH_EXPERT_RESUME 惯例）', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'killswitch')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { model: 'model-A', skills: ['a'] } })
+  process.env.DSH_EXPERT_PROFILES = '0'
+  try {
+    await summonProfileExpert(descriptors)
+    assert.ok(!('agentOptions' in specs[0]))
+    assert.ok(!specs[0].persona.includes('专家档案约束'))
+  } finally {
+    delete process.env.DSH_EXPERT_PROFILES
+  }
+})
+
+test('T15 #19 档案未知字段告警忽略、非法字段字段级丢弃、合法字段照常生效', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'unknownfield')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { model: 'model-A', typoField: 'x', tools: { allow: '不是数组' } } })
+  await summonProfileExpert(descriptors)
+  assert.equal(specs[0].agentOptions?.model, 'model-A') // 合法字段照常生效
+  assert.ok(!('allow' in specs[0].toolFilter), '非法 allow 不得进入 toolFilter')
+})
+
+test('T15 #19 双层级覆盖：同名专家项目层覆盖全局层；全局层独有条目保留', () => {
+  const root = mkdtempSync(join(tmpdir(), 't15-layers-'))
+  try {
+    const homePath = join(root, 'home', EXPERT_PROFILES_FILENAME)
+    const projectPath = join(root, 'ws', '.dsh', EXPERT_PROFILES_FILENAME)
+    mkdirSync(dirname(homePath), { recursive: true })
+    mkdirSync(dirname(projectPath), { recursive: true })
+    writeFileSync(homePath, JSON.stringify({ experts: { 甲: { model: 'global-A' }, 乙: { model: 'global-B' } } }))
+    writeFileSync(projectPath, JSON.stringify({ experts: { 甲: { model: 'project-A' } } }))
+    const merged = loadExpertProfiles({ homePath, projectPath })
+    assert.equal(merged['甲'].model, 'project-A') // 项目层覆盖
+    assert.equal(merged['乙'].model, 'global-B') // 全局层独有保留
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('T15 #19 档案加载容错：文件缺失静默（正常态零告警零变化）、JSON 损坏整层跳过、坏条目跳过不炸', () => {
+  const root = mkdtempSync(join(tmpdir(), 't15-tolerant-'))
+  try {
+    const homePath = join(root, 'home', EXPERT_PROFILES_FILENAME)
+    const projectPath = join(root, 'ws', '.dsh', EXPERT_PROFILES_FILENAME)
+    // 两层均缺失 → {} 且零告警（正常态）
+    let warned = []
+    assert.deepEqual(loadExpertProfiles({ homePath, projectPath }, (m) => warned.push(m)), {})
+    assert.deepEqual(warned, [])
+    // 损坏层 → 告警 + 该层跳过，另一层照常
+    mkdirSync(dirname(homePath), { recursive: true })
+    writeFileSync(homePath, '{broken json')
+    mkdirSync(dirname(projectPath), { recursive: true })
+    writeFileSync(projectPath, JSON.stringify({ experts: { 测试专家: { model: 'm' }, 坏专家: '不是对象' } }))
+    warned = []
+    const merged = loadExpertProfiles({ homePath, projectPath }, (m) => warned.push(m))
+    assert.equal(merged['测试专家'].model, 'm') // 好条目照常（全局层损坏被跳过，项目层生效）
+    assert.ok(!merged['坏专家'])
+    assert.ok(warned.some((m) => m.includes('JSON 损坏')), warned)
+    assert.ok(warned.some((m) => m.includes('坏专家')), warned)
+    // 路径解析约定：全局层随 DSH_HOME、项目层锚 cwd
+    assert.equal(globalProfilesPath({ DSH_HOME: '/x' }), join('/x', EXPERT_PROFILES_FILENAME))
+    assert.equal(projectProfilesPath('/ws'), join('/ws', '.dsh', EXPERT_PROFILES_FILENAME))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('T15 #19 parseExpertProfile 字段级校验与 profileForExpert 归一命中', () => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const p = parseExpertProfile({ model: ' m-1 ', tools: { allow: ['a'], deny: ['b'] }, skills: ['s1'], mcp: ['srv'], future: 1 }, warn)
+  assert.deepEqual(p.profile, { model: 'm-1', tools: { allow: ['a'], deny: ['b'] }, skills: ['s1'], mcp: ['srv'] })
+  assert.ok(warns.some((m) => m.includes('future')), '未知字段告警')
+  // 全字段非法 → 无档案（null）
+  assert.equal(parseExpertProfile({ model: '  ' }, warn).profile, null)
+  assert.equal(parseExpertProfile('不是对象', warn).ok, false)
+  assert.equal(parseExpertProfile({ skills: [] }, warn).profile, null, '空数组视同未配置')
+  assert.deepEqual(EXPERT_PROFILE_FIELDS, ['model', 'tools', 'skills', 'mcp'])
+  // profileForExpert：精确 → 归一 → 未命中
+  const profiles = loadExpertProfiles({})
+  assert.equal(profileForExpert({ 后端工程师: { model: 'm' } }, '后端工程师').model, 'm')
+  assert.equal(profileForExpert({ 'backend-engineer': { model: 'm' } }, 'Backend-Engineer ').model, 'm')
+  assert.equal(profileForExpert(profiles, ' nobody '), null)
+  // 排障开关语义
+  assert.equal(profilesEnabled({ DSH_EXPERT_PROFILES: '0' }), false)
+  assert.equal(profilesEnabled({ DSH_EXPERT_PROFILES: '' }), false)
+  assert.equal(profilesEnabled({}), true)
+  assert.equal(profilesEnabled({ DSH_EXPERT_PROFILES: '1' }), true)
+})
+
+test('T15 #17 纯函数：无标记逐字节原样；开段无收尾 fail-safe 不剪；剪除后折叠多余空行', () => {
+  const plain = 'A\n\nB\n<!-- tools: bash --> 未配对标记保持原文'
+  assert.equal(pruneUnavailableToolSections(plain, () => false), plain, '无配对段 fail-safe 不剪')
+  assert.deepEqual(parseToolGuidanceSections('<!-- tools:a --><!-- tools:b -->x<!-- /tools -->').length, 1, '不支持嵌套：开段配到首个收尾')
+  assert.equal(pruneUnavailableToolSections(123, () => true), 123, '非字符串原样')
+  const withGaps = 'A\n\n\n<!-- tools: bash -->\n段。\n<!-- /tools -->\n\n\nB'
+  const out = pruneUnavailableToolSections(withGaps, () => false)
+  assert.ok(!out.includes('段。'))
+  assert.ok(!/\n{3,}/.test(out), '剪除后折叠多余空行')
+  assert.equal(pruneUnavailableToolSections(withGaps, () => true), withGaps, '零剪除逐字节原样')
+  // 组装面次序：剪除发生在 sanitize 之后、splitPersona 之前（methods 指针尾行不受影响）
+  const marked = '<!-- tools: bash -->\nX 指引。\n<!-- /tools -->\n\n正文<!-- methods-cut -->'
+  const prunedPersona = pruneUnavailableToolSections(sanitizePersona(marked), () => false)
+  assert.ok(!prunedPersona.includes('X 指引。'))
+  assert.equal(splitPersona('/d', prunedPersona, null), prunedPersona)
+})
+
+test('T15 resolveProfileEffect 纯函数：null 档案→null；deny 命中/allow 缺名/未注册/探测异常的可见性判定', () => {
+  assert.equal(resolveProfileEffect({}, null), null)
+  const registry = new Set(['read', 'bash', ...EXPERT_TOOLS_DENY_LIST]) // 探测面含递归防护名：未注册名本就被既有探测纪律剔除
+  const ctx = { tools: { get: (n) => (registry.has(n) ? {} : undefined) } }
+  const eff = resolveProfileEffect(ctx, { tools: { deny: ['bash'] } })
+  assert.deepEqual(eff.toolFilter.deny, [...EXPERT_TOOLS_DENY_LIST, 'bash'])
+  assert.equal(eff.isToolAvailable('bash'), false) // deny 命中
+  assert.equal(eff.isToolAvailable('read'), true) // 已注册
+  assert.equal(eff.isToolAvailable('ghost'), false) // 未注册不可见
+  assert.equal(eff.isToolAvailable('summon_expert'), false) // 递归防护恒不可见
+  // allow 存在：不在 allow 即不可见
+  const effAllow = resolveProfileEffect(ctx, { tools: { allow: ['read'] } })
+  assert.equal(effAllow.isToolAvailable('read'), true)
+  assert.equal(effAllow.isToolAvailable('bash'), false)
+  // 探测 API 缺失：非 deny 名按可见（fail-safe 宁留勿删）
+  const effNoProbe = resolveProfileEffect({}, { tools: { deny: ['bash'] } })
+  assert.equal(effNoProbe.isToolAvailable('ghost'), true)
+  // expandMcpWhitelistDeny：无枚举面 → null（降级可见）；空名单 → []
+  assert.equal(expandMcpWhitelistDeny({}, ['srv']), null)
+  assert.deepEqual(expandMcpWhitelistDeny(ctx, []), [])
+  // withProfileConstraints：无 skills 原样
+  assert.equal(withProfileConstraints('p', {}), 'p')
+  assert.equal(withProfileConstraints('p', null), 'p')
+})
+
+test('T32 备忘(1) claimFailureReason：--json 信封 message ?? error ?? stderr 三档优选', () => {
+  // 人读 sys.exit 类拒绝：message 优先（旧实现降级为常量 command_failed 的缺陷现场）
+  assert.equal(
+    claimFailureReason({ ok: false, error: 'command_failed', message: '错误：T1 状态为 running，只有 ready 可认领' }, '', '{"ok":false,...}'),
+    '错误：T1 状态为 running，只有 ready 可认领',
+  )
+  // BoardError 具名错误：无 message 落 error 具名码
+  assert.equal(claimFailureReason({ ok: false, error: 'stale_revision', expected: 2, actual: 3 }, '', '{}'), 'stale_revision')
+  // 信封解析不出：stderr 首行兜底
+  assert.equal(claimFailureReason(null, '错误：板不可读\n第二行', ''), '错误：板不可读')
+  assert.equal(claimFailureReason(undefined, '', 'stdout 首行'), 'stdout 首行')
+  // 全空 → 未知错误
+  assert.equal(claimFailureReason(null, '', ''), '未知错误')
+})
+
+test('T32 备忘(1) E2E：--json 下 claim 失败提示消费信封 message（真实 taskboard show + PATH shim claim）', async (t) => {
+  guardProfilesEnv(t)
+  const dst = makeWp4aDst(t, 'memo1')
+  const boardDir = makeBoardDir(t, 'memo1')
+  assert.equal(runTb(boardDir, ['create', '任务A']).code, 0) // T1 ready：show 正常透传真 taskboard.py
+  const realPy = execFileSync('sh', ['-c', 'command -v python3']).toString().trim()
+  const shimDir = mkdtempSync(join(tmpdir(), 't15-shim-memo1-'))
+  t.after(() => rmSync(shimDir, { recursive: true, force: true }))
+  // claim 一律以 --json 人读拒绝信封失败（SystemExit 类：stderr 为空，原因只在 message）
+  const shim = join(shimDir, 'python3')
+  writeFileSync(shim, `#!/bin/sh\nfor a in "$@"; do [ "$a" = claim ] && { echo '{"ok":false,"error":"command_failed","message":"错误：T1 状态为 running，只有 ready 可认领"}'; exit 1; }; done\nexec ${realPy} "$@"\n`)
+  chmodSync(shim, 0o755)
+  const oldPath = process.env.PATH
+  process.env.PATH = `${shimDir}:${oldPath}`
+  try {
+    const { descriptors, ctx } = makeWp4aCtx({ boardDir })
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: boardDir })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '测试专家', task: '处理 T1' }, { agent: {} })
+    assert.ok(r.answer.includes('T1 认领失败（已忽略，不阻塞派工）：错误：T1 状态为 running，只有 ready 可认领'), r.answer)
+    assert.ok(!r.answer.includes('认领失败（已忽略，不阻塞派工）：command_failed'), r.answer) // 不再降级为常量码
+  } finally {
+    process.env.PATH = oldPath
+  }
 })

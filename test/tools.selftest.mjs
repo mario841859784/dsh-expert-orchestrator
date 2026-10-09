@@ -7347,7 +7347,7 @@ test('T28 #20 (d) #16 预算联动：续领复用 claim 路径——(任务,编�
   assert.equal(board().tasks.T1.budget.refused, true)
   const refuseEvs = events().filter((e) => e.type === 'budget' && e.args?.action === 'refuse')
   assert.equal(refuseEvs.length, 1, '首拒落 budget 系统事件（档位行为事件可见）')
-  assert.equal(refuseEvs[0].args.cmd, 'claim')
+  assert.equal(refuseEvs[0].args.cmd, 'claim_idle', 'v2.9 T3 起续领走原子 claim_idle（拒绝面随命令面具名，事件可见）')
   assert.equal(refuseEvs[0].args.owner, '编排者')
   assert.equal(refuseEvs[0].args.tier, 'interrupt')
   // 编排者显式重置（跨代累计语义下唯一放行出口）→ 第三次 summon 续领放行
@@ -7455,4 +7455,311 @@ test('T28 #20 idleReclaimSweep 直呼：无板/板损坏/信封异常全 fail-op
   assert.equal(board().tasks.T1.status, 'running')
   assert.equal(board().tasks.T1.owner, '代领人')
   assert.equal(board().tasks.T2.status, 'ready', '上限外的条目不动')
+})
+
+// ── T3 #16/#20 组合面收口（v2.9 M1）─────────────────────────────────────────
+// 三处窄项的机器验证（用户裁决=均做代码改动）：① T39-① TOCTOU 收窄——claim_idle 原子空闲认领
+// （真实双进程并发恰一成功 + 负向零回归）；② T38-1 降锁——budget 只读盘点无锁快照读（EX 写锁
+// 被持期间不被阻塞 + 盘点零写零事件回归保持）；③ interrupt 档交付出口 fail/vote 独立断言。
+// 并发断言自指盲区防御（T27/T28 同款）：全部真实子进程（flock 语义由内核保证），屏障/竞速放大窗口。
+
+test('T3 T39-① claim_idle 原子认领（taskboard 级）：批量认领+负向逐个跳过+单事件留痕；空闲闸/noop/CAS 拒绝零写零事件', (t) => {
+  const dir = makeBoardDir(t, 't3-claimidle')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ') + ' → ' + r.stderr); return r }
+  const board = () => JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+  const events = () => readFileSync(join(dir, BOARD_REL) + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  ok('create', 'A')                      // T1 ready 无 owner
+  ok('create', 'B', '--owner', '前任')   // T2 ready 有 owner（负向③）
+  ok('create', 'C', '--draft')           // T3 draft（负向②）
+  ok('create', 'D', '--dep', 'T3')       // T4 pending（负向②）
+  ok('create', 'E'); ok('claim', 'T5', '某人'); ok('done', 'T5', '完')  // T5 done（负向②）
+  // 正例：批量候选一次持锁认领，非 ready/有 owner 逐个跳过（fail-open 语义同旧 show 复判）
+  const r = runTb(dir, ['--json', 'claim_idle', '编排者', 'T1', 'T2', 'T3', 'T4', 'T5'])
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.deepEqual(r.json.data.claimed, ['T1'])
+  assert.deepEqual(r.json.data.skipped, [
+    { id: 'T2', reason: '已有 owner=前任' },
+    { id: 'T3', reason: '状态为 draft' },
+    { id: 'T4', reason: '状态为 pending' },
+    { id: 'T5', reason: '状态为 done' },
+  ])
+  assert.equal(board().tasks.T1.status, 'running')
+  assert.equal(board().tasks.T1.owner, '编排者')
+  assert.equal(board().tasks.T1.attempt_id, undefined, '不建派工代际（lib 侧认领同代际语义）')
+  assert.equal(board().tasks.T2.owner, '前任', '已有 owner 不动')
+  // 事件流留痕：type='claim'（budget_counts 归因与事件流消费方零改动）、args 记 {owner, ids}
+  // 可辨来源、after 恰携带变更任务（watchdog 单事件多任务先例）
+  const ev = events().find((e) => e.type === 'claim' && e.args?.ids)
+  assert.ok(ev, 'claim_idle 落 type=claim 事件')
+  assert.equal(ev.args.owner, '编排者')
+  assert.deepEqual(ev.args.ids, ['T1', 'T2', 'T3', 'T4', 'T5'])
+  assert.deepEqual(Object.keys(ev.after), ['T1'])
+  // 空闲闸：板上已有 running → board_not_idle 具名拒绝，板+事件流逐字节零变化
+  const before = readFileSync(join(dir, BOARD_REL))
+  const evBefore = readFileSync(join(dir, BOARD_REL) + '.events.jsonl')
+  const busy = runTb(dir, ['--json', 'claim_idle', '编排者', 'T2'])
+  assert.equal(busy.code, 1)
+  assert.equal(busy.json.error, 'board_not_idle')
+  assert.deepEqual(busy.json.running, ['T1'])
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before, '空闲闸拒绝零写')
+  assert.equal(readFileSync(join(dir, BOARD_REL) + '.events.jsonl').toString(), evBefore.toString(), '空闲闸拒绝零事件')
+  // CAS 共存：--expected-revision 不符 → stale_revision 零写
+  const stale = runTb(dir, ['--json', 'claim_idle', '编排者', 'T2', '--expected-revision', '1'])
+  assert.equal(stale.code, 1)
+  assert.equal(stale.json.error, 'stale_revision')
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before)
+})
+
+test('T3 T39-① claim_idle noop 与人类面：候选全跳过（有 owner/不存在）零写；人类面逐任务 show 块+revision 尾行', (t) => {
+  const dir = makeBoardDir(t, 't3-claimidle-noop')
+  const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ') + ' → ' + r.stderr); return r }
+  ok('create', 'A', '--owner', '前任') // T1 ready 有 owner
+  const before = readFileSync(join(dir, BOARD_REL))
+  const noop = runTb(dir, ['--json', 'claim_idle', '编排者', 'T1', 'T99'])
+  assert.equal(noop.code, 1)
+  assert.equal(noop.json.error, 'claim_idle_noop')
+  assert.deepEqual(noop.json.skipped, [
+    { id: 'T1', reason: '已有 owner=前任' },
+    { id: 'T99', reason: '任务不存在' },
+  ])
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before, '全跳过零写（板逐字节零变化）')
+  // 人类面：逐任务 show 块 + revision 尾行（与 claim 同构；lib 走 --json 不受影响）
+  ok('create', 'B')
+  const human = ok('claim_idle', '编排者', 'T2')
+  assert.ok(human.stdout.includes('T2 [running] B owner=编排者'), human.stdout)
+  assert.match(human.stdout, /revision=\d+/)
+})
+
+test('T3 T39-① 并发竞态（真实双进程+START 文件屏障）：两进程同时 claim_idle 同一就绪任务恰一个成功', async (t) => {
+  // 屏障放大：两个 python 子进程各自等 START 文件出现后同时发 claim_idle（同板同候选），
+  // flock 串行化下恰好一成一拒（board_not_idle）——旧「show 复判+claim」两步流程在该时序下
+  // 会双双入选（T39-① 收窄目标面）。3 轮独立板重复放大调度窗口。
+  const CHILD = `
+import json, os, subprocess, sys, time
+start, args = sys.argv[1], json.loads(sys.argv[2])
+while not os.path.exists(start):
+    time.sleep(0.002)
+r = subprocess.run(args, capture_output=True, text=True)
+sys.stdout.write(r.stdout)
+sys.stderr.write(r.stderr)
+sys.exit(r.returncode)
+`
+  for (let round = 0; round < 3; round++) {
+    const dir = makeBoardDir(t, `t3-race${round}`)
+    assert.equal(runTb(dir, ['create', 'A']).code, 0)
+    assert.equal(runTb(dir, ['create', 'B']).code, 0)
+    const startFile = join(dir, '.start')
+    const tbArgs = JSON.stringify([TASKBOARD, '--board', join(dir, BOARD_REL), '--json', 'claim_idle', '编排者', 'T1', 'T2'])
+    const kids = [0, 1].map(() => new Promise((resolve) => {
+      const p = spawn('python3', ['-c', CHILD, startFile, tbArgs], { cwd: dir })
+      let stdout = '', stderr = ''
+      p.stdout.on('data', (d) => { stdout += d })
+      p.stderr.on('data', (d) => { stderr += d })
+      p.on('close', (code) => resolve({ code, stdout, stderr }))
+    }))
+    await new Promise((r) => setTimeout(r, 60)) // 两进程就位（屏障等待中）再放行
+    writeFileSync(startFile, 'go')
+    const [x, y] = await Promise.all(kids)
+    const codes = [x.code, y.code].sort((m, n) => m - n)
+    assert.deepEqual(codes, [0, 1], `round${round}: x=${x.stdout} y=${y.stdout}`)
+    const loser = x.code !== 0 ? x : y
+    assert.equal(JSON.parse(loser.stdout.trim()).error, 'board_not_idle', `round${round}: ${loser.stdout}`)
+    assert.ok(!loser.stderr.includes('Traceback'), loser.stderr) // 具名拒绝，绝不裸 traceback
+    // 板面恰一次认领：T1/T2 均 running owner=编排者，claim 事件恰 1 条（原子批量）
+    const board = JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+    assert.equal(board.tasks.T1.status, 'running')
+    assert.equal(board.tasks.T2.status, 'running')
+    const evs = readFileSync(join(dir, BOARD_REL) + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+    assert.equal(evs.filter((e) => e.type === 'claim').length, 1, `round${round}: 恰一次认领事件`)
+  }
+})
+
+test('T3 T39-① 并发双 sweep（lib 级）：同一板两个 idleReclaimSweep 并发，认领提示恰一份、板面恰一次认领', async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't3-sweeprace')
+  ok('create', 'A')
+  ok('create', 'B')
+  const [h1, h2] = await Promise.all([
+    idleReclaimSweep({ cwd: dir }),
+    idleReclaimSweep({ cwd: dir }),
+  ])
+  const winners = [h1, h2].filter((h) => h.includes('已自动认领'))
+  assert.equal(winners.length, 1, JSON.stringify([h1, h2]))
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'running')
+  assert.equal(b.tasks.T1.owner, '编排者')
+  assert.equal(b.tasks.T2.status, 'running')
+  assert.equal(b.tasks.T2.owner, '编排者')
+  const evs = readFileSync(join(dir, '.expert-taskboards', 'default.json') + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.equal(evs.filter((e) => e.type === 'claim').length, 1, '并发 sweep 恰一次认领事件（原子批量）')
+})
+
+test('T3 T39-① claim_idle × #16 预算联动（taskboard 级）：interrupt 档续领被拒零认领、refuse 事件 cmd=claim_idle、幂等零事件；budget --reset 后放行', async (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok, board, events } = makeT27BudgetBoard(t, 't3-claimidle-budget')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '1', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '1' }
+  ok('create', 'A')
+  const r1 = tb(['--json', 'claim_idle', '编排者', 'T1'], th)
+  assert.equal(r1.status, 0, r1.stderr)
+  assert.equal(board().tasks.T1.owner, '编排者')
+  await new Promise((resolve) => setTimeout(resolve, 30)) // 活动时点落后窗口（跨进程时钟最小间隔之上，T28 (d) 同款）
+  assert.equal(tb(['watchdog', '--window-sec', '0', '--max-nudges', '0'], th).status, 0)
+  assert.equal(board().tasks.T1.status, 'ready', 'reclaim 回 ready 清 owner（续领场景结构基础）')
+  const r2 = tb(['--json', 'claim_idle', '编排者', 'T1'], th)
+  assert.equal(r2.status, 1)
+  assert.equal(r2.json.error, 'budget_interrupted')
+  assert.equal(r2.json.refused_cmd, 'claim_idle')
+  assert.equal(board().tasks.T1.status, 'ready', '被拒后任务保持 ready（fail-safe 零变更）')
+  assert.ok(!board().tasks.T1.owner)
+  assert.equal(board().tasks.T1.budget.refused, true)
+  const refuseEvs = events().filter((e) => e.type === 'budget' && e.args?.action === 'refuse')
+  assert.equal(refuseEvs.length, 1, '首拒落 budget 系统事件')
+  assert.equal(refuseEvs[0].args.cmd, 'claim_idle')
+  assert.equal(refuseEvs[0].args.owner, '编排者')
+  assert.equal(refuseEvs[0].args.tier, 'interrupt')
+  // 幂等：再次续领仍拒且零新增 budget 事件（防刷屏）
+  assert.equal(tb(['--json', 'claim_idle', '编排者', 'T1'], th).status, 1)
+  assert.equal(events().filter((e) => e.type === 'budget').length, 1, '后续拒绝幂等零事件')
+  // 编排者显式重置（跨代累计语义下唯一放行出口）→ 续领放行
+  assert.equal(tb(['budget', 'T1', '--reset'], th).status, 0)
+  const r3 = tb(['--json', 'claim_idle', '编排者', 'T1'], th)
+  assert.equal(r3.status, 0, r3.stderr)
+  assert.equal(board().tasks.T1.owner, '编排者')
+})
+
+const HOLD_FLOCK = `
+import fcntl, sys, time
+f = open(sys.argv[1], 'w')
+fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+print('HELD', flush=True)
+time.sleep(float(sys.argv[2]) / 1000)
+fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+`
+
+test('T3 T38-1 budget 降锁：EX 写锁被真实进程持有期间 budget 照常返回（无锁快照读），写命令仍被锁串行化', async (t) => {
+  guardT27BudgetEnv(t)
+  const { dir, boardPath, tb, ok } = makeT27BudgetBoard(t, 't3-budget-lockless')
+  ok('create', '任务A', '--owner', '后端工程师')
+  ok('claim', 'T1', '后端工程师')
+  // 真实持锁进程：fcntl.flock LOCK_EX 持 <board>.lock 4s（模拟慢写命令在持锁），HELD 信号屏障
+  const holder = spawn('python3', ['-c', HOLD_FLOCK, boardPath + '.lock', '4000'], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const holderExit = new Promise((resolve) => holder.on('exit', resolve)) // 预挂：exit 后再挂监听将永不结算
+  await new Promise((resolve, reject) => {
+    holder.stdout.on('data', (d) => String(d).includes('HELD') && resolve())
+    holder.on('exit', (code) => reject(new Error('持锁进程提前退出 code=' + code)))
+  })
+  try {
+    // ① budget --json（无锁快照读）：持锁期间照常完成且耗时远小于持锁时长（不排队）
+    const t0 = Date.now()
+    const r = tb(['--json', 'budget', 'T1'])
+    const elapsed = Date.now() - t0
+    assert.equal(r.status, 0, r.stdout + r.stderr)
+    assert.equal(r.json.ok, true)
+    assert.equal(r.json.cmd, 'budget')
+    assert.equal(r.json.data.budget.enabled, false)
+    assert.ok(elapsed < 2500, `budget 被写锁阻塞 ${elapsed}ms（应为无锁快照读立即返回）`)
+    // ② 人类面同语义（同一无锁分支）
+    const h = tb(['budget', 'T1'])
+    assert.equal(h.status, 0, h.stderr)
+    assert.match(h.stdout, /budget T1: 开关=关/)
+    assert.match(h.stdout, /revision=\d+/)
+    // ③ 写命令仍走锁内路径：持锁期间不完成（flock 结构零改动），释放后才成功
+    const wPromise = new Promise((resolve) => {
+      const p = spawn('python3', [TASKBOARD, '--board', boardPath, '--json', 'create', 'B'], { cwd: dir })
+      let stdout = ''
+      p.stdout.on('data', (d) => { stdout += d })
+      p.on('close', (code) => resolve({ code, stdout }))
+    })
+    const early = await Promise.race([
+      wPromise.then(() => 'done'),
+      new Promise((res) => setTimeout(() => res('blocked'), 1200)),
+    ])
+    assert.equal(early, 'blocked', '写命令在 EX 锁持有期间应被阻塞（锁结构零改动）')
+    const w = await wPromise
+    assert.equal(w.code, 0, w.stdout)
+    assert.equal(JSON.parse(w.stdout).ok, true)
+  } finally {
+    holder.kill('SIGKILL')
+    await holderExit
+  }
+})
+
+test('T3 T38-1 盘点零写零事件回归保持（无锁快照读）：budget 前后板/事件流逐字节零变化', (t) => {
+  guardT27BudgetEnv(t)
+  const { boardPath, tb, ok } = makeT27BudgetBoard(t, 't3-budget-zerowrite')
+  ok('create', '任务A', '--owner', '后端工程师')
+  ok('claim', 'T1', '后端工程师')
+  ok('progress', 'T1', 'p1')
+  const boardBefore = readFileSync(boardPath)
+  const evBefore = readFileSync(boardPath + '.events.jsonl')
+  const r = tb(['--json', 'budget', 'T1'], { DSH_EXPERT_TOOL_BUDGET: '1' })
+  assert.equal(r.status, 0, r.stderr)
+  assert.deepEqual(r.json.data.budget.budgets, [{ owner: '后端工程师', count: 2, tier: null }])
+  assert.deepEqual(readFileSync(boardPath), boardBefore, '板文件逐字节零变化（不重建视图）')
+  assert.equal(readFileSync(boardPath + '.events.jsonl').toString(), evBefore.toString(), '事件流逐字节零变化（零事件，防计数自激语义不动）')
+})
+
+test('T3 T38-1 无锁快照读崩溃容忍：视图落后/事件流残尾时 budget 零写照常盘点（不自愈不重建），后续写命令照常自愈', (t) => {
+  guardT27BudgetEnv(t)
+  // 场景①（视图落后=「事件已追加、视图未及写」崩溃间隙）：budget 按事件流权威盘点且零写
+  const s1 = makeT27BudgetBoard(t, 't3-budget-staleview')
+  s1.ok('create', '任务A', '--owner', '后端工程师')
+  s1.ok('claim', 'T1', '后端工程师')
+  s1.ok('progress', 'T1', 'p1')
+  const staleView = readFileSync(s1.boardPath) // claim+progress 后快照
+  s1.ok('progress', 'T1', 'p2')                // 事件流+视图前进
+  writeFileSync(s1.boardPath, staleView)       // 视图人为回拨 → 事件领先视图（崩溃间隙形态）
+  const viewBefore = readFileSync(s1.boardPath)
+  const r1 = s1.tb(['--json', 'budget', 'T1'], { DSH_EXPERT_TOOL_BUDGET: '1' })
+  assert.equal(r1.status, 0, r1.stderr)
+  assert.equal(r1.json.data.budget.budgets[0].count, 3, '以事件流权威折叠计数（claim+2 progress）')
+  assert.deepEqual(readFileSync(s1.boardPath), viewBefore, '视图落后不重建（零写；修复留给下一个持锁命令）')
+  // 场景②（事件流残尾=追加途中被杀）：budget 容忍残尾零写（不截断不告警），后续写命令照常自愈
+  const s2 = makeT27BudgetBoard(t, 't3-budget-torn')
+  s2.ok('create', '任务A', '--owner', '后端工程师')
+  s2.ok('claim', 'T1', '后端工程师')
+  const evBefore = readFileSync(s2.boardPath + '.events.jsonl')
+  appendFileSync(s2.boardPath + '.events.jsonl', '{"torn":')
+  const r2 = s2.tb(['--json', 'budget', 'T1'], { DSH_EXPERT_TOOL_BUDGET: '1' })
+  assert.equal(r2.status, 0, r2.stderr)
+  assert.equal(r2.json.data.budget.budgets[0].count, 1, '残尾容忍：按完整前缀计数（即崩溃前已落账状态）')
+  assert.equal(readFileSync(s2.boardPath + '.events.jsonl').toString(), evBefore.toString() + '{"torn":',
+    '无锁读不截断残尾（零写）')
+  const w = s2.tb(['--json', 'progress', 'T1', 'p1'])
+  assert.equal(w.status, 0, w.stderr)
+  const evsAfter = readFileSync(s2.boardPath + '.events.jsonl', 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  assert.deepEqual(evsAfter.map((e) => e.type), ['create', 'claim', 'progress'], '写命令自愈截断残尾后续链（seq 连续衔接）')
+})
+
+test('T3 ① interrupt 档交付出口补强：fail 与 vote 永不拒（中断=强迫交付；与 done 同语义的独立断言）', async (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok, board, events } = makeT27BudgetBoard(t, 't3-interrupt-delivery')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '1', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '2' }
+  // fail 面：claim(1)+progress(pre=1 wrap-up 章)+progress(pre=2≥2 interrupt 拒) → (T1,后端工程师) 停在 interrupt 档
+  ok('create', '任务A', '--owner', '后端工程师')
+  assert.equal(tb(['claim', 'T1', '后端工程师'], th).status, 0)
+  assert.equal(tb(['progress', 'T1', 'p1'], th).status, 0)
+  const refused = tb(['progress', 'T1', 'p2'], th)
+  assert.equal(refused.status, 1)
+  assert.equal(refused.json.error, 'budget_interrupted', '前置：interrupt 档已在位（推进类被拒）')
+  // 交付出口 fail：interrupt 档下永不拒（事件+状态照常落账）
+  const rFail = tb(['fail', 'T1', '预算耗尽交回编排者'], th)
+  assert.equal(rFail.status, 0, rFail.stderr + rFail.stdout)
+  assert.ok(rFail.stderr.includes('[budget] 硬预算已到'), 'interrupt 档交付提示照常（fail 亦为交付出口）')
+  assert.equal(board().tasks.T1.status, 'failed')
+  assert.ok(events().find((e) => e.type === 'fail' && e.after?.T1?.status === 'failed'), 'fail 事件照常落账')
+  // vote 面：m 票任务 owner=评审员本人，claim+progress 推到 interrupt 档，vote 永不拒
+  ok('create', '评审任务', '--kind', 'review', '--quorum-m', '2', '--owner', '评审员A')
+  assert.equal(tb(['claim', 'T2', '评审员A'], th).status, 0)
+  assert.equal(tb(['progress', 'T2', 'p1'], th).status, 0)
+  assert.equal(tb(['progress', 'T2', 'p2'], th).status, 1, '前置：T2 interrupt 档已在位')
+  const rVote = tb(['vote', 'T2', '--by', '评审员A', '--score', '1'], th)
+  assert.equal(rVote.status, 0, rVote.stderr + rVote.stdout)
+  assert.ok(rVote.stderr.includes('[budget] 硬预算已到'), 'interrupt 档交付提示照常（vote 亦为交付出口）')
+  assert.equal(board().tasks.T2.votes.length, 1, '落票照常入票箱')
+  assert.equal(board().tasks.T2.votes[0].by, '评审员A')
+  assert.ok(events().find((e) => e.type === 'vote' && e.args?.by === '评审员A'), 'vote 事件照常落账')
+  assert.equal(board().tasks.T2.status, 'running', '单票未达 m=2 生效线：任务保持 running（投票语义零回归）')
+  // fail-safe：全链 hash 校验经 replay 通过
+  assert.equal(tb(['replay'], th).status, 0)
 })

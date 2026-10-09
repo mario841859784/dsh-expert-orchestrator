@@ -104,6 +104,18 @@ per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭
   互补不冲突：watchdog 管时间窗无进展（activity 重臂），预算管调用量发散（事件计数）——interrupt 档
   拒绝 heartbeat/progress 使窗口自然到期、watchdog nudge→reclaim 接管，二者串联闭环；档位章不触碰
   updated（档位章不是活动信号，不重臂 watchdog 窗口）。
+ budget 只读盘点降锁（v2.9 M1/T3，T38-1）：budget（无 --reset）不持 board.lock 独占写锁——无锁
+   快照读路径（load/read_events 的 repair=False 变体）：零写零 stderr（不重建视图、不自愈事件流——
+   无锁进程绝不与持锁写命令竞争 os.replace/O_APPEND），输出=事件流某一完整前缀的折叠（链式 hash
+   全量校验保证为真实已落账状态），并发写命令进行中时至多略滞后（快照级一致性语义）；错误面/
+   信封/人类输出与锁内路径逐字节一致，盘点零写零事件防自激语义不动；--reset 与其余全部命令仍走
+   锁内路径（flock 结构零改动）。
+ 空闲续领原子认领（v2.9 M1/T3，T39-① 收窄）：claim_idle <owner> <id...> 在 main 统一 board_lock
+   单次持锁内完成「板上无 running 判定 + 认领」——消解 lib list 快照与 claim 之间的窄窗（并发
+   sweep/人工 claim 双双入选，现恰好一个成功）；空闲闸 board_not_idle（零写零事件）、候选锁内
+   复判（非 ready/已有 owner/不存在跳过，全跳过 claim_idle_noop）、逐候选预算门（interrupt 拒绝
+   同 claim，#20 续领受 #16 预算约束零回归）；事件 type='claim' 不建派工代际，lib idle-reclaim
+   改调本命令（list 快照降级为 fail-open 预筛，auto-claim（WP-4a）路径不动）。
 验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
   verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
 机器可读结构化输出通道（v2.8 S1，T17）：全局 --json 开关——开启后 stdout 恰一行 JSON 信封、
@@ -189,9 +201,14 @@ FINDINGS_MAX_CHARS = 4000
 # 不拒绝）。_BUDGET_EVAL 为 cmd_budget → _structured_data 的 --json data 载荷进程内暂存（_EVT_CTX 同款）。
 BUDGET_TIER_RANK = {'alarm': 1, 'wrap-up': 2, 'interrupt': 3}
 BUDGET_COUNTED_TYPES = frozenset(('claim', 'progress', 'heartbeat', 'done', 'fail', 'own', 'vote'))
-BUDGET_REFUSABLE_TYPES = frozenset(('claim', 'progress', 'heartbeat', 'own'))  # 推进类；done/fail/vote=交付出口
+# 推进类（interrupt 档当场拒绝）；done/fail/vote=交付出口永不拒。claim_idle 属推进类
+# （认领即开工，v2.9 T3/T39-①）——#20 空闲续领与 claim 同受 interrupt 闸约束（T28 (d) 语义）。
+BUDGET_REFUSABLE_TYPES = frozenset(('claim', 'claim_idle', 'progress', 'heartbeat', 'own'))
 DEFAULT_BUDGET_THRESHOLDS = {'alarm': 200, 'wrap-up': 250, 'interrupt': 300}
 _BUDGET_EVAL = {'payload': None}
+# _CLAIM_IDLE_EVAL 为 cmd_claim_idle → _structured_data 的 --json data 载荷进程内暂存
+# （_BUDGET_EVAL 同款惯例）：claimed/skipped 与人类面逐任务块同源。
+_CLAIM_IDLE_EVAL = {'claimed': [], 'skipped': []}
 
 
 
@@ -369,14 +386,18 @@ def _repair_events(ep, evs):
     os.replace(tmp, ep)
 
 
-def read_events(path):
+def read_events(path, repair=True):
     """读取并校验事件流：逐行解析 + 链式 hash 验证，返回验证通过的事件列表。
     尾部残行（末行不可解析的结构性残缺——O_APPEND 单行撕裂写缺闭合括号）→ 截断修复并 stderr 告警
     （崩溃恢复语义）；可解析但 seq/prev/hash/type 校验失败（含末事件被篡改、次末行被删导致的断链）
     一律 unrecoverable，与中段篡改同语义——可解析事件是已 fsync 落账的完整命令，按残尾截断等于
     静默回滚一次已执行命令（数据丢失且篡改语义不对称）；中段不可解析 → unrecoverable（权威受损
     绝不静默）。末事件完整合法但缺行尾换行（fsync 后恰损换行的部分落盘）→ 补写换行自愈并告警，
-    防止下次 O_APPEND 追加与末事件粘包后被误当残尾截断。"""
+    防止下次 O_APPEND 追加与末事件粘包后被误当残尾截断。
+    repair=False（v2.9 T3/T38-1 budget 无锁只读快照专用）：读路径零写零 stderr——残尾容忍跳过
+    （不截断不告警，evs 已按完整前缀截取，修复留给下一个持锁命令）、缺尾换行不补写（完整末行
+    照常解析）；其余校验语义逐字节一致。无锁进程绝不自愈写：os.replace 换 inode / 补写字节与
+    持锁写命令的 O_APPEND 追加竞争会丢事件（快照读只许读）。"""
     ep = events_path(path)
     if not os.path.exists(ep):
         return []
@@ -412,17 +433,21 @@ def read_events(path):
             raise _unrecoverable(path, f'事件流第 {k + 1} 个事件校验失败（链/hash 校验失败或被篡改）')
         prev_hash, prev_seq = ev['hash'], ev['seq']
     if torn:
-        _repair_events(ep, evs)
-        print(f'警告：事件流尾部存在未完成写入（疑似进程被杀），已截断修复至最后一个完整事件: {ep}', file=sys.stderr)
+        if repair:
+            _repair_events(ep, evs)
+            print(f'警告：事件流尾部存在未完成写入（疑似进程被杀），已截断修复至最后一个完整事件: {ep}', file=sys.stderr)
+        # repair=False：残尾容忍（零写零 stderr）——evs 已是完整前缀，即崩溃前已落账状态
     elif raw and not raw.endswith('\n') and evs:
-        # 丢尾随换行自愈（二轮评审重要-3）：fsync 后恰损行尾换行时末事件仍完整合法且链校验通过——
-        # 若直接 O_APPEND 追加，会与末事件粘成一行不可解析，下次读取按撕裂残尾截断，把已落账命令
-        # 一并回滚（实测 4→2）。读路径先补写换行（O_APPEND 单字节 + fsync），保证后续追加不粘包。
-        with open(ep, 'a', encoding='utf-8') as f:
-            f.write('\n')
-            f.flush()
-            os.fsync(f.fileno())
-        print(f'警告：事件流末尾缺失换行符（疑似写入中断残留），已补写自愈: {ep}', file=sys.stderr)
+        if repair:
+            # 丢尾随换行自愈（二轮评审重要-3）：fsync 后恰损行尾换行时末事件仍完整合法且链校验通过——
+            # 若直接 O_APPEND 追加，会与末事件粘成一行不可解析，下次读取按撕裂残尾截断，把已落账命令
+            # 一并回滚（实测 4→2）。读路径先补写换行（O_APPEND 单字节 + fsync），保证后续追加不粘包。
+            with open(ep, 'a', encoding='utf-8') as f:
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            print(f'警告：事件流末尾缺失换行符（疑似写入中断残留），已补写自愈: {ep}', file=sys.stderr)
+        # repair=False：完整末行照常解析，不补写（无锁快照读零写）
     return evs
 
 
@@ -490,6 +515,8 @@ def _event_args(a):
         return args
     if c == 'claim':
         return {'owner': a.owner, 'attempt': a.attempt}
+    if c == 'claim_idle':
+        return {'owner': a.owner, 'ids': list(a.ids)}  # 空闲续领原子认领（T39-①）：意图留档，事件 type 仍为 claim
     if c == 'vote':
         return {'by': a.by, 'score': a.score}
     if c == 'done':
@@ -520,7 +547,7 @@ def _event_args(a):
 # 写命令事件上下文：main 派发前武装（pre 快照供差分、并按需充当收编种子），save() 据此落事件。
 # 写命令白名单：与 save() 调用方一一对应。读命令（list/show/status/deps/metrics）与
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
-_WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
+_WRITE_CMDS = frozenset(('create', 'claim', 'claim_idle', 'done', 'fail', 'progress', 'recover', 'retry',
                          'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve',
                          'reject', 'vote', 'own', 'budget'))
 
@@ -536,7 +563,13 @@ def _arm_event_ctx(a, data):
                          'pre_seq': 0, 'pre_rev': 0, 'ts': 0})
         return
     _EVT_CTX.update({
-        'armed': True, 'type': a.cmd, 'args': _event_args(a),
+        'armed': True,
+        # 事件类型映射：claim_idle 是认领类状态迁移（running），事件 type 沿 'claim'——
+        # budget_counts 的事件类型过滤/BUDGET_COUNTED_TYPES 白名单与全部事件流消费方零改动
+        # （#20 续领受 #16 预算计数归因不变）；命令意图仍由 args 形状区分（{owner, ids} vs
+        # {owner, attempt}，T39-① 审计可辨）。T38-1 无锁 budget 分支不经过本函数（读路径）。
+        'type': 'claim' if a.cmd == 'claim_idle' else a.cmd,
+        'args': _event_args(a),
         'pre_tasks': copy.deepcopy(data['tasks']),
         'pre_seq': int(data.get('seq', 0)), 'pre_rev': int(data.get('revision', 0)),
         'ts': now_ms(),
@@ -629,12 +662,17 @@ def _orphan_log_of_archived(path):
     return False
 
 
-def load(path):
+def load(path, repair=True):
     """加载任务板状态：有事件流 → 折叠（权威）+ 视图对账；无事件流 → v2.6 旧板直读（首次写时收编）。
     视图对账：缺失/落后 → 静默重放重建（崩溃恢复）；手改/损坏 → stderr 报警并按事件流权威重建。
     直读分支两道防线：事件流被清空但视图含簿记 → unrecoverable（防清空日志洗白）；含未知顶层键 →
-    unrecoverable（收编早失败）。"""
-    evs = read_events(path)
+    unrecoverable（收编早失败）。
+    repair=False（v2.9 T3/T38-1 budget 无锁只读快照专用）：读路径零写零 stderr——残尾不修复
+    （read_events 同参）、视图缺失/落后/损坏不重建，一律按事件流权威折叠状态返回（stale 容忍：
+    并发写命令进行中时，结果=事件流某一完整前缀的折叠，恰为该前缀末事件落账时刻的板状态——
+    快照级一致性，至多略滞后，绝无半写状态：事件追加 O_APPEND 单行原子 + 视图 os.replace 原子）。
+    错误面（各 unrecoverable 分支）与 repair=True 逐字节一致；缺省 repair=True 行为与旧版一致。"""
+    evs = read_events(path, repair=repair)
     if not evs:
         if not os.path.exists(path):
             return {'tasks': {}, 'seq': 0, 'revision': 0}
@@ -680,8 +718,9 @@ def load(path):
             v = None
     if v is None:
         if v_exists:  # 视图在但解析失败（外部损坏；崩溃不会产生半写视图——os.replace 原子）
-            print(f'警告：任务板状态文件损坏（JSON 解析失败），已按事件流（权威）重放重建折叠状态: {path}',
-                  file=sys.stderr)
+            if repair:
+                print(f'警告：任务板状态文件损坏（JSON 解析失败），已按事件流（权威）重放重建折叠状态: {path}',
+                      file=sys.stderr)
         elif _orphan_log_of_archived(path):
             # archive 崩溃窗口防御（二轮评审重要-2）：板文件缺失而事件流在，且归档区有同名板的
             # 「有簿记、无日志」残留——顶层事件流是归档迁移未完成的孤儿日志，板已被收口；放行则
@@ -690,7 +729,8 @@ def load(path):
             raise _unrecoverable(path, '板文件缺失但事件流存在，且归档区存在同名归档板的孤儿日志残留'
                                        '（疑似 archive 迁移中断的崩溃窗口终态）；拒绝按孤儿事件流复活'
                                        '旧板或续链，请人工核查归档区与事件流后再处理')
-        save_view(path, state)  # 视图整体丢失属崩溃恢复，静默重建
+        if repair:
+            save_view(path, state)  # 视图整体丢失属崩溃恢复，静默重建
         return state
     vseq = v.get('event_seq')
     if isinstance(vseq, int) and not isinstance(vseq, bool) and vseq > state['event_seq']:
@@ -709,20 +749,23 @@ def load(path):
         # 视图自称 event_seq=vseq，其内容 hash 应与第 vseq 个事件的 state_hash 一致；失配说明视图
         # 内容曾被外部改动（而非单纯落后），stderr 补一条提示——重建行为不变，只补可观测性。
         ref = evs[vseq - 1].get('state_hash') if 0 < vseq <= len(evs) else None
-        if ref is not None and _state_hash(v) != ref:
-            print(f'提示：任务板视图落后于事件流且内容校验失配（疑似视图曾被外部改动），已按事件流重放重建: {path}',
-                  file=sys.stderr)
-        save_view(path, state)  # 崩溃间隙：事件已追加、视图未及写——静默重放（不报警）
+        if repair:
+            if ref is not None and _state_hash(v) != ref:
+                print(f'提示：任务板视图落后于事件流且内容校验失配（疑似视图曾被外部改动），已按事件流重放重建: {path}',
+                      file=sys.stderr)
+            save_view(path, state)  # 崩溃间隙：事件已追加、视图未及写——静默重放（不报警）
         return state
     if not any(k in v for k in BOOKKEEPING_KEYS) and _state_hash(v) == actual:
         # 旧板收编崩溃间隙：种子事件已追加、视图未及写，仍是收编前的 v2.6 原生板（无簿记字段）。
         # 内容与折叠权威逐字段一致 → 与上一分支同语义，静默重建（不报警）；缺簿记但内容不一致
         # 的真实手改不豁免，仍落入下方报警分支。
-        save_view(path, state)
+        if repair:
+            save_view(path, state)
         return state
-    print(f'警告：任务板状态文件校验不一致（疑似手改或外部修改），已按事件流（权威）重放重建折叠状态: {path}',
-          file=sys.stderr)
-    save_view(path, state)
+    if repair:
+        print(f'警告：任务板状态文件校验不一致（疑似手改或外部修改），已按事件流（权威）重放重建折叠状态: {path}',
+              file=sys.stderr)
+        save_view(path, state)
     return state
 
 
@@ -1098,6 +1141,79 @@ def cmd_claim(a, data, path):
     t['updated'] = now_ms()
     save(path, data)
     show(t)
+
+
+class _ClaimIdleGateNS:
+    """claim_idle 逐候选预算门的命令视图：budget_gate/_budget_refuse 只读 cmd/id/owner 三属性，
+    复用 claim 的全套门语义（interrupt 拒绝、alarm/wrap-up 升档章随本命令事件落账）——不复制
+    预算判定逻辑（#16 语义单一实现原则）。"""
+
+    __slots__ = ('cmd', 'id', 'owner')
+
+    def __init__(self, tid, owner):
+        self.cmd, self.id, self.owner = 'claim_idle', tid, owner
+
+
+def cmd_claim_idle(a, data, path):
+    """claim_idle <owner> <id> [<id>...]：#20 空闲续领原子认领（v2.9 M1/T3，T39-① 收窄）。
+    旧流程（lib list 快照判空闲 → 逐任务 show 复判 → claim）在快照与 claim 之间存在窄窗：
+    并发 sweep/人工 claim 可双双入选（v2.8 T39 评审判「后果仅多认领一条 ready、无损坏面」；
+    用户裁决仍做代码收窄）。本命令在 main 统一 board_lock 单次持锁内完成「板上无 running
+    判定 + 认领」，判定与写入间隙为零：
+    - 空闲闸：任一任务 status=running → BoardError board_not_idle（零写零事件，与 lib 侧
+      「有开放执行整轮不动」同语义；快照滞后场景由锁内权威状态裁决——并发 sweep 竞争下
+      恰好一个成功，后到者整轮不动）；
+    - 候选复判（快照可滞后，fail-open）：非 ready / 已有 owner / 任务不存在 → 跳过；全部
+      跳过 → BoardError claim_idle_noop（零写零事件）；
+    - 逐候选预算门（复用 budget_gate，同 claim 语义）：interrupt 档当场拒绝（首拒落 budget
+      事件、后续幂等零事件；拒绝发生在任何变更之前）——#20 续领受 #16 预算约束零回归；
+      alarm/wrap-up 升档章随本命令自身事件落账；
+    - 认领走既有 claim 变更语义：owner 落档、status=running、updated 重臂；不建派工代际
+      （attempt_id 不触碰，lib 侧认领与 WP-4a 同代际语义）；事件 type='claim'（budget_counts
+      归因不变），多候选单事件 after 携带全部变更任务快照（watchdog 单事件多任务先例）。
+    拒绝面（除预算拒绝外零写零事件）：board_not_idle / claim_idle_noop /
+    stale_revision（--expected-revision 既有 CAS）。人类面逐任务 show 块 + revision 尾行；
+    --json data 携带 {claimed:[id...], skipped:[{id,reason}...]}（_CLAIM_IDLE_EVAL 同源）。"""
+    owner = (a.owner or '').strip()
+    if not owner:
+        sys.exit('错误：claim_idle 需要非空 owner（认领方身份，空闲续领固定为编排者）')
+    running = sorted((tid for tid, t in data['tasks'].items() if t['status'] == 'running'),
+                     key=lambda x: int(x[1:]))
+    if running:
+        raise BoardError('board_not_idle', running=running,
+                         hint='板上存在开放执行（running 任务），空闲续领整轮不动；'
+                              '本轮候选未做任何认领（零写零事件），下个空闲边沿重扫')
+    seen, candidates, skipped = set(), [], []
+    for tid in a.ids:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        t = data['tasks'].get(tid)
+        if not isinstance(t, dict):
+            skipped.append({'id': tid, 'reason': '任务不存在'})
+        elif t['status'] != 'ready':
+            skipped.append({'id': tid, 'reason': f'状态为 {t["status"]}'})
+        elif t.get('owner'):
+            skipped.append({'id': tid, 'reason': f'已有 owner={t["owner"]}'})
+        else:
+            candidates.append(t)
+    if not candidates:
+        raise BoardError('claim_idle_noop', skipped=skipped,
+                         hint='候选在锁内权威状态下无一可认领（快照滞后/负向条件命中）；零写零事件')
+    # 逐候选预算门（任何变更之前）：interrupt 当场拒绝（首拒落 budget 事件，发生在候选认领
+    # 之前——整轮零认领）；alarm/wrap-up 升档章改内存态、随本命令事件落账。锁内计数读走
+    # 既有 read_events（repair=True，自愈语义与其余写命令一致）。
+    for t in candidates:
+        budget_gate(_ClaimIdleGateNS(t['id'], owner), data, path)
+    for t in candidates:
+        t['status'] = 'running'
+        t['owner'] = owner
+        t['updated'] = now_ms()
+    _CLAIM_IDLE_EVAL['claimed'] = [t['id'] for t in candidates]
+    _CLAIM_IDLE_EVAL['skipped'] = skipped
+    save(path, data)
+    for t in candidates:
+        show(t)
 
 
 def cmd_approve(a, data, path):
@@ -1784,12 +1900,16 @@ def _budget_epoch_of(t):
 
 def budget_owner_of(a, t):
     """预算门的调用方身份：vote 以 --by 落款（陪审员）；claim 取显式 --owner 或既有 owner
-    （gate 时点认领尚未发生，快照 owner 是认领前状态）；其余类型取任务 owner。空串=不可归因
-    （ownerless 任务/无落款投票——预算门跳过，交由命令自身语义处置）。"""
+    （gate 时点认领尚未发生，快照 owner 是认领前状态）；claim_idle 取认领方 owner（候选在
+    gate 时点尚无 owner，归因即认领请求方——#20 空闲续领受 #16 预算约束的接线点）；其余
+    类型取任务 owner。空串=不可归因（ownerless 任务/无落款投票——预算门跳过，交由命令自身
+    语义处置）。"""
     if a.cmd == 'vote':
         return a.by or ''
     if a.cmd == 'claim':
         return a.owner or (t.get('owner') or '')
+    if a.cmd == 'claim_idle':
+        return a.owner or ''
     return t.get('owner') or ''
 
 
@@ -1898,15 +2018,17 @@ def budget_gate(a, data, path):
             print(f"[budget] 告警档（计数 {count}/{th['alarm']}）：注意执行面调用开销，保持收敛", file=sys.stderr)
 
 
-def budget_evaluate(data, path, tid):
+def budget_evaluate(data, path, tid, repair=True):
     """只读预算评估（验收 a 的机器消费面，cmd_budget 用）：per-(任务,专家) 事件流计数+档位。
-    本函数绝不写事件流/视图——计数读与写隔离，封死「计数动作自身产生事件」的自激回路。"""
+    本函数绝不写事件流/视图——计数读与写隔离，封死「计数动作自身产生事件」的自激回路。
+    repair=False（v2.9 T3/T38-1 无锁快照盘点）：计数读走 read_events 快照变体（残尾容忍、
+    零自愈写），语义与其余读路径一致。"""
     t = data['tasks'].get(tid)
     th = budget_thresholds() if budget_enabled() else None
     counts = {}
     if th is not None:
         try:
-            counts = budget_counts(read_events(path), tid, _budget_epoch_of(t))
+            counts = budget_counts(read_events(path, repair=repair), tid, _budget_epoch_of(t))
         except BoardError:
             raise
         except Exception as e:
@@ -1927,6 +2049,9 @@ def cmd_budget(a, data, path):
     事件+检查点留痕），档位章与拒绝标记一并清除。budget 自身是编排面命令，不计入任何专家
     预算、也不受预算门约束。"""
     t = get_task(data, a.id)
+    # 无锁快照盘点标记（v2.9 T3/T38-1）：main 对 budget（无 --reset）走无锁分支时置位——
+    # 计数读随之走 read_events(repair=False) 快照变体（零自愈写）。--reset 恒走锁内写路径。
+    snapshot_read = bool(getattr(a, 'tb_snapshot_read', False))
     if a.reset:
         ts = now_ms()
         epoch = int(data.get('event_seq', 0) or 0)
@@ -1939,7 +2064,7 @@ def cmd_budget(a, data, path):
         save(path, data)
         show(t)
         print(f'预算纪元已重置: {a.id}（事件 seq≥{epoch} 重新计数）')
-    payload = budget_evaluate(data, path, a.id)
+    payload = budget_evaluate(data, path, a.id, repair=not snapshot_read)
     _BUDGET_EVAL['payload'] = payload
     th = payload.get('thresholds') or {}
     if payload.get('enabled'):
@@ -2314,6 +2439,11 @@ def _structured_data(a, data):
         if _BUDGET_EVAL.get('payload') is not None:
             out['budget'] = _BUDGET_EVAL['payload']
         return out
+    if a.cmd == 'claim_idle':
+        # v2.9 T3/T39-①：原子空闲认领的机器消费面——claimed/skipped 与人类面逐任务块同源
+        # （报告型命令 data 恒非空惯例沿 T27 budget；失败面的 running/skipped 在错误信封字段）。
+        return {'claimed': list(_CLAIM_IDLE_EVAL['claimed']),
+                'skipped': [dict(s) for s in _CLAIM_IDLE_EVAL['skipped']]}
     tid = getattr(a, 'id', None)
     if isinstance(tid, str) and tid in data.get('tasks', {}):
         return {'task': data['tasks'][tid]}
@@ -2402,6 +2532,25 @@ def cmd_archive(a, data, path):
         print(f'事件日志已一并归档: .expert-taskboards/archive/{os.path.basename(events_path(target))}')
 
 
+def _emit(a, data, path, json_mode):
+    """命令输出面（main 派发尾部，锁内/无锁两路共用一份实现）：--json 信封（_JsonSink 吞人类
+    stdout，信封是唯一 stdout 载荷）或缺省人类面 + revision 尾行；archive/_hook-check 不带
+    revision（与人类面末行既有约定一致）。"""
+    if json_mode:
+        # S1 结构化通道：人类可读 stdout 整体静默（_JsonSink 吞掉），信封是唯一 stdout 载荷；
+        # stderr（视图重建告警/门禁告警等诊断面）不受影响，退出码语义与缺省完全一致。
+        with contextlib.redirect_stdout(_JsonSink()):
+            a.fn(a, data, path)
+        envelope = {'ok': True, 'cmd': a.cmd, 'data': _structured_data(a, data)}
+        if a.cmd not in ('archive', '_hook-check'):  # 与人类面末行 revision 约定一致
+            envelope['revision'] = int(data.get('revision', 0))
+        print(json.dumps(envelope, ensure_ascii=False))
+    else:
+        a.fn(a, data, path)
+        if a.cmd not in ('archive', '_hook-check'):
+            print(f"revision={data.get('revision', 0)}")
+
+
 def main():
     ap = argparse.ArgumentParser(description='expert-orchestrator 任务板')
     ap.add_argument('--board', help='状态文件路径，默认 <cwd>/.expert-taskboard.json；--install-hook 时可固化项目板进 hook')
@@ -2443,6 +2592,14 @@ def main():
     p.set_defaults(fn=cmd_list)
     p = sub.add_parser('show'); p.add_argument('id'); p.set_defaults(fn=cmd_show)
     p = sub.add_parser('claim'); p.add_argument('id'); p.add_argument('owner', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_claim)
+    p = sub.add_parser('claim_idle', help='#20 空闲续领原子认领（v2.9 T3/T39-①）：单锁内「无 running 判定+认领」——'
+                                          '并发 sweep/人工 claim 竞争下恰好一个成功（board_not_idle 整轮不动）；'
+                                          '非 ready/已有 owner/不存在跳过（fail-open，全跳过 claim_idle_noop）；'
+                                          '不建代际；事件仍为 claim 类型（#16 预算计数归因不变，interrupt 档照常拒绝）')
+    p.add_argument('owner', help='认领方身份（空闲续领固定为编排者 IDLE_RECLAIM_OWNER）')
+    p.add_argument('ids', nargs='+', help='候选任务 id 列表（一次持锁内批量认领；上限由调用方 sweep 策略控制）')
+    add_write_args(p)
+    p.set_defaults(fn=cmd_claim_idle)
     p = sub.add_parser('approve'); p.add_argument('id'); add_write_args(p)
     p.set_defaults(fn=cmd_approve,
                    help='PM 规划草案批准：draft -> ready（依赖未满足先回 pending 走自动提升）；批准前 claim 被拒')
@@ -2510,6 +2667,20 @@ def main():
                 a.fn(a)
             return
         path = a.board or default_board()
+        if a.cmd == 'budget' and not getattr(a, 'reset', False):
+            # ── T38-1 降锁（v2.9 M1/T3）：只读盘点不持 board.lock 独占写锁 ──
+            # budget 是机器高频消费面（lib summonBudgetHint 每次派工逐任务盘点），此前与全部
+            # 命令互斥于独占 flock。改为无锁快照读：load(repair=False) 零写零 stderr（不重建
+            # 视图、不自愈事件流——无锁进程绝不与持锁写命令竞争 os.replace/O_APPEND），结果=
+            # 事件流某一完整前缀的折叠（链式 hash 全量校验保证为真实已落账状态），并发写进行
+            # 中时至多略滞后（快照级一致性，语义声明见 load）。零写零事件语义保持（盘点不产生
+            # 任何事件/视图写，计数自激封死不动）；--reset 与其余全部命令仍走下方锁内路径
+            # （flock 结构零改动）；错误面与信封/人类输出形态与锁内路径逐字节一致。
+            data = load(path, repair=False)
+            check_revision(a, data)  # --expected-revision 仍校验（对快照 revision，无锁下仅作乐观提示）
+            a.tb_snapshot_read = True  # cmd_budget 据此走 read_events(repair=False) 快照计数读
+            _emit(a, data, path, json_mode)
+            return
         with board_lock(path):  # 进程互斥：load -> CAS 校验 -> 写入整体原子（TOCTOU 防护）
             data = load(path)
             check_revision(a, data)  # 写命令的 CAS 校验，锁内针对最新落盘状态（读命令无该参数，透传为不校验）
@@ -2518,19 +2689,7 @@ def main():
                 # #16 预算门（T27）：升档章随本命令自身事件落账；interrupt 档在此当场拒绝
                 # （首拒落 budget 系统事件）——拒绝发生在命令体之前，命令自身零写零事件。
                 budget_gate(a, data, path)
-            if json_mode:
-                # S1 结构化通道：人类可读 stdout 整体静默（_JsonSink 吞掉），信封是唯一 stdout 载荷；
-                # stderr（视图重建告警/门禁告警等诊断面）不受影响，退出码语义与缺省完全一致。
-                with contextlib.redirect_stdout(_JsonSink()):
-                    a.fn(a, data, path)
-                envelope = {'ok': True, 'cmd': a.cmd, 'data': _structured_data(a, data)}
-                if a.cmd not in ('archive', '_hook-check'):  # 与人类面末行 revision 约定一致
-                    envelope['revision'] = int(data.get('revision', 0))
-                print(json.dumps(envelope, ensure_ascii=False))
-            else:
-                a.fn(a, data, path)
-                if a.cmd not in ('archive', '_hook-check'):
-                    print(f"revision={data.get('revision', 0)}")
+            _emit(a, data, path, json_mode)
     except BoardError as e:
         payload = {'error': e.code}
         payload.update(e.fields)

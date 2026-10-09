@@ -7620,11 +7620,96 @@ test('T3 T39-① claim_idle × #16 预算联动（taskboard 级）：interrupt �
   // 幂等：再次续领仍拒且零新增 budget 事件（防刷屏）
   assert.equal(tb(['--json', 'claim_idle', '编排者', 'T1'], th).status, 1)
   assert.equal(events().filter((e) => e.type === 'budget').length, 1, '后续拒绝幂等零事件')
+  // 完好性（v2.9 T11 必改-3）：拒绝后看板仍可用——list/replay 正常返回，事件流折叠对账不失配
+  const lstAfterRefuse = tb(['--json', 'list'], th)
+  assert.equal(lstAfterRefuse.status, 0, lstAfterRefuse.stderr)
+  assert.equal(lstAfterRefuse.json.ok, true)
+  assert.equal(tb(['replay'], th).status, 0, '拒绝后 replay 完好（折叠可复现，看板未砖化）')
   // 编排者显式重置（跨代累计语义下唯一放行出口）→ 续领放行
   assert.equal(tb(['budget', 'T1', '--reset'], th).status, 0)
   const r3 = tb(['--json', 'claim_idle', '编排者', 'T1'], th)
   assert.equal(r3.status, 0, r3.stderr)
   assert.equal(board().tasks.T1.owner, '编排者')
+})
+
+test('T11 claim_idle × #16 跨档「前章后拒」（T10 评审 🔴-1 砖化修复回归）：前候选升档章延后未落账、后候选 interrupt 拒绝——拒绝事件只携带被拒任务、折叠可复现；拒绝后 list/replay 完好、零认领、前候选章未落账；--reset 后放行并统一落章', async (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok, board, events } = makeT27BudgetBoard(t, 't11-crossrefuse')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '2', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '3' }
+  const reclaim = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30)) // 活动时点落后窗口（跨进程时钟最小间隔之上，T28 (d) 同款）
+    assert.equal(tb(['watchdog', '--window-sec', '0', '--max-nudges', '0'], th).status, 0)
+  }
+  // 跨档铺垫（reclaim 回 ready 不清计数——跨代累计）：T1 计数 2（announced=alarm 章）、
+  // T2 计数 3（announced=wrap-up 章），二者均 ready 无 owner
+  ok('create', 'A'); ok('create', 'B')
+  assert.equal(tb(['--json', 'claim_idle', '编排者', 'T1'], th).status, 0); await reclaim()
+  assert.equal(tb(['--json', 'claim_idle', '编排者', 'T1'], th).status, 0); await reclaim()
+  assert.equal(board().tasks.T1.budget.tier, 'alarm', '铺垫：T1 已落 alarm 章（第二次续领命中告警档）')
+  for (let i = 0; i < 3; i++) { assert.equal(tb(['--json', 'claim_idle', '编排者', 'T2'], th).status, 0); await reclaim() }
+  assert.equal(board().tasks.T2.budget.tier, 'wrap-up', '铺垫：T2 已落 wrap-up 章（第三次续领命中收尾档）')
+  const claimsBefore = events().filter((e) => e.type === 'claim').length
+  const budgetEvsBefore = events().filter((e) => e.type === 'budget').length
+  // 触发（修复前此处砖化：T1 wrap-up 章就地改写 data 未落账 + T2 interrupt 拒绝 → 拒绝事件
+  // 以含未落账章的 data 算末事件 state_hash 而 after 只带 T2 → 此后 list/replay 全命令 unrecoverable）
+  const refused = tb(['--json', 'claim_idle', '编排者', 'T1', 'T2'], th)
+  assert.equal(refused.status, 1)
+  assert.equal(refused.json.error, 'budget_interrupted')
+  assert.equal(refused.json.task, 'T2', '拒绝落在后候选（interrupt 档）')
+  // 拒绝事件形状不变：只携带被拒任务（前候选的延后章绝不入拒绝事件——折叠可复现性关键）
+  const budgetEvs = events().filter((e) => e.type === 'budget')
+  assert.equal(budgetEvs.length, budgetEvsBefore + 1, '首拒恰落一条 budget 系统事件')
+  assert.equal(budgetEvs[0].args.cmd, 'claim_idle')
+  assert.deepEqual(Object.keys(budgetEvs[0].after), ['T2'], '拒绝事件 after 只携带被拒任务（前候选延后章不入账）')
+  assert.equal(events().filter((e) => e.type === 'claim').length, claimsBefore, '被拒轮零认领事件')
+  // 章延后语义：前候选 wrap-up 章随拒绝轮丢弃（未落账），任务保持 ready 无 owner
+  assert.equal(board().tasks.T1.status, 'ready')
+  assert.ok(!board().tasks.T1.owner)
+  assert.equal(board().tasks.T1.budget.tier, 'alarm', '前候选升档章未落账（延后章随拒绝轮丢弃，防砖化）')
+  assert.equal(board().tasks.T2.budget.refused, true)
+  // 完好性（必改-3）：拒绝后 list/replay 可用——事件流折叠对账不失配，看板未砖化
+  const lst = tb(['--json', 'list'], th)
+  assert.equal(lst.status, 0, lst.stderr)
+  assert.equal(lst.json.ok, true)
+  assert.equal(lst.json.data.tasks.length, 2)
+  assert.equal(tb(['replay'], th).status, 0, '拒绝后 replay 完好（末事件 state_hash 可复现）')
+  // 放行路径：被拒任务 --reset 后，前候选单独续领照常放行且 wrap-up 章随 claim 事件统一落账
+  assert.equal(tb(['budget', 'T2', '--reset'], th).status, 0)
+  const r3 = tb(['--json', 'claim_idle', '编排者', 'T1'], th)
+  assert.equal(r3.status, 0, r3.stderr)
+  assert.equal(board().tasks.T1.owner, '编排者')
+  assert.equal(board().tasks.T1.budget.tier, 'wrap-up', '统一落章随 claim 事件入账')
+  assert.equal(tb(['replay'], th).status, 0, '放行后 replay 仍完好')
+})
+
+test('T11 claim_idle × #16 多候选跨档全过（章延后放行路径）：各自升档章统一落章、随单 claim 事件入账、折叠可复现', async (t) => {
+  guardT27BudgetEnv(t)
+  const { tb, ok, board, events } = makeT27BudgetBoard(t, 't11-crosspass')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '2', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '3' }
+  const reclaim = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(tb(['watchdog', '--window-sec', '0', '--max-nudges', '0'], th).status, 0)
+  }
+  ok('create', 'A'); ok('create', 'B')
+  assert.equal(tb(['--json', 'claim_idle', '编排者', 'T1'], th).status, 0); await reclaim()
+  assert.equal(tb(['--json', 'claim_idle', '编排者', 'T1'], th).status, 0); await reclaim() // T1 计数 2、announced=alarm
+  assert.equal(tb(['--json', 'claim_idle', '编排者', 'T2'], th).status, 0); await reclaim() // T2 计数 1、无章
+  const r = tb(['--json', 'claim_idle', '编排者', 'T1', 'T2'], th)
+  assert.equal(r.status, 0, r.stderr)
+  assert.deepEqual(r.json.data.claimed, ['T1', 'T2'])
+  // 各自升档章统一落账：T1 告警→收尾、T2 无章→告警，全部随同一 claim 事件入账
+  assert.equal(board().tasks.T1.budget.tier, 'wrap-up')
+  assert.equal(board().tasks.T2.budget.tier, 'alarm')
+  const last = events()[events().length - 1]
+  assert.equal(last.type, 'claim')
+  assert.deepEqual(last.args.ids, ['T1', 'T2'])
+  assert.deepEqual(Object.keys(last.after).sort(), ['T1', 'T2'], '单事件 after 携带全部变更任务（章+认领）')
+  assert.equal(last.after.T1.budget.tier, 'wrap-up', '升档章随事件可见（事件流留痕语义不变）')
+  assert.equal(last.after.T2.budget.tier, 'alarm')
+  // 折叠可复现 + 计数联动（本次 claim 各 +1）
+  assert.equal(tb(['replay'], th).status, 0, '多候选统一落账后折叠可复现')
+  assert.equal(JSON.parse(tb(['--json', 'budget', 'T1'], th).stdout).data.budget.budgets[0].count, 3)
+  assert.equal(JSON.parse(tb(['--json', 'budget', 'T2'], th).stdout).data.budget.budgets[0].count, 2)
 })
 
 const HOLD_FLOCK = `

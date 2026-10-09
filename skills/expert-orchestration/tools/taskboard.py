@@ -93,7 +93,7 @@ per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭
   自激回路。三档语义固定、阈值可配（DSH_EXPERT_TOOL_BUDGET_ALARM/_WRAPUP/_INTERRUPT，默认 200/250/300，
   须 alarm ≤ wrap-up ≤ interrupt，非法配置 fail-open 整体不启用并 stderr 告警）：告警档 alarm 非阻断
   （stderr 开销提示+档位章随本命令事件落账）；收尾档 wrap-up 非阻断（收敛指令+章）；中断档 interrupt
-  当场拒绝推进类调用（claim/progress/heartbeat/own）——首次拒绝落 type='budget' 系统事件（interrupt 章+
+  当场拒绝推进类调用（claim/claim_idle/progress/heartbeat/own）——首次拒绝落 type='budget' 系统事件（interrupt 章+
   refused 标记+检查点，revision+1）保证档位行为事件可见（验收 b），后续拒绝幂等零事件防刷屏；交付出口
   done/fail/vote 永不拒绝（中断=强迫交付而非堵死交付）。fail-safe：拒绝发生在任何命令变更之前（命令
   自身零写），预算事件只追加簿记（不动 status/owner/代际），任务板状态不受损。计数只读绝不写事件流
@@ -113,8 +113,10 @@ per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭
  空闲续领原子认领（v2.9 M1/T3，T39-① 收窄）：claim_idle <owner> <id...> 在 main 统一 board_lock
    单次持锁内完成「板上无 running 判定 + 认领」——消解 lib list 快照与 claim 之间的窄窗（并发
    sweep/人工 claim 双双入选，现恰好一个成功）；空闲闸 board_not_idle（零写零事件）、候选锁内
-   复判（非 ready/已有 owner/不存在跳过，全跳过 claim_idle_noop）、逐候选预算门（interrupt 拒绝
-   同 claim，#20 续领受 #16 预算约束零回归）；事件 type='claim' 不建派工代际，lib idle-reclaim
+   复判（非 ready/已有 owner/不存在跳过，全跳过 claim_idle_noop）、逐候选预算门两段式章延后
+   （interrupt 拒绝同 claim，#20 续领受 #16 预算约束零回归；alarm/wrap-up 升档章在全部门判定
+   通过后统一落章随 claim 事件入账——拒绝时点全板除被拒任务零变更，跨档「前章后拒」拒绝
+   事件保持折叠可复现，v2.9 T11）；事件 type='claim' 不建派工代际，lib idle-reclaim
    改调本命令（list 快照降级为 fail-open 预筛，auto-claim（WP-4a）路径不动）。
 验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
   verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
@@ -1165,8 +1167,9 @@ def cmd_claim_idle(a, data, path):
       恰好一个成功，后到者整轮不动）；
     - 候选复判（快照可滞后，fail-open）：非 ready / 已有 owner / 任务不存在 → 跳过；全部
       跳过 → BoardError claim_idle_noop（零写零事件）；
-    - 逐候选预算门（复用 budget_gate，同 claim 语义）：interrupt 档当场拒绝（首拒落 budget
-      事件、后续幂等零事件；拒绝发生在任何变更之前）——#20 续领受 #16 预算约束零回归；
+    - 逐候选预算门（复用 budget_gate，同 claim 语义；两段式章延后——v2.9 T11）：先全部候选
+      判定、后统一落章随本命令事件入账；interrupt 档当场拒绝（首拒落 budget 事件、后续幂等
+      零事件；拒绝发生在任何变更之前）——#20 续领受 #16 预算约束零回归；
       alarm/wrap-up 升档章随本命令自身事件落账；
     - 认领走既有 claim 变更语义：owner 落档、status=running、updated 重臂；不建派工代际
       （attempt_id 不触碰，lib 侧认领与 WP-4a 同代际语义）；事件 type='claim'（budget_counts
@@ -1200,11 +1203,18 @@ def cmd_claim_idle(a, data, path):
     if not candidates:
         raise BoardError('claim_idle_noop', skipped=skipped,
                          hint='候选在锁内权威状态下无一可认领（快照滞后/负向条件命中）；零写零事件')
-    # 逐候选预算门（任何变更之前）：interrupt 当场拒绝（首拒落 budget 事件，发生在候选认领
-    # 之前——整轮零认领）；alarm/wrap-up 升档章改内存态、随本命令事件落账。锁内计数读走
-    # 既有 read_events（repair=True，自愈语义与其余写命令一致）。
+    # 逐候选预算门，两段式章延后（v2.9 T11，T10 评审 🔴-1）：先全部候选判定、后统一落章——
+    # 升档章暂存 stamps，全部门判定通过后才落快照、随本命令 claim 事件入账。此前「逐候选
+    # 就地落章」在跨档组合下砖化：前候选章已就地改写 data 而未落账，后候选 interrupt 拒绝时
+    # _append_budget_event 以含未落账章的 data 算末事件 state_hash 而 after 只携带被拒任务 →
+    # 折叠对账失配，此后 list/replay 全命令 unrecoverable。章延后后，拒绝时点上全板除被拒
+    # 任务自身（拒绝事件 after 携带、可复现）零变更，拒绝/放行两条路径均保持事件流可复现
+    # 不变量。锁内计数读走既有 read_events（repair=True，自愈语义与其余写命令一致）。
+    stamps = []
     for t in candidates:
-        budget_gate(_ClaimIdleGateNS(t['id'], owner), data, path)
+        budget_gate(_ClaimIdleGateNS(t['id'], owner), data, path, stamp_sink=stamps)
+    for t, tier, who, count, th in stamps:
+        _budget_stamp(t, tier, who, count, th)  # 统一落章：随本命令 claim 事件落账（零额外事件）
     for t in candidates:
         t['status'] = 'running'
         t['owner'] = owner
@@ -1974,13 +1984,18 @@ def _budget_refuse(a, data, path, t, owner, count, th):
                           '——请立即收敛交付，或 fail 交回编排者处置（编排者可 budget --reset 显式重置或改派他人）')
 
 
-def budget_gate(a, data, path):
+def budget_gate(a, data, path, stamp_sink=None):
     """#16 预算门（写命令派发前，main 派发点调用）：执行面命令（BUDGET_COUNTED_TYPES）按
     「本次调用前已完成的事件流计数」定档——计数只读（绝不写事件流，防自激）；alarm/wrap-up
     非阻断（升档章随本命令自身事件落账 + stderr 提示）；interrupt 拒推进类调用（首拒落
     budget 事件），交付出口 done/fail/vote 永不拒绝。计数/评估内部错误 fail-open（stderr
     告警放行）——预算是成本护栏非正确性屏障；BoardError（板损坏 unrecoverable）原样上抛
-    不吞。任务不存在/不可归因（ownerless）→ 交由命令自身语义处置，预算门不越位。"""
+    不吞。任务不存在/不可归因（ownerless）→ 交由命令自身语义处置，预算门不越位。
+    stamp_sink（v2.9 T11 章延后，缺省 None=行为不变）：传入 list 时升档章不就地落快照，改以
+    (任务, tier, owner, count, th) 元组追加到 sink，由调用方在全部候选门判定通过后统一落章、
+    随其自身事件入账——供单命令多候选门（claim_idle）隔离「门判定」与「章应用」：拒绝事件
+    以发生时点的 data 算 state_hash 且 after 只携带被拒任务，任何「已就地改写而未落账」的
+    其他任务都会使折叠对账失配（T10 评审 🔴-1 砖化）。"""
     if not budget_enabled():
         return
     th = budget_thresholds()
@@ -2007,7 +2022,10 @@ def budget_gate(a, data, path):
     if tier:
         announced = BUDGET_TIER_RANK.get((t.get('budget') or {}).get('tier'), 0)
         if BUDGET_TIER_RANK[tier] > announced:
-            _budget_stamp(t, tier, owner, count, th)  # 升档章随本命令自身事件落账（零额外事件）
+            if stamp_sink is not None:
+                stamp_sink.append((t, tier, owner, count, th))  # 章延后：调用方在全部候选门通过后统一落章
+            else:
+                _budget_stamp(t, tier, owner, count, th)  # 升档章随本命令自身事件落账（零额外事件）
         if tier == 'interrupt':
             print(f"[budget] 硬预算已到（计数 {count}/{th['interrupt']}）：本调用为交付出口（done/fail），"
                   '请立即完成交付或 fail 交回编排者', file=sys.stderr)

@@ -75,7 +75,6 @@
         - id: persona
           name: '@deepseek-ai/dsh-persona'
           config:
-            suffix: Your working directory is {{cwd}}.
             prefix: |-
               你是一名专家编排代理 (Expert Orchestrator)。你的核心职能不是亲自完成工作：实施类改动一律委派专家执行，你负责分诊、请 PM 规划、委派、检查点重排、验证与整合。
 

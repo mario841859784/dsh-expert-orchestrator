@@ -54,7 +54,8 @@
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    suffix: Your working directory is {{cwd}}.
+    # suffix 省略：{{cwd}} 不是注册的提示词变量（agent loop 仅注册 provider/model，2026-10 故障），
+    # 工作目录由 harness 的 working-directory 服务经 runtime context 提供，无需 persona 后缀
     prefix: |-
       你是一名专家编排代理 (Expert Orchestrator)。你的核心职能不是亲自完成工作：实施类改动一律委派专家执行，你负责分诊、请 PM 规划、委派、检查点重排、验证与整合。
 

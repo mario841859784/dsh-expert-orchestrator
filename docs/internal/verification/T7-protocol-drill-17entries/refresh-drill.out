@@ -1,0 +1,24 @@
+seeded sentinel files: 60 (17 entries, dirs recursive)
+PASS: pre: README.md holds stale sentinel
+PASS: pre: CHANGELOG.md holds stale sentinel
+PASS: pre: README.zh.md absent (first landing expected)
+REAL MARKER BEFORE : "2.8.0+sources1"
+PASS: marker 2.7.1+sources1 → 2.8.0+sources1
+PASS: 17 PROTOCOL entries refreshed byte-identical from the package (60 files compared)
+PASS: first apply() refreshed exactly 60 files (~ lines)
+PASS: new entry README.md: sentinel overwritten, sha256 == package copy
+PASS: new entry README.zh.md: sentinel overwritten, sha256 == package copy
+PASS: new entry CHANGELOG.md: sentinel overwritten, sha256 == package copy
+PASS: refresh log covers ~ README.md (refreshEntry path)
+PASS: refresh log covers ~ README.zh.md (first landing)
+PASS: refresh log covers ~ CHANGELOG.md
+PASS: CUSTOM_EXCLUDE did not exclude README/CHANGELOG (sentinels gone, package bytes landed)
+PASS: USER_DATA untouched: skills/expert-orchestration/lessons.md
+PASS: USER_DATA untouched: expert-lessons/backend-engineer.md
+PASS: USER_DATA untouched: expert-methods/backend-engineer.md
+PASS: extra user file inside refreshed protocol dir NOT deleted
+PASS: second apply() refreshed nothing (idempotent)
+PASS: marker untouched by second apply()
+REAL MARKER AFTER  : "2.8.0+sources1"
+PASS: real deploy marker untouched (read-only对照)
+DRILL: ALL PASS (60 files, 17 entries)

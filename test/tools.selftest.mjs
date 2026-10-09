@@ -23,6 +23,7 @@ import {
   expertLessonSlug,
   extractPersonaMethod,
   filterRestrictableTools,
+  idleReclaimSweep,
   loadAliases,
   loadExpertLessons,
   loadRoster,
@@ -47,6 +48,7 @@ import {
   withProfileConstraints,
 } from '../lib/tools.js'
 import { budgetMaybeEnabled, budgetNoticeFromEnvelope } from '../lib/budget.js'
+import { IDLE_RECLAIM_MAX_TASKS, IDLE_RECLAIM_OWNER, idleReclaimEnabled, selectIdleReclaimTasks } from '../lib/idle-reclaim.js'
 import {
   EXPERT_PROFILE_FIELDS,
   EXPERT_PROFILES_FILENAME,
@@ -6965,4 +6967,358 @@ test('T27 #16 summon 接线 E2E：告警档续派附【预算】提示行（answ
   const r2 = await f.summon.execute({ expert: '甲', task: '请继续 T1 的收尾工作' }, { agent: {} })
   assert.ok(!r2.answer.includes('【预算】'), r2.answer)
   assert.ok(r2.answer.includes('【auto-claim】'), 'auto-claim 行为不受影响')
+})
+
+// ── T28 #20 idle-edge 自动续领（v2.8 M8-2 / WP-7 ②）────────────────────────────
+// 用例构造视角（自指断言盲区防御，同 T27）：以独立消费方视角用真实 taskboard.py 子进程
+// + 真实 summon mock 通道（makeWp4aDst/makeWp4aCtx）驱动，断言只看板折叠视图/事件流产物。
+// 负向场景（有开放执行/非 ready/已有 owner/开关关闭/预算超限/失败边沿）逐一生效；
+// 开关沿 T26/T27 惯例：DSH_EXPERT_IDLE_RECLAIM 默认关闭 opt-in。
+
+const IDLE_ENV_KEYS = ['DSH_EXPERT_IDLE_RECLAIM']
+
+/** T28 env 守卫：清掉部署环境可能注入的自动续领开关（隔离基线），结束恢复。 */
+const guardT28IdleEnv = (t) => {
+  const saved = {}
+  for (const k of IDLE_ENV_KEYS) {
+    saved[k] = process.env[k]
+    delete process.env[k]
+  }
+  t.after(() => {
+    for (const k of IDLE_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  })
+}
+
+test('T28 #20 开关与选择纯函数：默认关闭/0/空串关、置其他值开；running 阻断整轮；仅 ready 无 owner 入选；上限 8 截断', () => {
+  // 开关语义与 lib/budget.js budgetMaybeEnabled（#16）同构（opt-in 默认关闭）
+  assert.equal(idleReclaimEnabled({}), false, '未设置=关闭（默认）')
+  assert.equal(idleReclaimEnabled({ DSH_EXPERT_IDLE_RECLAIM: '' }), false)
+  assert.equal(idleReclaimEnabled({ DSH_EXPERT_IDLE_RECLAIM: '0' }), false)
+  assert.equal(idleReclaimEnabled({ DSH_EXPERT_IDLE_RECLAIM: '1' }), true)
+  assert.equal(idleReclaimEnabled({ DSH_EXPERT_IDLE_RECLAIM: 'on' }), true)
+  assert.equal(IDLE_RECLAIM_OWNER, '编排者')
+  assert.equal(IDLE_RECLAIM_MAX_TASKS, 8)
+  // 选择：板上任一 running（开放执行/开放 attempt）→ 整轮不动
+  assert.deepEqual(selectIdleReclaimTasks([{ id: 'T1', status: 'ready' }, { id: 'T2', status: 'running' }]),
+    { ok: false, reason: 'open_attempt' })
+  // 仅 ready 且无 owner 入选（owner 空串与缺失键等价）；draft/pending/done/failed/rejected/escalated 全跳过
+  const tasks = [
+    { id: 'T1', status: 'ready', owner: '' },
+    { id: 'T2', status: 'ready' }, // owner 缺失键=无 owner
+    { id: 'T3', status: 'ready', owner: '前任' }, // 已有 owner 不动
+    { id: 'T4', status: 'draft' },
+    { id: 'T5', status: 'pending' },
+    { id: 'T6', status: 'done' },
+    { id: 'T7', status: 'failed' },
+    { id: 'T8', status: 'rejected' },
+    { id: 'T9', status: 'escalated' },
+  ]
+  const sel = selectIdleReclaimTasks(tasks)
+  assert.equal(sel.ok, true)
+  assert.deepEqual(sel.ids, ['T1', 'T2'])
+  assert.equal(sel.truncated, false)
+  assert.equal(sel.total, 2)
+  // 上限 8：超出取前 8 并标记截断（list 已按 id 升序，选择保持确定性）
+  const many = Array.from({ length: 11 }, (_, i) => ({ id: `T${i + 1}`, status: 'ready' }))
+  const capped = selectIdleReclaimTasks(many)
+  assert.deepEqual(capped.ids, ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'])
+  assert.equal(capped.truncated, true)
+  assert.equal(capped.total, 11)
+  // 非数组/条目形状非法 fail-open 按空处理
+  assert.deepEqual(selectIdleReclaimTasks(null), { ok: true, ids: [], truncated: false, total: 0 })
+  assert.deepEqual(selectIdleReclaimTasks([null, 'x', { status: 'ready' }]), { ok: true, ids: [], truncated: false, total: 0 })
+})
+
+test('T28 #20 (a) 空闲边沿正例：summon 收尾自动续领 ready 无 owner 任务（owner=编排者）——走真实 claim 路径、不建代际；已有 owner 条目不动', async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board, events } = makeT27BudgetBoard(t, 't28-claim')
+  ok('create', '任务A') // T1 ready 无 owner
+  ok('create', '任务B', '--owner', '前任') // T2 ready 有 owner（负向③）
+  const dst = makeWp4aDst(t, 't28-claim')
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir: dir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  try {
+    // 任务书不引用任何任务编号：派工即回写（WP-4a）零动作，空闲边沿续领是唯一认领来源
+    const r = await summon.execute({ expert: '测试专家', task: '纯收尾总结任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.ok(r.answer.startsWith('ok'), r.answer)
+    assert.ok(r.answer.includes('【自动续领】T1 已自动认领（owner=编排者，板=default.json）'), r.answer)
+    assert.ok(!r.answer.includes('T2'), '已有 owner 的 T2 不入提示（未被动过）', r.answer)
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'running')
+  assert.equal(b.tasks.T1.owner, '编排者')
+  assert.equal(b.tasks.T2.status, 'ready', '已有 owner 条目不动（负向③）')
+  assert.equal(b.tasks.T2.owner, '前任')
+  // ④ 走既有 claim 路径：事件流恰一条 claim 事件（owner=编排者、running）；lib 侧认领与
+  // WP-4a 同代际语义——不建派工代际（无 attempt_id），代际仍由编排者 claim --attempt/reassign 建立
+  const claimEvs = events().filter((e) => e.type === 'claim' && e.after?.T1)
+  assert.equal(claimEvs.length, 1)
+  assert.equal(claimEvs[0].after.T1.owner, '编排者')
+  assert.equal(claimEvs[0].after.T1.status, 'running')
+  assert.equal(b.tasks.T1.attempt_id, undefined)
+})
+
+test('T28 #20 (b①) 负向·有开放执行：板上有 running 任务（真实 claim --attempt 建立代际）→ 整轮不动，ready 无 owner 任务保持 ready', async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't28-open')
+  ok('create', '任务A') // T1 ready 无 owner
+  ok('create', '任务B') // T2
+  ok('claim', 'T2', '某人', '--attempt', 'a28open') // T2 running（开放代际）
+  const before = readFileSync(join(dir, '.expert-taskboards', 'default.json'))
+  const dst = makeWp4aDst(t, 't28-open')
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir: dir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  try {
+    const r = await summon.execute({ expert: '测试专家', task: '纯观察任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.equal(r.answer, 'ok', '整轮不动 → 零提示（answer 逐字节不变）')
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'ready', 'ready 无 owner 条目未被续领')
+  assert.ok(!b.tasks.T1.owner)
+  assert.equal(b.tasks.T2.status, 'running')
+  assert.equal(b.tasks.T2.owner, '某人')
+  assert.deepEqual(readFileSync(join(dir, '.expert-taskboards', 'default.json')), before, '板逐字节零变化')
+})
+
+test('T28 #20 (b②③) 负向·非 ready 与已有 owner：无一入选，板逐字节零变化', async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't28-nonready')
+  ok('create', '任务A')
+  ok('claim', 'T1', '某人')
+  ok('done', 'T1', '已完成') // T1 done
+  ok('create', '任务B', '--draft') // T2 draft（批准前零 spawn 面外）
+  ok('create', '任务C', '--dep', 'T2') // T3 pending（依赖 draft 不提升）
+  ok('create', '任务D', '--owner', '前任') // T4 ready 有 owner
+  ok('create', '任务E')
+  ok('claim', 'T5', '某人')
+  ok('fail', 'T5', '原因') // T5 failed
+  const before = readFileSync(join(dir, '.expert-taskboards', 'default.json'))
+  const dst = makeWp4aDst(t, 't28-nonready')
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir: dir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  try {
+    const r = await summon.execute({ expert: '测试专家', task: '纯观察任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.equal(r.answer, 'ok', '无一入选 → 零提示')
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'done')
+  assert.equal(b.tasks.T2.status, 'draft')
+  assert.equal(b.tasks.T3.status, 'pending')
+  assert.equal(b.tasks.T4.status, 'ready')
+  assert.equal(b.tasks.T4.owner, '前任')
+  assert.equal(b.tasks.T5.status, 'failed')
+  assert.deepEqual(readFileSync(join(dir, '.expert-taskboards', 'default.json')), before, '板逐字节零变化')
+})
+
+test("T28 #20 (c) 开关默认关闭：未设置/'0' 时零提示零板变化；开启但板不可唯一定位时静默跳过（fail-open 不炸召唤）", async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't28-off')
+  ok('create', '任务A') // T1 ready 无 owner
+  const boardPath = join(dir, '.expert-taskboards', 'default.json')
+  const before = readFileSync(boardPath)
+  const dst = makeWp4aDst(t, 't28-off')
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir: dir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // 缺省（默认态）：零提示、板逐字节零变化——summon 行为与开启前逐字节一致
+  const r = await summon.execute({ expert: '测试专家', task: '纯观察任务，任务书不引用任何任务编号' }, { agent: {} })
+  assert.equal(r.answer, 'ok')
+  assert.deepEqual(readFileSync(boardPath), before)
+  assert.equal(board().tasks.T1.status, 'ready')
+  // 显式 '0' 同效
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '0'
+  try {
+    const r0 = await summon.execute({ expert: '测试专家', task: '纯观察任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.equal(r0.answer, 'ok')
+    assert.deepEqual(readFileSync(boardPath), before)
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+  // 开启但 cwd 下无板：静默跳过（与 summonBudgetHint 同语义），召唤不受阻
+  const emptyDir = mkdtempSync(join(tmpdir(), 't28-noboard-'))
+  t.after(() => rmSync(emptyDir, { recursive: true, force: true }))
+  const dst2 = makeWp4aDst(t, 't28-noboard')
+  const { descriptors: d2, ctx: ctx2 } = makeWp4aCtx()
+  registerExpertTools(ctx2, { dst: dst2, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: emptyDir })
+  const summon2 = d2.find((d) => d.name === 'summon_expert')
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  try {
+    const r2 = await summon2.execute({ expert: '测试专家', task: '纯观察任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.equal(r2.answer, 'ok')
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+})
+
+test('T28 #20 (d) #16 预算联动：续领复用 claim 路径——(任务,编排者) 计数跨 reclaim 累计达 interrupt 即续领被拒（budget_interrupted），任务保持 ready；budget --reset 后放行', async (t) => {
+  guardT27BudgetEnv(t)
+  guardT28IdleEnv(t)
+  const { dir, tb, ok, board, events } = makeT27BudgetBoard(t, 't28-budget')
+  const th = { DSH_EXPERT_TOOL_BUDGET: '1', DSH_EXPERT_TOOL_BUDGET_ALARM: '1', DSH_EXPERT_TOOL_BUDGET_WRAPUP: '1', DSH_EXPERT_TOOL_BUDGET_INTERRUPT: '1' }
+  ok('create', '任务A') // T1 ready 无 owner
+  const dst = makeWp4aDst(t, 't28-budget')
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir: dir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const setEnv = () => {
+    for (const [k, v] of Object.entries(th)) process.env[k] = v
+    process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  }
+  const clearEnv = () => {
+    for (const k of Object.keys(th)) delete process.env[k]
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+  // 第一次 summon 空闲边沿续领：claim 计数 0 < INTERRUPT=1 → 放行（owner=编排者）
+  setEnv()
+  try {
+    const r1 = await summon.execute({ expert: '测试专家', task: '纯收尾总结任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.ok(r1.answer.includes('【自动续领】T1 已自动认领（owner=编排者'), r1.answer)
+  } finally {
+    clearEnv()
+  }
+  assert.equal(board().tasks.T1.status, 'running')
+  // watchdog reclaim（窗口 0 + max-nudges 0 直接升级；无落盘完成证据 → reclaim 回 ready 清 owner）
+  await new Promise((resolve) => setTimeout(resolve, 30)) // 活动时点落后窗口（跨进程时钟最小间隔之上）
+  const wd = tb(['watchdog', '--window-sec', '0', '--max-nudges', '0'], th)
+  assert.equal(wd.status, 0, wd.stderr)
+  assert.ok(wd.stdout.includes('reclaim'), wd.stdout)
+  assert.equal(board().tasks.T1.status, 'ready')
+  assert.equal(board().tasks.T1.owner, '', 'reclaim 清 owner（续领场景结构基础）')
+  // 第二次 summon 空闲边沿续领：claim 预算门 (T1,编排者)=1 ≥ INTERRUPT=1 → budget_interrupted 当场被拒，
+  // 任务保持 ready（自动续领复用 claim 路径即自动受预算约束，无法绕过预算空转）
+  setEnv()
+  try {
+    const r2 = await summon.execute({ expert: '测试专家', task: '纯收尾总结任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.ok(r2.answer.includes('【自动续领】T1 认领失败（已忽略，不阻塞派工）：budget_interrupted'), r2.answer)
+  } finally {
+    clearEnv()
+  }
+  assert.equal(board().tasks.T1.status, 'ready', '被拒后任务保持 ready')
+  assert.ok(!board().tasks.T1.owner)
+  assert.equal(board().tasks.T1.budget.refused, true)
+  const refuseEvs = events().filter((e) => e.type === 'budget' && e.args?.action === 'refuse')
+  assert.equal(refuseEvs.length, 1, '首拒落 budget 系统事件（档位行为事件可见）')
+  assert.equal(refuseEvs[0].args.cmd, 'claim')
+  assert.equal(refuseEvs[0].args.owner, '编排者')
+  assert.equal(refuseEvs[0].args.tier, 'interrupt')
+  // 编排者显式重置（跨代累计语义下唯一放行出口）→ 第三次 summon 续领放行
+  const reset = tb(['budget', 'T1', '--reset'], th)
+  assert.equal(reset.status, 0, reset.stderr)
+  setEnv()
+  try {
+    const r3 = await summon.execute({ expert: '测试专家', task: '纯收尾总结任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.ok(r3.answer.includes('【自动续领】T1 已自动认领（owner=编排者'), r3.answer)
+  } finally {
+    clearEnv()
+  }
+  assert.equal(board().tasks.T1.status, 'running')
+  assert.equal(board().tasks.T1.owner, '编排者')
+})
+
+test('T28 #20 (e) summon_experts 批量：空闲边沿在最后一位收尾恰触发一次（恰好一个 answer 携带续领提示，板面恰认领一次）', async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't28-batch')
+  ok('create', '任务A') // T1 ready 无 owner
+  const dst = makeWp4aDst(t, 't28-batch')
+  const { descriptors, ctx } = makeWp4aCtx({ boardDir: dir })
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const batch = descriptors.find((d) => d.name === 'summon_experts')
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  let value
+  try {
+    value = await batch.execute({ experts: [
+      { expert: '测试专家', task: '批量项一，任务书不引用任何任务编号' },
+      { expert: '测试专家', task: '批量项二，任务书同样不引用任何任务编号' },
+    ] }, { agent: {} })
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+  assert.equal(value.results.length, 2)
+  assert.ok(value.results.every((e) => e.ok === true), JSON.stringify(value.results))
+  assert.equal(value.results.filter((e) => e.answer.includes('【自动续领】T1 已自动认领')).length, 1, '空闲边沿恰触发一次')
+  assert.ok(isLosslessJson(value))
+  const b = board()
+  assert.equal(b.tasks.T1.status, 'running')
+  assert.equal(b.tasks.T1.owner, '编排者')
+})
+
+test('T28 #20 (f) 失败边沿不扫描 + 计数不泄漏：专家执行失败不触发续领；同会话紧接着的成功收尾仍能正常触发（证明失败路径已递减）', async (t) => {
+  guardT28IdleEnv(t)
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't28-fail')
+  ok('create', '任务A') // T1 ready 无 owner
+  const dst = makeWp4aDst(t, 't28-fail')
+  // 可控 stopReason 的 mock provider：同一 registerExpertTools 闭包内先失败后成功
+  const descriptors = []
+  let stop = 'failed'
+  const ctx = {
+    tools: { register: (d) => descriptors.push(d) },
+    subagents: {
+      getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+      start: async () => ({ result: Promise.resolve({ stopReason: stop, output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }),
+    },
+  }
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dir })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  process.env.DSH_EXPERT_IDLE_RECLAIM = '1'
+  try {
+    // 失败边沿：专家执行失败 → 不扫描（板静默，T1 保持 ready）
+    await assert.rejects(
+      () => summon.execute({ expert: '测试专家', task: '纯观察任务，任务书不引用任何任务编号' }, { agent: {} }),
+      (error) => {
+        assert.ok(/专家执行未正常完成/.test(error.message), error.message)
+        assert.ok(!error.message.includes('自动续领'), '失败边沿不产出续领提示')
+        return true
+      },
+    )
+    assert.equal(board().tasks.T1.status, 'ready')
+    assert.ok(!board().tasks.T1.owner)
+    // 成功边沿：若失败路径漏递减（idleFlight 残留 1），本次收尾计数为 1 ≠ 0 不会扫描——
+    // T1 被续领即证明失败路径已正确递减（计数不泄漏）
+    stop = 'completed'
+    const r = await summon.execute({ expert: '测试专家', task: '纯收尾总结任务，任务书不引用任何任务编号' }, { agent: {} })
+    assert.ok(r.answer.includes('【自动续领】T1 已自动认领（owner=编排者'), r.answer)
+    assert.equal(board().tasks.T1.status, 'running')
+    assert.equal(board().tasks.T1.owner, '编排者')
+  } finally {
+    delete process.env.DSH_EXPERT_IDLE_RECLAIM
+  }
+})
+
+test('T28 #20 idleReclaimSweep 直呼：无板/板损坏/信封异常全 fail-open 空串；owner/max 可注入', async (t) => {
+  guardT28IdleEnv(t)
+  // 无板：空串
+  const emptyDir = mkdtempSync(join(tmpdir(), 't28-sweep-noboard-'))
+  t.after(() => rmSync(emptyDir, { recursive: true, force: true }))
+  assert.equal(await idleReclaimSweep({ cwd: emptyDir }), '')
+  // 板损坏：list 返回 unrecoverable → 空串
+  const corruptDir = mkdtempSync(join(tmpdir(), 't28-sweep-corrupt-'))
+  t.after(() => rmSync(corruptDir, { recursive: true, force: true }))
+  mkdirSync(join(corruptDir, '.expert-taskboards'), { recursive: true })
+  writeFileSync(join(corruptDir, '.expert-taskboards', 'default.json'), '{not-json')
+  assert.equal(await idleReclaimSweep({ cwd: corruptDir }), '')
+  // 正常板：owner/max 注入生效（自定义 owner 落板；max=1 截断说明）
+  const { dir, ok, board } = makeT27BudgetBoard(t, 't28-sweep')
+  ok('create', '任务A')
+  ok('create', '任务B')
+  const hint = await idleReclaimSweep({ cwd: dir, owner: '代领人', max: 1 })
+  assert.ok(hint.includes('【自动续领】就绪任务共 2 个，超过上限 1，仅续领前 1 个'), hint)
+  assert.ok(hint.includes('T1 已自动认领（owner=代领人，板=default.json）'), hint)
+  assert.equal(board().tasks.T1.status, 'running')
+  assert.equal(board().tasks.T1.owner, '代领人')
+  assert.equal(board().tasks.T2.status, 'ready', '上限外的条目不动')
 })

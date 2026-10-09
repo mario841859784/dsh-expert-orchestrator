@@ -475,6 +475,8 @@ def _event_args(a):
         return {'dep': a.dep}
     if c == 'verify':
         return {'files': list(a.files or [])}
+    if c == 'own':
+        return {'paths': list(a.paths or [])}
     return {}  # retry/recover/approve/reject 等无附加意图
 
 
@@ -483,7 +485,7 @@ def _event_args(a):
 # boards/archive/replay/_hook-check 永不 save，不武装——免去每次读命令两次全量 tasks deepcopy。
 _WRITE_CMDS = frozenset(('create', 'claim', 'done', 'fail', 'progress', 'recover', 'retry',
                          'reassign', 'set_dependencies', 'verify', 'heartbeat', 'watchdog', 'approve',
-                         'reject', 'vote'))
+                         'reject', 'vote', 'own'))
 
 
 def _arm_event_ctx(a, data):
@@ -876,6 +878,57 @@ def show(t):
     scope = (' scope=' + ','.join(t['scope'])) if t.get('scope') else ''
     kind = (f" kind={t['kind']}") if t.get('kind') else ''  # 缺省任务不带 kind 字段（行为不变）
     print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}{scope}{kind}")
+    if t.get('artifacts'):
+        print(f"  工件归属: {', '.join(t['artifacts'])}")
+
+
+# 终态集合（工件归属让位判定用）：终态任务的旧归属不再阻止新任务登记同一工件
+# ——返工/repair 重开同一工件是正常路径（expert-team「创建放行」语义在任务级投影）。
+TERMINAL_STATUSES = ('done', 'failed', 'rejected', 'escalated')
+
+
+def cmd_own(a, data, path):
+    """own <id> <path>...：工件归属门禁（#22，T26）——任务级工件归属台账 + 冲突拒绝。
+    判据对齐 expert-team artifact-ownership（调研 C-expert-team-swarm R1：「创建放行 /
+    覆写非负责人工件当场 deny」在任务级投影）：路径未被其他**开放**任务持有 → 记归属
+    放行；已被其他开放任务（pending/ready/running）持有 → 具名拒绝 artifact_owned
+    （零事件零落盘），报错含持有者任务与状态；终态任务（TERMINAL_STATUSES）的旧归属
+    自动让位；本任务重复 own 同一路径幂等（重入放行）。路径为声明意图（文件/目录均可，
+    不要求已存在——「创建放行」），不做存在性查询。TASKBOARD_DISABLE_OWNERSHIP 显式
+    关闭冲突拒绝（stderr 告警放行只记录——逃生口，与 TASKBOARD_DISABLE_FLOCK 同惯例）。
+    --attempt 走既有代际校验（不带不校验，与 progress 同口径）；--expected-revision CAS
+    照常共存。"""
+    t = get_task(data, a.id)
+    check_attempt(a, t)
+    if t['status'] in ('draft', 'rejected', 'escalated', 'done', 'failed'):
+        sys.exit(f"错误：{a.id} 状态为 {t['status']}，工件归属登记仅接受 pending/ready/running")
+    paths = []
+    for p in a.paths:
+        p = p.strip()
+        if p and p not in paths:
+            paths.append(p)
+    if not paths:
+        sys.exit('错误：至少需要一个工件路径')
+    owned = {}
+    for other_id, other in data['tasks'].items():
+        if other_id == a.id or other['status'] in TERMINAL_STATUSES:
+            continue
+        for p in (other.get('artifacts') or []):
+            owned.setdefault(p, []).append(other_id)
+    conflicts = {p: owned[p] for p in paths if p in owned}
+    if conflicts:
+        if os.environ.get('TASKBOARD_DISABLE_OWNERSHIP'):
+            print('工件归属门禁告警：TASKBOARD_DISABLE_OWNERSHIP 已关闭冲突拒绝，本次仅登记不校验（恢复口，用后请移除）',
+                  file=sys.stderr)
+        else:
+            detail = '；'.join(f"{p} ← 已被 {','.join(ids)} 登记" for p, ids in sorted(conflicts.items()))
+            raise BoardError('artifact_owned', task=a.id, conflicts=detail,
+                             hint='工件已被其他开放任务登记归属：等其收口后重登记，或把该工件划入在持任务处理')
+    arts = t.get('artifacts') or []
+    t['artifacts'] = arts + [p for p in paths if p not in arts]
+    t['updated'] = now_ms()
+    save(path, data)
+    show(t)
 
 
 def cmd_create(a, data, path):
@@ -2076,6 +2129,8 @@ def main():
     p = sub.add_parser('reassign'); p.add_argument('id'); p.add_argument('attempt_id', help='新派工代际 attempt_id（编排者生成）'); p.add_argument('--owner'); add_write_args(p); p.set_defaults(fn=cmd_reassign)
     p = sub.add_parser('set_dependencies'); p.add_argument('id'); p.add_argument('--dep', required=True, help='逗号分隔的依赖任务ID（整体替换）'); add_write_args(p); p.set_defaults(fn=cmd_set_dependencies)
     p = sub.add_parser('verify'); p.add_argument('id'); p.add_argument('files', nargs='*', help='文件范围清单；缺省=重算既有回执输出 fresh/stale'); add_write_args(p); p.set_defaults(fn=cmd_verify)
+    p = sub.add_parser('own', help='工件归属门禁（#22）：登记任务工件归属；与其他开放任务冲突时具名拒绝 artifact_owned')
+    p.add_argument('id'); p.add_argument('paths', nargs='+', help='工件路径清单（文件/目录均可，声明意图不要求已存在）'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_own)
     p = sub.add_parser('replay'); p.set_defaults(fn=cmd_replay,
                                                  help='显式从事件流重放折叠状态并重写视图文件（幂等；崩溃演练/人工核对）')
     p = sub.add_parser('_hook-check', help=argparse.SUPPRESS)  # commit-msg hook 内部入口，非用户命令

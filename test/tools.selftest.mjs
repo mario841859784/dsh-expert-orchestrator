@@ -70,6 +70,7 @@ import {
 import { copyFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { readFileSync } from 'node:fs'
+import { realpathSync } from 'node:fs' // T26 链路 cwd 归一断言用（existsSync 已于本文件 1811 行导入）
 
 const PERSONA_LIMIT = 100000 // 与 tools.js MAX_PERSONA_CHARS 一致
 
@@ -5824,7 +5825,7 @@ test('T15 #19 parseExpertProfile 字段级校验与 profileForExpert 归一命�
   assert.equal(parseExpertProfile({ model: '  ' }, warn).profile, null)
   assert.equal(parseExpertProfile('不是对象', warn).ok, false)
   assert.equal(parseExpertProfile({ skills: [] }, warn).profile, null, '空数组视同未配置')
-  assert.deepEqual(EXPERT_PROFILE_FIELDS, ['model', 'tools', 'skills', 'mcp'])
+  assert.deepEqual(EXPERT_PROFILE_FIELDS, ['model', 'tools', 'skills', 'mcp', 'effort']) // T26 #22 新增 effort 字段
   // profileForExpert：精确 → 归一 → 未命中
   const profiles = loadExpertProfiles({})
   assert.equal(profileForExpert({ 后端工程师: { model: 'm' } }, '后端工程师').model, 'm')
@@ -5992,4 +5993,598 @@ test('T34 备忘(a) E2E：tools.allow=[] 空数组 fail-closed——toolFilter.a
     '消费面 fail-closed：点名工具全部不可见 → guidance 段全剪（#17 联动）',
   )
   assert.ok(specs[0].persona.includes('正文'), '段外正文不受影响')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T26（v2.8 M8-2）：#21 origin chain 递归防护 + #22 四小门禁
+// （工件归属门禁 + 振荡检测 + effort 预检 + per-cwd 写锁，各自 <200 行）
+// 验收对照：WP-7 (c) A→B→A 链拒绝且报错含链路；(d) 同 cwd 双专家并发写被拒而非排队；
+// (e) 振荡 N 次来回后告警；deny 列表与宿主 restrictableNames 动态求交有单测。
+// 递归链/写锁用例按独立消费方视角构造：真实子进程 + 独立 cwd fixture（避免工具自测
+// 自指断言盲区）；A→B→A 链以三个真实嵌套 summon 形态（每个 hop 一个真实 node 子进程）模拟。
+// ═══════════════════════════════════════════════════════════════════════════
+import { hostRestrictableNames } from '../lib/tools.js' // T26 求交（filterRestrictableTools 已在上文导入）
+import {
+  checkOriginChain,
+  extendOriginChain,
+  normalizeCwdAnchor,
+  originChainDepth,
+  originChainEnabled,
+  parseOriginChain,
+  renderOriginChain,
+  renderOriginChainMarker,
+} from '../lib/origin-chain.js'
+import { acquireCwdWriteLock, cwdLockEnabled } from '../lib/cwd-lock.js'
+import {
+  alternationRunLength,
+  createOscillationDetector,
+  oscillationEnabled,
+  oscillationRoundTrips,
+  oscillationThreshold,
+} from '../lib/oscillation.js'
+import { preflightEffort } from '../lib/effort-preflight.js'
+
+/** T26 用例的进程级环境守卫：四个门禁开关 + 振荡阈值，防部署环境残留污染断言。 */
+const guardT26Env = (t, { keepCwdLock } = {}) => {
+  const keys = ['DSH_EXPERT_ORIGIN_CHAIN', 'DSH_EXPERT_OSCILLATION', 'DSH_EXPERT_OSCILLATION_N', 'DSH_EXPERT_EFFORT']
+  if (!keepCwdLock) keys.push('DSH_EXPERT_CWD_LOCK')
+  const saved = {}
+  for (const k of keys) {
+    saved[k] = process.env[k]
+    delete process.env[k]
+  }
+  t.after(() => {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  })
+}
+
+/** T26 summon 夹具：双专家花名册（甲/乙）+ start spec 捕获。 */
+const makeT26Fixture = (t, label, { capabilities = {} } = {}) => {
+  const f = makeProfileFixture(t, label)
+  writeFileSync(join(f.dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({
+    core: [
+      { source: 'bundled-core', file: 'a.md', name: '甲' },
+      { source: 'bundled-core', file: 'b.md', name: '乙' },
+    ],
+  }))
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  return { ...f, specs, summon }
+}
+
+test('T26 origin-chain 纯函数：无标记字节保真/解析/多标记取末/坏标记 fail-open/延伸与重复对/深度推导/渲染往返', (t) => {
+  guardT26Env(t)
+  // 无标记：text 逐字节原样
+  const raw = '任务书正文\n\n第二行  \n'
+  const p0 = parseOriginChain(raw)
+  assert.deepEqual(p0.chain, [])
+  assert.equal(p0.text, raw, '无标记任务书逐字节零扰动')
+  // 有标记：解析 + 剥除
+  const chain = [{ n: '甲', c: '/w/1' }, { n: '乙', c: '/w/1' }]
+  const withMark = `正文\n\n${renderOriginChainMarker(chain)}`
+  const p1 = parseOriginChain(withMark)
+  assert.deepEqual(p1.chain, chain)
+  assert.equal(p1.text, '正文')
+  // 多标记取末（最后者最权威）
+  const p2 = parseOriginChain(`${renderOriginChainMarker([{ n: 'X', c: '/a' }])}\n中段\n${renderOriginChainMarker(chain)}`)
+  assert.deepEqual(p2.chain, chain)
+  // 坏标记（有闭合括号但 JSON 断裂）：warn + 按无链 + 标记行仍剥除（不随出站漂流）
+  const warns = []
+  const p3 = parseOriginChain('正文\n<!-- origin-chain: [{"n":"甲",}] -->', { warn: (m) => warns.push(m) })
+  assert.deepEqual(p3.chain, [])
+  assert.ok(warns.some((m) => m.includes('解析失败')))
+  assert.equal(p3.text, '正文')
+  assert.ok(!p3.text.includes('origin-chain'))
+  // 未闭合的伪标记（正则不命中）：按普通文本透传（零扰动）
+  const warns2 = []
+  const p3b = parseOriginChain('正文\n<!-- origin-chain: [{"n":"甲", -->', { warn: (m) => warns2.push(m) })
+  assert.deepEqual(p3b.chain, [])
+  assert.deepEqual(warns2, [], '未闭合形态不告警（不命中标记正则）')
+  assert.ok(p3b.text.includes('origin-chain'), '透传不剥除')
+  // hop 形状非法（缺 c）：同样 fail-open
+  const p4 = parseOriginChain(renderOriginChainMarker([{ n: '甲' }]), { warn: (m) => warns.push(m) })
+  assert.deepEqual(p4.chain, [])
+  // 延伸与重复对：无重复 → 延伸；重复对 → ok:false + cycle
+  const e1 = extendOriginChain([{ n: '甲', c: '/w' }], { n: '乙', c: '/w' })
+  assert.equal(e1.ok, true)
+  assert.deepEqual(e1.chain, [{ n: '甲', c: '/w' }, { n: '乙', c: '/w' }])
+  const e2 = extendOriginChain([{ n: '甲', c: '/w' }, { n: '乙', c: '/w' }], { n: '甲', c: '/w' })
+  assert.equal(e2.ok, false)
+  assert.deepEqual(e2.cycle, { n: '甲', c: '/w' })
+  // 同名不同 cwd / 同 cwd 不同名：均不构成重复对（(n,c) 二元组判据）
+  assert.equal(extendOriginChain([{ n: '甲', c: '/w1' }], { n: '甲', c: '/w2' }).ok, true)
+  assert.equal(extendOriginChain([{ n: '甲', c: '/w' }], { n: '乙', c: '/w' }).ok, true)
+  // 深度由链长推导（无独立计数字段）
+  assert.equal(originChainDepth([]), 0)
+  assert.equal(originChainDepth(e1.chain), 2)
+  assert.equal(originChainDepth([...e1.chain, { n: '甲', c: '/w' }]), 3)
+  // 渲染（报错含链路本身）与标记行往返
+  assert.equal(renderOriginChain(e1.chain), '甲@/w → 乙@/w')
+  assert.deepEqual(parseOriginChain(`x\n${renderOriginChainMarker(e1.chain)}`).chain, e1.chain)
+  // cwd 归一：realpath 失败回退原值
+  assert.equal(normalizeCwdAnchor('/nonexistent-t26-anchor-xyz'), '/nonexistent-t26-anchor-xyz')
+  assert.equal(normalizeCwdAnchor(process.cwd()), realpathSync(process.cwd()))
+})
+
+test('T26 origin-chain 开关：DSH_EXPERT_ORIGIN_CHAIN 仅 0/空串关闭（沿既有惯例）', () => {
+  assert.equal(originChainEnabled({}), true)
+  assert.equal(originChainEnabled({ DSH_EXPERT_ORIGIN_CHAIN: '1' }), true)
+  assert.equal(originChainEnabled({ DSH_EXPERT_ORIGIN_CHAIN: '0' }), false)
+  assert.equal(originChainEnabled({ DSH_EXPERT_ORIGIN_CHAIN: '' }), false)
+})
+
+test('T26 #21 (c) 进程内单元：A→B→A 链拒绝且报错含链路本身；自召唤（A→A）同样拒绝', async (t) => {
+  guardT26Env(t)
+  const f = makeT26Fixture(t, 'chain-unit')
+  // hop1：编排者召唤 甲 → 任务书尾部出现单跳标记行
+  {
+    await f.summon.execute({ expert: '甲', task: '顶层任务书' }, { agent: {} })
+    const book1 = f.specs[0].prompt[0].text
+    const lines1 = book1.split('\n')
+    assert.ok(lines1[lines1.length - 1].startsWith('<!-- origin-chain: '), '标记行收尾')
+    assert.ok(book1.includes('"n":"甲"'), '标记含专家名')
+    assert.ok(book1.includes('顶层任务书'), '任务正文保留')
+    const parsed = parseOriginChain(book1)
+    assert.equal(parsed.chain.length, 1)
+    assert.equal(parsed.chain[0].n, '甲')
+    assert.equal(parsed.chain[0].c, realpathSync(f.root))
+  }
+  // hop2：甲（承书）召唤 乙，任务书携带收到的标记行（§5 复制约定）→ 新标记 [甲,乙]
+  const book1 = f.specs[0].prompt[0].text
+  await f.summon.execute({ expert: '乙', task: book1 }, { agent: {} })
+  const book2 = f.specs[1].prompt[0].text
+  const chain2 = parseOriginChain(book2).chain
+  assert.deepEqual(chain2.map((h) => h.n), ['甲', '乙'])
+  assert.ok(chain2.every((h) => h.c === realpathSync(f.root)), '同工作区每跳 cwd 一致')
+  assert.equal((book2.match(/origin-chain/g) ?? []).length, 1, '旧标记行被剥除，出站只留单一新标记')
+  // hop3：乙 召唤 甲（A→B→A）→ 拒绝且报错含整链
+  await assert.rejects(
+    () => f.summon.execute({ expert: '甲', task: book2 }, { agent: {} }),
+    (error) => {
+      const msg = String(error?.message ?? error)
+      assert.ok(msg.includes('环路拒绝'), msg)
+      assert.ok(msg.includes('甲@' + realpathSync(f.root)), '报错含链路首跳')
+      assert.ok(msg.includes(`甲@${realpathSync(f.root)} → 乙@${realpathSync(f.root)} → 甲@${realpathSync(f.root)}`), '报错含链路本身（验收 (c)）')
+      assert.ok(msg.includes('深度由链长推导：3'), '深度=链长')
+      return true
+    },
+  )
+  // 自召唤：甲 收到单跳书再召唤 甲 → 立即拒绝
+  await assert.rejects(() => f.summon.execute({ expert: '甲', task: book1 }, { agent: {} }), /环路拒绝/)
+})
+
+test('T26 #21 开关关闭：任务书逐字节回到既有行为（不剥标记、不追加、不拒绝）', async (t) => {
+  guardT26Env(t)
+  process.env.DSH_EXPERT_ORIGIN_CHAIN = '0'
+  const f = makeT26Fixture(t, 'chain-off')
+  const incoming = `顶层任务书\n${renderOriginChainMarker([{ n: '甲', c: '/w' }])}`
+  await f.summon.execute({ expert: '甲', task: incoming }, { agent: {} })
+  const expected = withLessonHint(incoming, '甲', null)
+  assert.equal(f.specs[0].prompt[0].text, expected, 'DSH_EXPERT_ORIGIN_CHAIN=0 下 prompt 逐字节=既有行为')
+  // 关闭时环链也放行（不解析不拒绝）
+  const loopBook = `书\n${renderOriginChainMarker([{ n: '甲', c: realpathSync(f.root) }, { n: '乙', c: realpathSync(f.root) }])}`
+  await f.summon.execute({ expert: '甲', task: loopBook }, { agent: {} })
+  assert.equal(f.specs[1].prompt[0].text, withLessonHint(loopBook, '甲', null))
+})
+
+test('T26 #21 实验对照基线：默认开启时 prompt = 既有 payload + 单行链标记（经验提示在前、标记收尾）', async (t) => {
+  guardT26Env(t)
+  const f = makeT26Fixture(t, 'chain-baseline')
+  await f.summon.execute({ expert: '甲', task: '正文A' }, { agent: {} })
+  const text = f.specs[0].prompt[0].text
+  const lines = text.split('\n')
+  assert.ok(lines[lines.length - 1].startsWith('<!-- origin-chain: '), '末行=链标记行')
+  assert.ok(text.startsWith('正文A'), '正文在前')
+})
+
+test('T26 restrictableNames 动态求交（验收单测）：schemas 枚举面批量求交 / 空枚举与异常回退逐名探测 / 双缺原样传递', async (t) => {
+  guardT26Env(t)
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (m) => warns.push(String(m))
+  t.after(() => { console.warn = originalWarn })
+  // ① schemas 枚举面：deny 与宿主可 restrict 名单动态求交，未知名剔除并告警
+  const ctxSchemas = { tools: { schemas: () => [{ name: 'summon_expert' }, { name: 'bash' }], get: () => ({}) } }
+  assert.deepEqual(hostRestrictableNames(ctxSchemas), { mode: 'schemas', names: ['summon_expert', 'bash'] })
+  assert.deepEqual(
+    filterRestrictableTools(ctxSchemas, ['summon_expert', 'subagent', 'bash']),
+    ['summon_expert', 'bash'],
+  )
+  assert.ok(warns.some((m) => m.includes('subagent')), '未注册名剔除有告警')
+  // ② schemas 空枚举 → fail-safe 回退逐名探测（绝不把 deny 清成空集）
+  const ctxEmptySchemas = { tools: { schemas: () => [], get: (n) => (n === 'summon_expert' ? {} : undefined) } }
+  assert.deepEqual(hostRestrictableNames(ctxEmptySchemas).mode, 'probe')
+  assert.deepEqual(filterRestrictableTools(ctxEmptySchemas, ['summon_expert', 'workflow']), ['summon_expert'])
+  // ③ schemas 抛异常 → 回退探测
+  const ctxThrowSchemas = { tools: { schemas: () => { throw new Error('boom') }, get: (n) => (n === 'summon_expert' ? {} : undefined) } }
+  assert.deepEqual(hostRestrictableNames(ctxThrowSchemas).mode, 'probe')
+  assert.deepEqual(filterRestrictableTools(ctxThrowSchemas, ['summon_expert']), ['summon_expert'])
+  // ④ 双缺（无 schemas 无 get）→ 原样传递（退回宿主报错）
+  assert.deepEqual(hostRestrictableNames({ tools: {} }).mode, 'none')
+  assert.deepEqual(filterRestrictableTools({ tools: {} }, ['a', 'b']), ['a', 'b'])
+  // ⑤ summon 全链：schemas 面下 toolFilter.deny 同样剔除未注册名（T9 缺陷 A 的枚举面变体）
+  const f = makeT26Fixture(t, 'restrict-schemas')
+  // 重建 ctx 携带 schemas 枚举面
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ schemaNames: ['summon_expert', 'summon_experts', 'list_experts', 'bash'] })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '甲', task: 'x' }, { agent: {} })
+  assert.deepEqual(specs[0].toolFilter.deny, ['list_experts', 'summon_expert', 'summon_experts'])
+})
+
+test('T26 per-cwd 写锁单元：获取/拒绝（含持有者与三条出路）/同专家重入计数/死持有者偷锁/readOnly 与开关', (t) => {
+  guardT26Env(t)
+  assert.equal(cwdLockEnabled({}), false, '默认关闭（opt-in：阻断型门禁不破坏既有并行批量流程）')
+  assert.equal(cwdLockEnabled({ DSH_EXPERT_CWD_LOCK: '1' }), true)
+  assert.equal(cwdLockEnabled({ DSH_EXPERT_CWD_LOCK: '0' }), false)
+  assert.equal(cwdLockEnabled({ DSH_EXPERT_CWD_LOCK: '' }), false)
+  const dir = mkdtempSync(join(tmpdir(), 't26-cwdlock-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // 开关关闭：no-op 不落锁文件
+  const disabled = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(disabled.disabled)
+  disabled.release()
+  assert.ok(!existsSync(join(dir, '.expert-bus', 'cwd-write.lock')))
+  // 获取 → 同专家重入（计数）→ 异专家拒绝（报错含持有者与三条出路）→ 逐层释放
+  process.env.DSH_EXPERT_CWD_LOCK = '1'
+  const l1 = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(l1.ok && !l1.disabled)
+  const l2 = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(l2.ok && l2.reentrant, '同 pid 同名=重入放行')
+  const l3 = acquireCwdWriteLock({ cwd: dir, expert: '乙' })
+  assert.equal(l3.ok, false, '异专家并发=拒绝而非排队（验收 (d)）')
+  assert.ok(l3.message.includes('甲'), '报错含持有者')
+  assert.ok(l3.message.includes('readOnly'), '出路③=声明只读')
+  assert.ok(l3.message.includes('DSH_EXPERT_CWD_LOCK=0'), '排障开关出路')
+  l2.release()
+  const l4 = acquireCwdWriteLock({ cwd: dir, expert: '乙' })
+  assert.equal(l4.ok, false, '重入未清零前异专家仍被拒')
+  l1.release()
+  const l5 = acquireCwdWriteLock({ cwd: dir, expert: '乙' })
+  assert.ok(l5.ok, '全部释放后可获取')
+  l5.release()
+  assert.ok(!existsSync(join(dir, '.expert-bus', 'cwd-write.lock')), '释放后锁文件清理')
+  // 死持有者 → 偷锁自愈
+  const staleP = join(dir, '.expert-bus', 'cwd-write.lock')
+  writeFileSync(staleP, JSON.stringify({ token: 'x', pid: 999999999, expert: '僵尸', cwd: dir, startedAt: 1, count: 1 }))
+  const l6 = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(l6.ok, 'ESRCH 死持有者被偷锁')
+  l6.release()
+  // readOnly 逃生口：不触锁面
+  const ro = acquireCwdWriteLock({ cwd: dir, expert: '乙', readOnly: true })
+  assert.ok(ro.ok && ro.readOnly)
+  ro.release()
+  assert.ok(!existsSync(staleP))
+})
+
+test('T26 #22 (d) 真实子进程 E2E：同 cwd 双专家并发写——后到者被拒绝（非排队）且报错含持有者；持有者退出后可获取', async (t) => {
+  guardT26Env(t)
+  process.env.DSH_EXPERT_CWD_LOCK = '1'
+  const dir = mkdtempSync(join(tmpdir(), 't26-cwdlock-e2e-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // 真实后台持有进程：另一宿主进程形态，持有本 fixture cwd 写锁
+  const holderBg = spawn(process.execPath, ['--input-type=module', '-e', HOLD_SCRIPT, join(process.cwd(), 'lib'), '甲', 'hold'], {
+    cwd: dir, env: { ...process.env, DSH_EXPERT_CWD_LOCK: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  await new Promise((resolve, reject) => {
+    holderBg.stdout.on('data', (d) => String(d).includes('HELD') && resolve())
+    holderBg.on('exit', (code) => reject(new Error('持有进程提前退出 code=' + code)))
+  })
+  // 竞争者（独立真实子进程）：非阻塞获取 → 立即拒绝而非排队
+  const contender = spawnSync(process.execPath, ['--input-type=module', '-e', HOLD_SCRIPT, join(process.cwd(), 'lib'), '乙', 'try'], {
+    cwd: dir, encoding: 'utf-8', timeout: 30000, env: { ...process.env, DSH_EXPERT_CWD_LOCK: '1' },
+  })
+  assert.equal(contender.status, 1, '竞争者被拒绝（拒绝而非排队）')
+  const out = contender.stdout + contender.stderr
+  assert.ok(out.includes('甲'), '拒绝信息含持有者专家名（独立子进程消费视角）')
+  assert.ok(out.includes('readOnly'), '拒绝信息含三条出路')
+  // 持有进程死亡：SIGKILL + 收割（等 exit 事件，僵尸进程 kill(pid,0) 仍视为存活）
+  holderBg.kill('SIGKILL')
+  await new Promise((resolve) => holderBg.on('exit', resolve))
+  const after = spawnSync(process.execPath, ['--input-type=module', '-e', HOLD_SCRIPT, join(process.cwd(), 'lib'), '乙', 'try'], {
+    cwd: dir, encoding: 'utf-8', timeout: 30000, env: { ...process.env, DSH_EXPERT_CWD_LOCK: '1' },
+  })
+  assert.equal(after.status, 0, '持有者死后（ESRCH 偷锁自愈）可获取：' + after.stdout + after.stderr)
+})
+
+const HOLD_SCRIPT = `
+const { pathToFileURL } = await import('node:url')
+const { acquireCwdWriteLock } = await import(pathToFileURL(process.argv[1] + '/cwd-lock.js').href)
+const expert = process.argv[2]
+const mode = process.argv[3]
+const lock = acquireCwdWriteLock({ cwd: process.cwd(), expert })
+if (!lock.ok) {
+  console.log('REJECTED::' + lock.message)
+  process.exit(1)
+}
+console.log('HELD')
+if (mode === 'hold') {
+  await new Promise((resolve) => setTimeout(resolve, 2500))
+}
+lock.release()
+`
+
+test('T26 振荡检测单元：交替段来回数推导/阈值告警/段内一次/段断重臂/开关与阈值解析', (t) => {
+  guardT26Env(t)
+  // 来回 = 回到出发专家：A,B,A=1；A,B,A,B,A=2；A,B,A,B,A,B=2（半程不折算）；A,B,A,B,A,B,A=3
+  assert.equal(alternationRunLength(['甲', '乙']), 2)
+  assert.equal(alternationRunLength(['甲', '乙', '甲']), 3)
+  assert.equal(alternationRunLength(['甲', '乙', '甲', '乙', '丙', '甲']), 2, '第三名打断后只算尾部新段')
+  assert.equal(alternationRunLength(['甲', '甲']), 1)
+  assert.equal(oscillationRoundTrips(3), 1)
+  assert.equal(oscillationRoundTrips(6), 2)
+  assert.equal(oscillationRoundTrips(7), 3)
+  // 阈值解析
+  assert.equal(oscillationThreshold({}), 3)
+  assert.equal(oscillationThreshold({ DSH_EXPERT_OSCILLATION_N: '2' }), 2)
+  assert.equal(oscillationThreshold({ DSH_EXPERT_OSCILLATION_N: '1' }), 3, '<2 回退默认')
+  assert.equal(oscillationThreshold({ DSH_EXPERT_OSCILLATION_N: 'abc' }), 3)
+  // 开关
+  assert.equal(oscillationEnabled({}), true)
+  assert.equal(oscillationEnabled({ DSH_EXPERT_OSCILLATION: '0' }), false)
+  // 检测器：默认阈值 3 → 第 7 次交替派发（3 来回）告警，段内一次，段断重臂
+  const d = createOscillationDetector({ threshold: 3 })
+  const seq = ['甲', '乙', '甲', '乙', '甲', '乙']
+  assert.ok(seq.every((n) => d.record(n) === null), '前 6 次不告警')
+  const warn = d.record('甲')
+  assert.ok(warn && warn.includes('【振荡告警】'), '第 7 次（3 来回）告警（验收 (e)）')
+  assert.ok(warn.includes('甲') && warn.includes('乙'))
+  assert.ok(warn.includes('3 次来回'))
+  assert.equal(d.record('乙'), null, '同段同对只告警一次')
+  assert.equal(d.record('甲'), null)
+  // 段断重臂：丙 打断后重新积累到 3 来回再次告警
+  assert.equal(d.record('丙'), null)
+  const seq2 = ['甲', '乙', '甲', '乙', '甲', '乙']
+  assert.ok(seq2.slice(0, 6).every((n) => d.record(n) === null))
+  const warn2 = d.record('甲')
+  assert.ok(warn2 && warn2.includes('【振荡告警】'), '新段重臂后再告警')
+  // 低阈值：N=2 → 第 5 次交替派发即告警
+  const d2 = createOscillationDetector({ threshold: 2 })
+  ;['甲', '乙', '甲', '乙'].forEach((n) => assert.equal(d2.record(n), null))
+  assert.ok(d2.record('甲').includes('2 次来回'))
+})
+
+test('T26 #22 (e) 真实 summon 面 E2E：甲↔乙交替派工达阈值 → 告警行附 answer 尾（非阻断）；开关关闭零告警', async (t) => {
+  guardT26Env(t)
+  process.env.DSH_EXPERT_OSCILLATION_N = '2'
+  const f = makeT26Fixture(t, 'osc-e2e')
+  const results = []
+  for (const name of ['甲', '乙', '甲', '乙', '甲']) {
+    const r = await f.summon.execute({ expert: name, task: '任务' }, { agent: {} })
+    results.push(r.answer)
+  }
+  assert.ok(results.slice(0, 4).every((a) => !a.includes('振荡告警')), '前 4 次（1 来回）无告警')
+  assert.ok(results[4].includes('【振荡告警】'), '第 5 次（2 来回，N=2）告警附 answer 尾')
+  assert.ok(results[4].includes('不阻断'), '告警语义非阻断')
+  // 开关关闭：registerExpertTools 不建记录器 → 零告警
+  process.env.DSH_EXPERT_OSCILLATION = '0'
+  const f2 = makeT26Fixture(t, 'osc-off')
+  const answers = []
+  for (const name of ['甲', '乙', '甲', '乙', '甲', '乙', '甲']) {
+    const r = await f2.summon.execute({ expert: name, task: '任务' }, { agent: {} })
+    answers.push(r.answer)
+  }
+  assert.ok(answers.every((a) => !a.includes('振荡告警')))
+})
+
+test('T26 effort 预检单元：能力齐=随 agentOptions 下发/缺能力=一行告警降级不阻断/无 effort 零变化/字段级校验', (t) => {
+  guardT26Env(t)
+  const caps = { agentOptions: true }
+  const nocaps = {}
+  // 无档案 / 无 effort 无 model：零变化
+  assert.deepEqual(preflightEffort({ profile: null, caps }), { agentOptions: undefined, warnings: [], answerHints: [] })
+  assert.deepEqual(preflightEffort({ profile: { skills: ['s'] }, caps }), { agentOptions: undefined, warnings: [], answerHints: [] })
+  // effort + 能力 → reasoningEffort 下发（effort-only 覆盖是 AgentOptions 合法形态）
+  assert.deepEqual(preflightEffort({ profile: { effort: 'high' }, caps }).agentOptions, { reasoningEffort: 'high' })
+  // model + effort 同时声明
+  assert.deepEqual(preflightEffort({ profile: { model: 'm', effort: 'low' }, caps }).agentOptions, { model: 'm', reasoningEffort: 'low' })
+  // effort 缺能力：warnings + answerHints（answer 尾提示行），agentOptions 收敛 undefined
+  const miss = preflightEffort({ profile: { effort: 'high' }, caps: nocaps, providerName: 'spawn' })
+  assert.equal(miss.agentOptions, undefined)
+  assert.equal(miss.warnings.length, 1)
+  assert.ok(miss.warnings[0].includes('effort=high 未生效（effort 预检）'))
+  assert.deepEqual(miss.answerHints, miss.warnings, 'effort 告警双通道（console + answer 尾）')
+  // model 缺能力：告警文本与 T15 逐字一致，但不进 answerHints（既有语义零漂移）
+  const missModel = preflightEffort({ profile: { model: 'model-A' }, caps: nocaps, providerName: 'spawn' })
+  assert.equal(missModel.warnings[0], '专家档案 model=model-A 未生效：provider "spawn" 未声明 agentOptions 能力（旧代宿主，降级可见）')
+  assert.deepEqual(missModel.answerHints, [])
+  // 开关：DSH_EXPERT_EFFORT=0/空 → effort 本次不生效（model 分支不受影响）
+  assert.equal(preflightEffort({ profile: { effort: 'high' }, caps, env: { DSH_EXPERT_EFFORT: '0' } }).agentOptions, undefined)
+  assert.deepEqual(preflightEffort({ profile: { model: 'm', effort: 'low' }, caps, env: { DSH_EXPERT_EFFORT: '' } }).agentOptions, { model: 'm' })
+  assert.deepEqual(preflightEffort({ profile: { effort: 'high' }, caps, env: { DSH_EXPERT_EFFORT: '1' } }).agentOptions, { reasoningEffort: 'high' })
+  // 字段级校验：effort 非法（空串/非字符串）丢弃并告警
+  const warns = []
+  const p = parseExpertProfile({ effort: '  ' }, (m) => warns.push(m))
+  assert.equal(p.profile, null)
+  const p2 = parseExpertProfile({ effort: 'high ' }, (m) => warns.push(m))
+  assert.deepEqual(p2.profile, { effort: 'high' })
+  const p3 = parseExpertProfile({ effort: 3 }, (m) => warns.push(m))
+  assert.equal(p3.profile, null)
+  assert.ok(warns.some((m) => m.includes('effort 非法')))
+})
+
+test('T26 effort 预检 summon 面 E2E：effort 随 agentOptions 下发；缺能力时 answer 尾附预检告警', async (t) => {
+  guardT26Env(t)
+  const f = makeT26Fixture(t, 'effort-e2e', { capabilities: { agentOptions: true } })
+  f.writeProfiles({ 甲: { effort: 'high' } })
+  await f.summon.execute({ expert: '甲', task: 'x' }, { agent: {} })
+  assert.deepEqual(f.specs[0].agentOptions, { reasoningEffort: 'high' })
+  assert.ok(!f.specs[0].prompt[0].text.includes('effort 预检'))
+  // 缺能力 provider：agentOptions 键不存在（spec 形状不变）+ answer 尾告警
+  const f2 = makeT26Fixture(t, 'effort-e2e2')
+  f2.writeProfiles({ 甲: { model: 'm-1', effort: 'max' } })
+  const r = await f2.summon.execute({ expert: '甲', task: 'x' }, { agent: {} })
+  assert.ok(!('agentOptions' in f2.specs[0]))
+  assert.ok(r.answer.includes('effort=max 未生效（effort 预检）'), r.answer)
+})
+
+test('T26 summon_experts 批量：readOnly 逐项透传（schema 形状保持向后兼容）', async (t) => {
+  guardT26Env(t)
+  const f2 = makeT26Fixture(t, 'batch-ro2')
+  const rosterCtx = makeProfileSummonCtx({})
+  registerExpertTools(rosterCtx.ctx, { dst: f2.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f2.root })
+  const batchTool = rosterCtx.descriptors.find((d) => d.name === 'summon_experts')
+  const r = await batchTool.execute({ experts: [{ expert: '甲', task: 'a', readOnly: true }, { expert: '乙', task: 'b' }] }, { agent: {} })
+  assert.equal(r.results.length, 2)
+  assert.ok(r.results.every((x) => x.ok))
+  assert.ok(!('readOnly' in rosterCtx.specs[0]), 'readOnly 是 summon 派发面参数，不进 start spec')
+})
+
+// T26 (c) 真实嵌套 summon 形态 E2E：三个真实 node 子进程各扮演一层 summon 面
+// （编排者→甲、甲→乙、乙→甲），任务书经文件传递（独立消费方视角，非工具自测自指）。
+// 上面的脚本占位不完整（descriptors 捕获需要包 register），真正用例内联完整脚本：
+const chainHop = (t, { libDir, fixture, expert, taskFile, outFile }) => {
+  const script = `
+import { writeFileSync, readFileSync } from 'node:fs'
+const mod = await import('file://' + ${JSON.stringify(libDir)} + '/tools.js')
+const specs = []
+const descriptors = []
+const ctx = {
+  tools: { register: (d) => descriptors.push(d), get: () => ({}) },
+  subagents: {
+    getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+    start: async (_p, opts) => {
+      specs.push(opts)
+      return { result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }
+    },
+  },
+}
+mod.registerExpertTools(ctx, { dst: ${JSON.stringify(fixture.dst)}, getExpertContentImpl: () => ({ content: 'persona' }), autoClaimCwd: process.cwd() })
+const summon = descriptors.find((d) => d.name === 'summon_expert')
+const task = readFileSync(${JSON.stringify(taskFile)}, 'utf-8')
+try {
+  await summon.execute({ expert: ${JSON.stringify(expert)}, task }, { agent: {} })
+  writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ ok: true, book: specs[0].prompt[0].text }))
+} catch (error) {
+  writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+  process.exit(0)
+}
+`
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: fixture.root, encoding: 'utf-8', timeout: 30000, env: { ...process.env },
+  })
+  assert.equal(r.status, 0, r.stderr)
+  return JSON.parse(readFileSync(outFile, 'utf-8'))
+}
+
+test('T26 #21 (c) 真实子进程嵌套 summon 形态 E2E：编排者→甲→乙→甲，第三跳被拒且报错含完整链路', (t) => {
+  guardT26Env(t)
+  const root = mkdtempSync(join(tmpdir(), 't26-chain-e2e-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const dst = join(root, 'dst')
+  mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({
+    core: [{ source: 'bundled-core', file: 'a.md', name: '甲' }, { source: 'bundled-core', file: 'b.md', name: '乙' }],
+  }))
+  const libDir = join(process.cwd(), 'lib')
+  const taskFile = join(root, 'task.txt')
+  const outFile = join(root, 'out.json')
+  writeFileSync(taskFile, '顶层任务书')
+  // hop1：编排者面召唤 甲
+  const hop1 = chainHop(t, { libDir, fixture: { dst, root }, expert: '甲', taskFile, outFile })
+  assert.ok(hop1.ok, JSON.stringify(hop1))
+  // hop2：甲面（拿到 book1）召唤 乙
+  writeFileSync(taskFile, hop1.book)
+  const hop2 = chainHop(t, { libDir, fixture: { dst, root }, expert: '乙', taskFile, outFile })
+  assert.ok(hop2.ok, JSON.stringify(hop2))
+  const chain2 = parseOriginChain(hop2.book).chain
+  assert.deepEqual(chain2.map((h) => h.n), ['甲', '乙'])
+  // hop3：乙面（拿到 book2）召唤 甲 → A→B→A 拒绝，报错含链路本身
+  writeFileSync(taskFile, hop2.book)
+  const hop3 = chainHop(t, { libDir, fixture: { dst, root }, expert: '甲', taskFile, outFile })
+  assert.equal(hop3.ok, false, '第三跳必须被拒绝')
+  const cwdReal = realpathSync(root)
+  assert.ok(hop3.error.includes(`甲@${cwdReal} → 乙@${cwdReal} → 甲@${cwdReal}`), '报错含 A→B→A 整链（验收 (c)）: ' + hop3.error)
+  assert.ok(hop3.error.includes('环路拒绝'))
+  // 对照：DSH_EXPERT_ORIGIN_CHAIN=0 时第三跳放行（回退保留原行为）
+  writeFileSync(taskFile, hop2.book)
+  const hop3off = spawnSync(process.execPath, ['--input-type=module', '-e', `
+import { writeFileSync, readFileSync } from 'node:fs'
+const mod = await import('file://' + ${JSON.stringify(libDir)} + '/tools.js')
+const specs = []
+const descriptors = []
+const ctx = {
+  tools: { register: (d) => descriptors.push(d), get: () => ({}) },
+  subagents: {
+    getProvider: () => ({ capabilities: { persona: true, toolFilter: true } }),
+    start: async (_p, opts) => {
+      specs.push(opts)
+      return { result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }), dispose: async () => {} }
+    },
+  },
+}
+mod.registerExpertTools(ctx, { dst: ${JSON.stringify(dst)}, getExpertContentImpl: () => ({ content: 'persona' }), autoClaimCwd: process.cwd() })
+const summon = descriptors.find((d) => d.name === 'summon_expert')
+try {
+  await summon.execute({ expert: '甲', task: readFileSync(${JSON.stringify(taskFile)}, 'utf-8') }, { agent: {} })
+  writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ ok: true, book: specs[0].prompt[0].text }))
+} catch (error) {
+  writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ ok: false, error: String(error?.message ?? error) }))
+}
+  `], {
+    cwd: root, encoding: 'utf-8', timeout: 30000, env: { ...process.env, DSH_EXPERT_ORIGIN_CHAIN: '0' },
+  })
+  assert.equal(hop3off.status, 0, hop3off.stderr)
+  const off = JSON.parse(readFileSync(outFile, 'utf-8'))
+  assert.equal(off.ok, true, '开关关闭时环链放行（不达标配置回退语义）')
+})
+
+test('T26 taskboard own 工件归属门禁（真实子进程）：冲突具名拒绝零落盘/幂等重入/终态让位/--json 信封/开关逃生口/attempt 校验', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 't26-own-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const tb = (args, env = {}) =>
+    spawnSync('python3', [join(process.cwd(), 'skills', 'expert-orchestration', 'tools', 'taskboard.py'), '--board', join(dir, 'b.json'), ...args], {
+      encoding: 'utf-8', env: { ...process.env, ...env },
+    })
+  const ok = (...args) => {
+    const r = tb(args)
+    assert.equal(r.status, 0, args.join(' ') + ' → ' + r.stderr)
+    return r
+  }
+  ok('create', '甲任务', '--owner', '甲')
+  ok('create', '乙任务', '--owner', '乙')
+  ok('claim', 'T1', '甲')
+  ok('claim', 'T2', '乙')
+  // T1 登记归属
+  ok('own', 'T1', 'src/a.py', 'src/common')
+  // T2 冲突 → artifact_owned 具名拒绝 + 零落盘
+  const before = readFileSync(join(dir, 'b.json'))
+  const conflict = tb(['own', 'T2', 'src/a.py'])
+  assert.equal(conflict.status, 1)
+  assert.match(conflict.stdout, /artifact_owned/)
+  assert.match(conflict.stdout, /T1/)
+  assert.deepEqual(readFileSync(join(dir, 'b.json')), before, '拒绝零落盘')
+  // 无冲突路径放行；本任务重复 own 幂等
+  ok('own', 'T2', 'docs/b.md')
+  ok('own', 'T1', 'src/a.py', 'src/c.py')
+  const t1 = JSON.parse(readFileSync(join(dir, 'b.json'), 'utf-8')).tasks.T1
+  assert.deepEqual(t1.artifacts, ['src/a.py', 'src/common', 'src/c.py'])
+  // show 展示工件归属
+  assert.match(ok('show', 'T1').stdout, /工件归属: src\/a\.py, src\/common, src\/c\.py/)
+  // --json 信封：data.task.artifacts（机器消费面走信封，非报告命令 data={} 的问题面不存在）
+  const env = JSON.parse(ok('--json', 'own', 'T2', 'docs/d.md').stdout)
+  assert.equal(env.ok, true)
+  assert.deepEqual(env.data.task.artifacts, ['docs/b.md', 'docs/d.md'])
+  // 终态让位：T1 done 后 T2 可登记同一工件
+  ok('done', 'T1', '完成')
+  ok('own', 'T2', 'src/a.py')
+  // attempt 校验共存：带错误代际被拒
+  const stale = tb(['own', 'T2', 'x.py', '--attempt', 'nope'])
+  assert.equal(stale.status, 1)
+  assert.match(stale.stdout, /no_attempt/)
+  // 开关逃生口：TASKBOARD_DISABLE_OWNERSHIP=1 冲突放行 + stderr 告警（T3 与 open T2 抢 src/a.py）
+  ok('create', '丙任务', '--owner', '丙')
+  ok('claim', 'T3', '丙')
+  const esc = tb(['own', 'T3', 'src/a.py'], { TASKBOARD_DISABLE_OWNERSHIP: '1' })
+  assert.equal(esc.status, 0, esc.stderr)
+  assert.match(esc.stderr, /TASKBOARD_DISABLE_OWNERSHIP/)
+  const escBlocked = tb(['own', 'T3', 'docs/d.md'])
+  assert.equal(escBlocked.status, 1, '开关未设时同路径冲突仍拒绝')
+  assert.match(escBlocked.stdout, /artifact_owned/)
+  // 事件溯源：own 随事件流折叠一致
+  ok('replay')
 })

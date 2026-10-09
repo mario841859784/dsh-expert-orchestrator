@@ -5919,3 +5919,77 @@ test('T32 备忘(1) E2E：--json 下 claim 失败提示消费信封 message（�
     process.env.PATH = oldPath
   }
 })
+
+test('T34 修复 E2E（真实 Top-5 persona 消费方视角）：有效 method + methods-cut persona + skills 档案 → 约束行幸存于最终 persona 尾部', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't34-cut')
+  // 真实随包 Top-5 persona（code-reviewer，含 frontmatter method 键 + <!-- methods-cut --> 标记）
+  // 与真实 method 文件按部署形态落进 tmp dst（splitPersona 只认 <dst>/expert-methods/ 下文件）。
+  const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+  const rawPersona = readFileSync(join(repoRoot, 'skills', 'expert-orchestration', 'experts', 'code-reviewer.md'), 'utf8')
+  const methodRel = extractPersonaMethod(rawPersona)
+  assert.equal(methodRel, 'expert-methods/code-reviewer.md')
+  mkdirSync(dirname(join(f.dst, methodRel)), { recursive: true })
+  copyFileSync(join(repoRoot, methodRel), join(f.dst, methodRel))
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(['bash', ...EXPERT_TOOLS_DENY_LIST]) })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: rawPersona }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { skills: ['expert-orchestration', 'trim-cli'] } })
+  await summonProfileExpert(descriptors)
+  const persona = specs[0].persona
+  const constraint = '【专家档案约束】可用技能白名单：expert-orchestration、trim-cli；白名单之外的技能一律不要调用。'
+  // T34 缺陷现场回归：旧实现在 splitPersona 之前注入，约束行随标记之后内容被静默丢弃。
+  assert.ok(persona.endsWith(constraint), '约束行必须落在最终 persona 尾部（消费方：宿主 start payload 的 persona 末行）')
+  const pointerIdx = persona.indexOf('领域方法论全文在 ')
+  assert.ok(pointerIdx !== -1, 'methods-cut 分层真实生效（瘦 persona + method 指针行）')
+  assert.ok(pointerIdx < persona.indexOf('【专家档案约束】'), '次序：method 指针行在前、档案约束行最后')
+  assert.ok(persona.includes('你是资深代码审查专家'), '标记前瘦 persona 正文保留')
+  assert.ok(!persona.includes('<!-- methods-cut -->'), '标记本体不进 persona')
+  assert.ok(persona.includes(`领域方法论全文在 ${join(f.dst, methodRel)}`), 'method 指针指向本次 dst 内 method 文件')
+})
+
+test('T34 修复回归（合成分层 persona）：无档案=P2 既有行为逐字节；有 skills 档案=分层照常 + 约束行尾部幸存', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't34-regress')
+  const raw = '---\nname: 测试专家\nmethod: expert-methods/plan.md\n---\n\n核心规则\n<!-- methods-cut -->\n深读区清单（不应注入）'
+  mkdirSync(join(f.dst, 'expert-methods'), { recursive: true })
+  writeFileSync(join(f.dst, 'expert-methods', 'plan.md'), '# 方法论全文')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(EXPERT_TOOLS_DENY_LIST) })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: raw }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  // ① 无档案：P2 方法论分层既有行为逐字节不变，无约束行（档案面零变化）
+  await summonProfileExpert(descriptors)
+  assert.equal(
+    specs[0].persona,
+    `核心规则\n\n领域方法论全文在 ${join(f.dst, 'expert-methods/plan.md')}，任务复杂或触及清单场景时先 read 再动手`,
+    '无档案 = P2 分层既有输出逐字节（无档案约束行、无其他变换）',
+  )
+  // ② skills 档案：深读区仍被分层截掉、指针行保留，约束行追加在最终 persona 尾部
+  f.writeProfiles({ 测试专家: { skills: ['trim-cli'] } })
+  await summonProfileExpert(descriptors)
+  const p = specs[1].persona
+  assert.ok(!p.includes('深读区清单'), '分层截断语义不被档案注入改变')
+  assert.ok(p.includes(`领域方法论全文在 ${join(f.dst, 'expert-methods/plan.md')}`), 'method 指针行保留')
+  assert.ok(p.endsWith('【专家档案约束】可用技能白名单：trim-cli；白名单之外的技能一律不要调用。'), '约束行幸存于最终尾部')
+})
+
+test('T34 备忘(a) E2E：tools.allow=[] 空数组 fail-closed——toolFilter.allow 键在且为空（不缺省放宽），全部工具段被剪', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't34-emptyallow')
+  const registry = new Set(['read', 'bash', ...EXPERT_TOOLS_DENY_LIST])
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry })
+  registerExpertTools(ctx, {
+    dst: f.dst,
+    autoClaimCwd: f.root,
+    profilesPaths: { homePath: f.homePath, projectPath: f.projectPath },
+    getExpertContentImpl: () => ({ content: '正文\n\n<!-- tools: bash -->\nbash 指引。\n<!-- /tools -->\n\n<!-- tools: read -->\nread 指引。\n<!-- /tools -->' }),
+  })
+  f.writeProfiles({ 测试专家: { tools: { allow: [] } } })
+  await summonProfileExpert(descriptors)
+  assert.ok('allow' in specs[0].toolFilter, 'allow 键必须存在——缺键语义是无白名单（全放行），与 fail-closed 相反')
+  assert.deepEqual(specs[0].toolFilter.allow, [], '空 allow 原样传空（解析层 nameList([]) 直通）')
+  for (const n of EXPERT_TOOLS_DENY_LIST) assert.ok(specs[0].toolFilter.deny.includes(n), `递归防护 ${n} 照常`)
+  assert.ok(
+    !specs[0].persona.includes('bash 指引。') && !specs[0].persona.includes('read 指引。'),
+    '消费面 fail-closed：点名工具全部不可见 → guidance 段全剪（#17 联动）',
+  )
+  assert.ok(specs[0].persona.includes('正文'), '段外正文不受影响')
+})

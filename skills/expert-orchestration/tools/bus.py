@@ -3,6 +3,13 @@
 """expert-orchestrator 消息总线：专家与协调官之间的落盘信箱。
 
 信箱目录默认 <cwd>/.expert-bus/，每封信一个 JSON 文件（可 --root 覆盖）。
+全局信箱根约定（v2.8 S3 成文，T17；教训池 L128「信箱根随 cwd 漂移」与 v2.6 D1 事故放大器的根治面）：
+  解析规则单一且全部消费方同规——信箱根 = 显式 --root 参数，缺省 <cwd>/.expert-bus（cwd 相对）。
+  所有 bus 消费方（编排者/专家的 shell 调用、taskboard.py watchdog --bus-root 缺省值、
+  lib/tools.js collectResumeProgress 与 trustedBusMessages 的收件箱目录解析）都必须锚定同一
+  cwd（=会话工作区根）或显式传同一 --root；在子目录/其他 cwd 下调用会散落出多个互不相通的
+  信箱根——发送落 A 根、读取看 B 根，消息「已发未收」且无任何报错（v2.6 D1 过代误判的放大器）。
+  约定：bus 调用一律在会话工作区根 cwd 执行；跨根疑云先用 `stats` 对账两边根再排查投递。
 用法（既有命令与参数行为全部不变）：
   bus.py send --from 前端工程师 --to coordinator --subject "登录页完成" --body "…" [--file 路径]…
   bus.py read --box coordinator [--unread]
@@ -75,6 +82,8 @@ class BusError(Exception):
 
 
 def root(a):
+    # 全局信箱根约定（v2.8 S3 成文，见文件头）：显式 --root 优先，缺省 <cwd>/.expert-bus；
+    # 全部消费方必须同 cwd（会话工作区根）或同 --root，跨 cwd 调用会散落互不相通的信箱根。
     return a.root or os.path.join(os.getcwd(), '.expert-bus')
 
 
@@ -546,7 +555,7 @@ def cmd_stats(a, _data=None):
 
 def main():
     ap = argparse.ArgumentParser(description='expert-orchestrator 消息总线')
-    ap.add_argument('--root', help='总线目录，默认 <cwd>/.expert-bus')
+    ap.add_argument('--root', help='总线目录，默认 <cwd>/.expert-bus（全局信箱根约定见文件头：全部消费方须锚定同一 cwd 或显式传同一 --root）')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p = sub.add_parser('send')

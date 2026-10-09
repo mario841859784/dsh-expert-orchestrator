@@ -87,6 +87,13 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
     任务 after 快照），新字段 heartbeat_at/nudges/nudged_at 随快照折叠只增不减，既有命令输出零变化。
 验证回执范围指纹（v2.6）：verify <id> <文件...> 对完成汇报附带文件清单逐文件记 SHA-256（整表 digest 存板）；
   verify <id>（无文件）与 show/done 均重算比对，文件一变回执即标 stale（旧验证/旧评审自动失效），done 时 stale 仅告警不阻塞。
+机器可读结构化输出通道（v2.8 S1，T17）：全局 --json 开关——开启后 stdout 恰一行 JSON 信封、
+  人类可读文本不再上 stdout（stderr 诊断/告警不受影响），退出码语义与缺省完全一致。信封形态：
+  成功 {"ok":true,"cmd":<命令>,"data":<结构化载荷>,"revision":<板级 revision（archive/_hook-check 缺省不带，与人类面末行约定一致）>}；
+  失败 {"ok":false,"error":<具名错误码或 command_failed>,...既有错误字段}（BoardError 字段原样保留，人读 sys.exit 类拒绝归一为
+  command_failed+message）。data 载荷：任务中心命令给完整任务对象（含全部簿记字段——新增字段对机器消费方透明可见，这正是
+  结构化通道的意义：不再依赖展示层文本行格式）、list 给 id 升序任务数组、boards 给逐板摘要数组、其余命令给空对象。
+  缺省（不带 --json）人类可读面逐字节零变化；消费方契约升级路径：lib/tools.js auto-claim 已改走本通道（v2.8 S1）。
 事件溯源化核心（v2.7）：
   状态权威：append-only JSONL 事件流 <板文件>.events.jsonl；JSON 板文件降级为「折叠视图」缓存（对外只增簿记字段
     event_seq/event_state_hash，既有字段零删改），list/status/show/deps 等命令输出结构不变。
@@ -109,6 +116,9 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
     写命令重新收编）；load 对「板文件缺失但事件流存在，且归档区有同名板的有簿记无日志残留」（旧序 archive
     崩溃窗口孤儿日志）拒绝复活旧板/续链（unrecoverable），同名 create 同拒。
   archive：事件流随板文件一并归档（<归档名>.events.jsonl），重放能力不因归档丢失。
+  规模口径（T10 首轮 s2 事件流压实，T17 收口留档裁定不实施）：load 每次全量读日志折叠为 O(N) 扫描，
+    预期任务量级千级以内成本可忽略；单板事件达万级前须先引入 seq 索引/快照事件再扩展，勿直接沿用
+    本实现（压实会牺牲 append-only 链式 hash 的全历史重放能力，须与 state_hash 口径一并重新设计）。
   折叠语义不变量（当前命令集契约，扩展事件模型前必读；违背即重放与末事件 state_hash 失配 → 板 unrecoverable）：
     ① fold_events 只能逐事件覆盖 after 快照中的任务，无法表达任务删除——当前命令集不存在删除任务的命令；
        未来新增删除类命令须同步扩展折叠语义（如墓碑事件），否则重放结果多出已删任务，与崩溃前状态不一致。
@@ -546,7 +556,12 @@ def _orphan_log_of_archived(path):
     事件簿记字段（曾是事件流板）但对应 .events.jsonl 不在归档区——即「板已迁、日志未迁完」的残留
     形态，顶层的孤儿事件日志正是其未迁完的日志；此时板已被收口，孤儿日志不得复活旧板或被续链。
     归档区落点与 cmd_archive 一致（cwd 相对 .expert-taskboards/archive）；无簿记字段的 v2.6 旧归档板
-    本就无日志，不算窗口残留（避免误伤「升级前归档 + 活动板视图丢失」的正常崩溃恢复）。"""
+    本就无日志，不算窗口残留（避免误伤「升级前归档 + 活动板视图丢失」的正常崩溃恢复）。
+    B4（T10 三轮评审建议-b，T17 收口实施）：归档板 JSON 损坏时原实现 fail-open（continue），孤儿日志
+    会按权威静默复活旧板（实测 rc=0）——降级为原文包含 'event_seq' 字面判定（簿记字段名子串；损坏
+    JSON 给不出比 json.load 更强的否定证据，宁可误判「有簿记」fail-closed 提示人工核查，也不放行
+    跨板劫持）；彻底不可读（权限/IO）才维持原 fail-open（无证据可依，签名本就是纵深防御）。
+    匹配面同时覆盖 S4 唯一后缀归档名（<ts>-<板名>.<pid>.<hex>，同秒碰撞归档），其孤儿日志同样不得复活。"""
     arch = os.path.join('.expert-taskboards', 'archive')
     if not os.path.isdir(arch):
         return False
@@ -556,7 +571,7 @@ def _orphan_log_of_archived(path):
     except OSError:
         return False
     for n in sorted(names):
-        if n.endswith('.jsonl') or not n.endswith(suffix):
+        if n.endswith('.jsonl') or not (n.endswith(suffix) or (suffix + '.') in n):
             continue
         ap = os.path.join(arch, n)
         if os.path.exists(ap + '.events.jsonl'):
@@ -566,7 +581,12 @@ def _orphan_log_of_archived(path):
                 if 'event_seq' in json.load(f):
                     return True
         except Exception:
-            continue
+            try:
+                with open(ap, encoding='utf-8') as f:
+                    if 'event_seq' in f.read():
+                        return True
+            except Exception:
+                continue  # 彻底不可读：无证据可依，维持 fail-open（纵深防御的既定极限）
     return False
 
 
@@ -634,6 +654,15 @@ def load(path):
         save_view(path, state)  # 视图整体丢失属崩溃恢复，静默重建
         return state
     vseq = v.get('event_seq')
+    if isinstance(vseq, int) and not isinstance(vseq, bool) and vseq > state['event_seq']:
+        # A3（T10 三轮评审建议-a，T17 收口升格 unrecoverable）：视图自称 event_seq 大于事件流末 seq
+        # ——尾部事件丢失的强证据。写路径先追加日志（fsync）后写视图，崩溃只产生「视图落后」，绝不
+        # 产生「视图超前」；超前只能来自事件流被外部截断/丢失。原实现落入通用手改分支仅 stderr 告警
+        # 并按截短日志回滚重建（fail-loud 但已落账命令被静默回滚）——与空日志防御（i1 洗白封死）对齐
+        # 升格为 unrecoverable，迫使人工介入从备份恢复，绝不静默回滚到更早状态。
+        raise _unrecoverable(path, f'视图 event_seq={vseq} 大于事件流末 seq={state["event_seq"]}——'
+                                   '事件流尾部疑似被外部截断或丢失（崩溃间隙只可能视图落后，不可能视图超前）；'
+                                   '拒绝按截短事件流回滚重建（已落账命令不得静默回滚），请从备份恢复事件流后人工核对')
     if _state_hash(v) == actual and vseq == state['event_seq']:
         return state  # 干净快路径：视图与事件流一致
     if isinstance(vseq, int) and not isinstance(vseq, bool) and vseq < state['event_seq']:
@@ -1866,6 +1895,31 @@ def default_board():
     return os.path.join(os.getcwd(), '.expert-taskboards', 'default.json')
 
 
+class _JsonSink:
+    """--json 模式下吞掉命令的人类可读 stdout（JSON 信封是唯一 stdout 载荷；stderr 不受影响）。"""
+
+    def write(self, *_args):
+        return
+
+    def flush(self):
+        pass
+
+
+def _structured_data(a, data):
+    """--json 信封的 data 载荷（v2.8 S1 机器消费方契约）：
+    任务中心命令（args 带 id 且板上存在）给完整任务对象——取自折叠视图权威缓存，与事件流重放
+    逐字段一致，含全部簿记字段（未来新增字段对机器消费方透明可见，这正是结构化通道的意义：
+    不再依赖展示层文本行格式）；list 给 id 升序任务数组；其余命令给空对象（cmd/revision 已在
+    信封顶层）。boards 走专用载荷（main 内先行处理）；--json 仅支持任务板子命令面，
+    install/uninstall-hook 不支持。"""
+    if a.cmd == 'list':
+        return {'tasks': [data['tasks'][k] for k in sorted(data['tasks'], key=lambda x: int(x[1:]))]}
+    tid = getattr(a, 'id', None)
+    if isinstance(tid, str) and tid in data.get('tasks', {}):
+        return {'task': data['tasks'][tid]}
+    return {}
+
+
 def all_boards():
     """当前目录下的全部任务板（含遗留文件与 .expert-taskboards/*.json）。"""
     found = []
@@ -1878,12 +1932,11 @@ def all_boards():
     return found
 
 
-def cmd_boards(a, _data=None):
-    found = all_boards()
-    if not found:
-        print('（当前目录没有任务板）')
-        return
-    for p in found:
+def _board_rows():
+    """逐板摘要（cmd_boards 的人类行与 --json 信封共用一份数据源，两输出面永不漂移）。"""
+    rows = []
+    for p in all_boards():
+        rel = os.path.relpath(p)
         try:
             data = json.load(open(p, encoding='utf-8'))
             tasks = data.get('tasks', {})
@@ -1891,9 +1944,22 @@ def cmd_boards(a, _data=None):
             upd = max([t.get('updated', 0) for t in tasks.values()] or [0])
             ts = datetime.datetime.fromtimestamp(upd / 1000).strftime('%m-%d %H:%M') if upd else '-'
             dist = ' '.join(f'{k}={v}' for k, v in sorted(st.items())) or '空'
-            print(f"{os.path.relpath(p)} | {len(tasks)} 任务 | {dist} | 最近更新 {ts}")
+            rows.append((rel, f"{rel} | {len(tasks)} 任务 | {dist} | 最近更新 {ts}",
+                         {'path': rel, 'tasks': len(tasks),
+                          'status_dist': dict(sorted(st.items())), 'updated': upd, 'ok': True}))
         except Exception:
-            print(f'{os.path.relpath(p)} （损坏）')  # 解析失败或深层结构损坏都不裸 traceback
+            # 解析失败或深层结构损坏都不裸 traceback
+            rows.append((rel, f'{rel} （损坏）', {'path': rel, 'ok': False}))
+    return rows
+
+
+def cmd_boards(a, _data=None):
+    rows = _board_rows()
+    if not rows:
+        print('（当前目录没有任务板）')
+        return
+    for _rel, line, _payload in rows:
+        print(line)
 
 
 def cmd_replay(a, data, path):
@@ -1916,6 +1982,15 @@ def cmd_archive(a, data, path):
     target = os.path.join('.expert-taskboards', 'archive', name)
     ep = events_path(path)
     moved_log = os.path.exists(ep)
+    if os.path.exists(target) or os.path.exists(events_path(target)):
+        # S4（v2.6 遗留债，T17 收口修复，T10 首轮评审 s3）：同秒重名归档会经 os.replace 静默顶掉
+        # 既有归档（同秒内「归档 → 同名新建 → 再归档」即触发；os.replace 对既有目标是覆盖语义，
+        # 先前那份归档板与事件流一并丢失）。复用本文件既有「唯一名 + os.replace 原子落位」惯例
+        # （save_view 同款 pid+uuid 后缀）：碰撞时追加唯一后缀再落位，既有归档零覆盖；无碰撞的
+        # 正常路径归档名逐字节不变（既有调用方式与目录布局零变化）。归档在 board_lock 内执行，
+        # 同板归档串行化，存在性检查无 TOCTOU 实害。
+        name += f'.{os.getpid()}.{uuid.uuid4().hex[:8]}'
+        target = os.path.join('.expert-taskboards', 'archive', name)
     if moved_log:
         # 先迁事件流后迁板（二轮评审重要-2）：两步间被杀时顶层残留的是板（折叠视图）而非孤儿事件流
         # ——视图仍可直读降级、下次写以视图重新收编，数据零丢失；反序则顶层孤儿日志会被读命令按权威
@@ -1930,6 +2005,10 @@ def cmd_archive(a, data, path):
 def main():
     ap = argparse.ArgumentParser(description='expert-orchestrator 任务板')
     ap.add_argument('--board', help='状态文件路径，默认 <cwd>/.expert-taskboard.json；--install-hook 时可固化项目板进 hook')
+    ap.add_argument('--json', action='store_true',
+                    help='机器可读结构化输出通道（v2.8 S1）：stdout 恰一行 JSON 信封（成功 {"ok":true,cmd,data,revision}；'
+                         '失败 {"ok":false,error,...}），人类可读文本不上 stdout，stderr 与退出码语义不变；'
+                         '缺省（不带本参数）人类可读面逐字节零变化。仅支持任务板子命令，不与 --install-hook/--uninstall-hook 同用')
     ap.add_argument('--install-hook', action='store_true',
                     help='门禁执法平面（默认关闭）：向当前仓库 .git/hooks/commit-msg 安装零依赖三查 hook；已有同名 hook 报错不覆盖')
     ap.add_argument('--uninstall-hook', action='store_true',
@@ -2005,6 +2084,9 @@ def main():
     a = ap.parse_args()
     if (a.install_hook or a.uninstall_hook) and a.cmd:
         ap.error('--install-hook/--uninstall-hook 不与任务板子命令同时使用')
+    if getattr(a, 'json', False) and (a.install_hook or a.uninstall_hook):
+        ap.error('--json 不与 --install-hook/--uninstall-hook 同时使用（结构化通道仅覆盖任务板子命令）')
+    json_mode = getattr(a, 'json', False)
     if a.install_hook:
         cmd_install_hook(a)
         return
@@ -2015,26 +2097,56 @@ def main():
         ap.error('the following arguments are required: cmd（或 --install-hook / --uninstall-hook）')
     try:
         if a.cmd == 'boards':
-            a.fn(a)
+            if json_mode:
+                print(json.dumps({'ok': True, 'cmd': 'boards',
+                                  'data': {'boards': [payload for _rel, _line, payload in _board_rows()]}},
+                                 ensure_ascii=False))
+            else:
+                a.fn(a)
             return
         path = a.board or default_board()
         with board_lock(path):  # 进程互斥：load -> CAS 校验 -> 写入整体原子（TOCTOU 防护）
             data = load(path)
             check_revision(a, data)  # 写命令的 CAS 校验，锁内针对最新落盘状态（读命令无该参数，透传为不校验）
             _arm_event_ctx(a, data)  # 事件溯源：写命令派发前武装事件上下文（pre 快照/收编种子）
-            a.fn(a, data, path)
-            if a.cmd not in ('archive', '_hook-check'):
-                print(f"revision={data.get('revision', 0)}")
+            if json_mode:
+                # S1 结构化通道：人类可读 stdout 整体静默（_JsonSink 吞掉），信封是唯一 stdout 载荷；
+                # stderr（视图重建告警/门禁告警等诊断面）不受影响，退出码语义与缺省完全一致。
+                with contextlib.redirect_stdout(_JsonSink()):
+                    a.fn(a, data, path)
+                envelope = {'ok': True, 'cmd': a.cmd, 'data': _structured_data(a, data)}
+                if a.cmd not in ('archive', '_hook-check'):  # 与人类面末行 revision 约定一致
+                    envelope['revision'] = int(data.get('revision', 0))
+                print(json.dumps(envelope, ensure_ascii=False))
+            else:
+                a.fn(a, data, path)
+                if a.cmd not in ('archive', '_hook-check'):
+                    print(f"revision={data.get('revision', 0)}")
     except BoardError as e:
         payload = {'error': e.code}
         payload.update(e.fields)
         if e.code == 'unrecoverable':
             payload['unrecoverable'] = True
+        if json_mode:
+            payload = {'ok': False, **payload}  # 信封错误面：具名错误码与既有错误字段原样保留
         print(json.dumps(payload, ensure_ascii=False))
         sys.exit(1)
+    except SystemExit as e:
+        # 人读 sys.exit('错误：…') 类拒绝把消息打到 stderr 并以退出码 1 结束；--json 模式下 stdout
+        # 仍须恰一行 JSON——归一为 {"ok":false,"error":"command_failed","message":…} 信封（退出码不变）。
+        # argparse 用法错误（exit 2）与正常退出（0/None）不在信封化范围。
+        if json_mode and e.code not in (None, 0):
+            print(json.dumps({'ok': False, 'error': 'command_failed',
+                              'message': e.code if isinstance(e.code, str) else f'exit {e.code}'},
+                             ensure_ascii=False))
+            sys.exit(1)
+        raise
     except Exception as e:  # 兜底：深层结构异常等绝不裸 traceback，统一具名 unrecoverable JSON
-        print(json.dumps({'error': 'unrecoverable', 'unrecoverable': True,
-                          'reason': f'命令执行异常: {type(e).__name__}: {e}'}, ensure_ascii=False))
+        payload = {'error': 'unrecoverable', 'unrecoverable': True,
+                   'reason': f'命令执行异常: {type(e).__name__}: {e}'}
+        if json_mode:
+            payload = {'ok': False, **payload}
+        print(json.dumps(payload, ensure_ascii=False))
         sys.exit(1)
 
 

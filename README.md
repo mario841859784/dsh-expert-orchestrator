@@ -30,6 +30,16 @@ A DeepSeek Harness (DSH) **agent preset plugin**: once installed, DSH gets an "E
 - **Review-backlog closure** — the 14-item v2.7 review ledger is fully dispositioned: `taskboard.py --json` structured envelopes, the bus mailbox-root convention, archive same-second collision suffixes, `unrecoverable` upgrades for view-ahead/corrupt-archive states, and four documented written rulings.
 - **Compatibility** — `engines.dsh` / `@deepseek-ai/dsh-tools` ranges are unchanged since 2.6.0 (re-verified by the static semver matrix in `docs/internal/verification/`); the PROTOCOL refresh manifest stays at 14 items.
 
+### Combining the tool budget (#16) with idle-edge auto re-claim (#20)
+
+Both switches ship **off** by default; if you enable them, enable them **together** — each one covers a gap the other leaves open.
+
+**With #20 on and #16 off.** Every successful idle edge claims `ready`/unowned tasks (≤8 per sweep) as owner=编排者. A claimed task that is not dispatched in time is taken over by the watchdog on the time face (nudge → reclaim back to `ready`, owner cleared) — and the next idle edge re-claims it. That claim → reclaim → re-claim slow loop has **no count cap** in this combination: the budget carry-over backstop exists only when #16 is on, and the watchdog reclaim itself is an orchestration-plane command that never counts toward any budget.
+
+**Why it stays harmless — but only bounded.** Three facts hold it in check: the watchdog time window rate-limits the loop (at most one reclaim cycle per window), the loop is **zero-token** (claim ≠ dispatch — the sweep never summons an expert), and every hop is **visible on the event stream** (event `type=claim`, `args` carrying `{owner, ids}`). It can idle-loop, but it cannot spend tokens and it cannot hide.
+
+**Recommendation.** Also set `DSH_EXPERT_TOOL_BUDGET=1`: re-claims ride the claim path, so the per-(task, expert) counter accumulates across reclaims; the interrupt tier refuses on the spot (`budget_interrupted`), and `budget <id> --reset` is the only way through. Delivery exits (`done`/`fail`) are never refused — an interruption forces a hand-back, it never blocks delivery.
+
 ## What's new in v2.7
 
 - **Crash-safe orchestration state (WP-4b)** — the taskboard is event-sourced (append-only event stream as authority, dual-layer integrity hashes, deterministic crash replay); the bus filters by dispatch generation with a tri-state verdict and supports incremental reads (`--since-seq`); a watchdog adopts orphaned experts when their completion evidence is already on the bus. `summon_expert` can resume interrupted expert runs as durable continuations on new-generation hosts (ruling Q2=2A — old hosts keep one-shot behavior; `DSH_EXPERT_RESUME=0` disables).

@@ -59,6 +59,16 @@
 | 🧾 **评审台账收口** | v2.7 评审后置 14 项台账全部处置：`taskboard.py --json` 结构化信封、bus 信箱根约定成文、归档同秒碰撞唯一后缀、视图超前/损坏归档板升格 `unrecoverable`，另四项书面裁定留档 |
 | 🔌 **兼容性** | `engines.dsh` / `@deepseek-ai/dsh-tools` 区间自 2.6.0 起未变（静态 semver 矩阵复验，记录见 `docs/internal/verification/`）；PROTOCOL 刷新清单维持 14 项 |
 
+### #16 硬预算 × #20 idle-edge 自动续领：建议组合开启
+
+两个开关默认均**关闭**；若要开启，建议**同时开启**——各自补上对方留下的缺口。
+
+**#20 开而 #16 关时。** 每次成功的空闲边沿都会把 `ready` 且无 owner 的任务（每轮扫描 ≤8 条）以 owner=编排者 领取。领取后未及时派工的任务由 watchdog 从时间面接管（nudge→reclaim 回 `ready`、清 owner）——而下一个空闲边沿会再次领取。该 claim→reclaim→再 claim 的慢循环在此组合下**没有计数上限**：#16 的预算累计兜底只在 #16 开启时存在，而 watchdog reclaim 本身是编排面命令，不计入任何预算。
+
+**为什么它无害——但也仅是有界。** 三个事实兜住它：watchdog 时间窗为循环限速（每个时间窗至多一轮回收周期）、循环**零 token**（领取≠派工——扫描绝不召唤专家）、每一跳都在**事件流可见**（事件 `type=claim`，`args` 携带 `{owner, ids}` 可辨来源）。它可以空转，但花不掉 token、也藏不住。
+
+**建议。** 同时设置 `DSH_EXPERT_TOOL_BUDGET=1`：续领取道既有 claim 路径，per-(task, expert) 计数跨 reclaim 累计；interrupt 档当场拒绝（`budget_interrupted`），`budget <id> --reset` 是唯一放行出口。交付出口（`done`/`fail`）永不拒绝——中断=强迫交还，绝不阻断交付。
+
 ## 🆕 v2.7 新特性
 
 | 特性 | 说明 |

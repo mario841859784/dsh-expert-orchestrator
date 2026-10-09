@@ -6261,6 +6261,45 @@ test('T26 per-cwd 写锁单元：获取/拒绝（含持有者与三条出路）/
   assert.ok(!existsSync(staleP))
 })
 
+test('T37 per-cwd 写锁重入释放修复：重入/原始按计数递减、持有未清零前异名仍拒、清零才删锁文件', (t) => {
+  guardT26Env(t)
+  process.env.DSH_EXPERT_CWD_LOCK = '1'
+  const dir = mkdtempSync(join(tmpdir(), 't37-cwdlock-reentry-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const lockFile = join(dir, '.expert-bus', 'cwd-write.lock')
+  const holderCount = () => { try { return JSON.parse(readFileSync(lockFile, 'utf-8')).count } catch { return null } }
+  // 场景①（重入先释放）：count 递减且原始在持时异名仍拒——缺陷版重入 release 比对
+  // 本次新生成随机 token（从未写入锁文件）恒失配，count 永不递减。
+  const o1 = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(o1.ok)
+  const r1 = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(r1.ok && r1.reentrant, '同 pid 同名=重入计数放行')
+  assert.equal(holderCount(), 2, '重入后 count=2')
+  r1.release()
+  r1.release() // 释放幂等：二次调用不得再递减
+  assert.equal(holderCount(), 1, '重入先释放：count 递减回 1 且释放幂等')
+  assert.ok(existsSync(lockFile), '原始仍在持：锁文件不删')
+  const b1 = acquireCwdWriteLock({ cwd: dir, expert: '乙' })
+  assert.equal(b1.ok, false, '原始在持：异名仍拒')
+  // 场景②（原始先释放，重入在飞）：锁文件不清除、异名仍拒——缺陷版原始 release
+  // 无条件 unlink，同批双开同名专家时原始先完成即提前放锁（事故面恰为门禁目标）。
+  const r2 = acquireCwdWriteLock({ cwd: dir, expert: '甲' })
+  assert.ok(r2.ok && r2.reentrant)
+  assert.equal(holderCount(), 2)
+  o1.release()
+  assert.ok(existsSync(lockFile), '原始先释放但重入在飞：锁文件不得清除')
+  assert.equal(holderCount(), 1, '原始释放按计数递减 2→1')
+  const b2 = acquireCwdWriteLock({ cwd: dir, expert: '乙' })
+  assert.equal(b2.ok, false, '重入在飞：异名仍拒')
+  // 场景③（全部释放）：计数归 0 才删锁文件，清零后异名可获取。
+  r2.release()
+  assert.ok(!existsSync(lockFile), '全部释放（count 归 0）后锁文件清除')
+  const c1 = acquireCwdWriteLock({ cwd: dir, expert: '乙' })
+  assert.ok(c1.ok, '清零后异名可获取')
+  c1.release()
+  assert.ok(!existsSync(lockFile), '单人持有释放后锁文件清除')
+})
+
 test('T26 #22 (d) 真实子进程 E2E：同 cwd 双专家并发写——后到者被拒绝（非排队）且报错含持有者；持有者退出后可获取', async (t) => {
   guardT26Env(t)
   process.env.DSH_EXPERT_CWD_LOCK = '1'

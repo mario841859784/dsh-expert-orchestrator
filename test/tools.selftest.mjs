@@ -13,6 +13,7 @@ import { execFileSync, spawnSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
   autoClaimSummonedTasks,
+  buildRecursionAllowList,
   buildResumePrompt,
   claimFailureReason,
   collectResumeProgress,
@@ -6661,122 +6662,144 @@ test('T26 restrictableNames 动态求交（验收单测）：schemas 枚举面�
   assert.deepEqual(specs[0].toolFilter.deny, ['list_experts', 'summon_expert', 'summon_experts'])
 })
 
-test('dsh-expert-293 T1 负向主用例：preset 作用域名经召唤者 agent scope 探测面并入，summon 派发 deny=7 名', async (t) => {
+test('dsh-expert-294 回炉 P0 主用例：deny 只传全局确证名→spawn 通过；「召唤者可见 ⊋ 子代理可 restrict」真机现场钉死', async (t) => {
   guardT26Env(t)
   const warns = []
   const originalWarn = console.warn
   console.warn = (m) => warns.push(String(m))
   t.after(() => { console.warn = originalWarn })
-  // 缺陷现场形态：插件 ctx（全局视角）只见全局层——schemas() 枚举与 get() 探测对
-  // subagent/subagent_fork/workflow/ralph 双盲；召唤者 agent scope 视域可见全七名。
-  // T2 起 mock 采用宿主真实装配形状：schemas(scope)/get(name, scope) 为显式 scope
-  // 参数语义（dsh-tools 0.2.1-alpha.2 lib/index.js:3021/:2940），scope=召唤者 agent
-  // 对象（dsh-agent-loop lib/index.js:778 createScope(loopCtx, this)——对象即 key）。
-  const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash']
-  const agentScopeNames = [...EXPERT_TOOLS_DENY_LIST, 'bash']
-  const summoner = { id: 'summoner-agent', ctx: null } // scope key 占位（真实宿主=agent 对象本身）
-  const hostShapedTools = {
-    schemas: (scope) => (scope === summoner ? agentScopeNames : globalNames).map((name) => ({ name })),
-    get: (n, scope) => ((scope === summoner ? agentScopeNames : globalNames).includes(n) ? {} : undefined),
-  }
-  const ctx = { tools: hostShapedTools }
-  const scopeCtx = { tools: hostShapedTools } // cordis 语义：agent.ctx.tools 解析到同一 registry
-  summoner.ctx = scopeCtx
-  // 探测面收集：插件面（全局视域）+ 召唤者 scope 面（scope=exec.agent 显式透传）
-  assert.deepEqual(
-    restrictProbeFaces(ctx, scopeCtx, summoner).map((f) => f.kind),
-    ['schemas', 'schemas'],
-  )
-  // 单元：七名全保留（求交只剔「宿主真不认识」的名，不剔「插件 ctx 不可见但已注册」的名）
-  assert.deepEqual(filterRestrictableTools(ctx, EXPERT_TOOLS_DENY_LIST, 'deny', scopeCtx, summoner), [...EXPERT_TOOLS_DENY_LIST])
-  assert.ok(!warns.some((m) => m.includes('subagent') || m.includes('workflow') || m.includes('ralph')), '已注册名不得有剔除告警')
-  // 全链：summon 发射 spec 的 toolFilter.deny 必须含全部 7 名
-  const f = makeT26Fixture(t, 'deny-six')
-  const { descriptors, specs, ctx: summonCtx } = makeProfileSummonCtx({ registry: new Set(globalNames), schemaNames: globalNames })
-  registerExpertTools(summonCtx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
-  const summon = descriptors.find((d) => d.name === 'summon_expert')
-  await summon.execute({ expert: '甲', task: 'x' }, { agent: summoner })
-  assert.deepEqual(specs[0].toolFilter.deny, [...EXPERT_TOOLS_DENY_LIST], '派发描述符 deny=7 名（含 subagent 等 preset 作用域名+ralph）')
-})
-
-test('dsh-expert-293 T2 宿主形状用例（C 回炉）：schemas(scope)/get(name,scope) 显式 scope 参数语义——无参调用=全局视域，mock 绿真机红偏差钉死', async (t) => {
-  guardT26Env(t)
-  // 宿主 dsh-tools 0.2.1-alpha.2 真实形状（lib/index.js:2940/:3021）：
-  // get(name, scope)/schemas(scope) 的 scope 是**显式参数**，省略=全局视域；
-  // cordis Service 代理（cordis lib/index.js createShadowMethod）只把 this.ctx 重绑
-  // 到访问方 ctx，**从不向省略的参数注入 scope**——所以 2.9.3 在 scopeCtx 上无参
-  // 调用 schemas()/get(name) 读到的仍是全局层，preset generation 层（composeFrom
-  // 经 bindScopeParent 挂在祖先链层，dsh-agent-preset-registry lib/index.js:701/
-  // :710）对两个探测面双盲 → deny 被剔成 3 名。本用例按宿主形状构造 mock，
-  // 同时钉死「传 scope=七名全保留」与「不传 scope=收窄」两个方向。
-  const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash']
-  const generationLayerNames = ['subagent', 'subagent_fork', 'workflow', 'ralph', 'bash', 'read'] // preset generation scope 层（祖先链层贡献）
-  const agentScopeNames = [...new Set([...globalNames, ...generationLayerNames])]
+  // 真机现场（0.2.1-alpha.2 重启后实测）：2.9.4 summon 派发即拒——
+  // 「tools.restrict() names unknown global tool "subagent"」，其 known 清单含
+  // subagent_fork/workflow/ralph/summon_expert 等、唯独没有 subagent。根因（源码
+  // 行号级）：子代理 spawn 侧 restrict 校验集 = view(child).restrictableNames
+  // （dsh-tools lib/index.js:2904）= 全局层 ∪ preset generation 层（view() 只把
+  // inherited 计入，:2967-2970；own 层豁免，:2973-2976），而 2.9.4 的召唤者 scope
+  // 视域面读 view(exec.agent).visible——它包含召唤者 own 层与更高祖先层的工具。
+  // 「召唤者可见」与「子代理可 restrict」是两个集合，schemas/get 这条 seam 无法
+  // 区分归属 → 探测只读全局视域（无参调用，dsh-tools lib/index.js:3021/:2994）。
+  // mock 按宿主真实装配形状构造：schemas(scope)/get(name, scope) 为显式 scope 参数。
+  const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash', 'read']
+  const generationLayerNames = ['subagent_fork', 'workflow', 'ralph'] // preset generation 层（子代理链上、可 restrict，但全局面不可见）
+  const summonerOnlyNames = ['subagent'] // 召唤者 own/更高祖先层（子代理链下，进 deny 即炸）
+  const summonerVisible = [...new Set([...globalNames, ...generationLayerNames, ...summonerOnlyNames])]
   const summoner = { id: 'summoner-agent' }
-  const view = (scope) => (scope === summoner ? agentScopeNames : globalNames)
+  const view = (scope) => (scope === summoner ? summonerVisible : globalNames)
   const hostShapedTools = {
     schemas: (scope) => view(scope).map((name) => ({ name })),
     get: (n, scope) => (view(scope).includes(n) ? {} : undefined),
   }
   const ctx = { tools: hostShapedTools }
-  const scopeCtx = { tools: hostShapedTools }
-  // ① 修复路径：scope=exec.agent 显式透传 → 召唤者视域 → 七名全保留（不炸不收窄）
+  // 单元：deny 收窄为全局确证子集（3 名召唤工具）。2.9.4 行为（scope 面确证即保留）
+  // 会把 subagent/subagent_fork/workflow/ralph 一并放行 → 本断言在 2.9.4 下红。
   assert.deepEqual(
-    filterRestrictableTools(ctx, EXPERT_TOOLS_DENY_LIST, 'deny', scopeCtx, summoner),
-    [...EXPERT_TOOLS_DENY_LIST],
-  )
-  // ② 回归钉（2.9.3 失配现场）：同一条 scopeCtx，不传 scope（无参调用）→ 视域退化为
-  //    全局层 → preset 作用域名被当「未注册」剔除 → 只剩 3 名召唤工具。这正是
-  //    真机描述符 deny=3 的成因；旧 mock 的零参 schemas 返回作用域名是不代表宿主
-  //    的假形状，本断言防止该偏差以任何形式回潮。
-  assert.deepEqual(
-    filterRestrictableTools(ctx, EXPERT_TOOLS_DENY_LIST, 'deny', scopeCtx),
+    filterRestrictableTools(ctx, EXPERT_TOOLS_DENY_LIST, 'deny'),
     ['list_experts', 'summon_expert', 'summon_experts'],
   )
-  // ③ probe 面同理：无 schemas 缝时 get(name, scope) 逐名探测，scope 语义一致
-  const probeCtx = { tools: { get: hostShapedTools.get } }
-  assert.deepEqual(
-    filterRestrictableTools(probeCtx, EXPERT_TOOLS_DENY_LIST, 'deny', { tools: { get: hostShapedTools.get } }, summoner),
-    [...EXPERT_TOOLS_DENY_LIST],
-  )
-  assert.deepEqual(
-    filterRestrictableTools(probeCtx, EXPERT_TOOLS_DENY_LIST, 'deny', { tools: { get: hostShapedTools.get } }),
-    ['list_experts', 'summon_expert', 'summon_experts'],
-  )
-  // ④ 探测面 kind 收集（scope 面在 scope 缺失时退化为全局视域，仍照常建面）
-  assert.deepEqual(restrictProbeFaces(ctx, scopeCtx, summoner).map((f) => f.kind), ['schemas', 'schemas'])
-  assert.deepEqual(restrictProbeFaces(ctx, null, null).map((f) => f.kind), ['schemas'])
+  assert.ok(warns.some((m) => m.includes('subagent')), '召唤者可见但全局未注册名的剔除有 console.warn 可见')
+  // 全链：summon 发射 toolFilter = allow(P1 全局枚举−递归清单) + deny(全局确证子集)
+  // ——宿主 restrict 校验集（全局∪generation）⊇ allow ∪ deny → spawn 不再被拒。
+  const f = makeT26Fixture(t, 'deny-global-only')
+  const { descriptors, specs, ctx: summonCtx } = makeProfileSummonCtx({ registry: new Set(globalNames), schemaNames: globalNames })
+  registerExpertTools(summonCtx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '甲', task: 'x' }, { agent: summoner })
+  assert.deepEqual(specs[0].toolFilter.deny, ['list_experts', 'summon_expert', 'summon_experts'], 'deny=3 名（全局层确证），spawn 不再被宿主 restrict 拒收')
+  assert.deepEqual(specs[0].toolFilter.allow, ['bash', 'read'], 'P1 allow=全局枚举−递归清单（generation 层派生面与召唤者 own 层名一并不可见）')
 })
 
-test('dsh-expert-293 T1 降级：宿主真未注册名双视角双盲 → summon 不炸、收窄 + warn 可见；全面异常保守保留', async (t) => {
+test('dsh-expert-294 回炉 P0：probe 面（无 schemas 缝）同纪律收窄；探测面收集恒为单一全局面', async (t) => {
+  guardT26Env(t)
+  // 宿主 dsh-tools 0.2.1-alpha.2 真实形状（lib/index.js:2994/:3021）：
+  // get(name, scope)/schemas(scope) 的 scope 是**显式参数**，省略=全局视域。
+  // 2.9.3 真机形状（get 面无参=全局视域）本就落在安全侧；2.9.4 加 scope 面后被
+  // 召唤者 own/更高祖先层名字（subagent）炸穿。本用例钉死：probe 面与 schemas 面
+  // 一致地只认全局视域，deny 收窄为 3 名召唤工具。
+  const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash']
+  const generationLayerNames = ['subagent_fork', 'workflow', 'ralph']
+  const summonerVisible = [...new Set([...globalNames, ...generationLayerNames, 'subagent'])]
+  const summoner = { id: 'summoner-agent' }
+  const view = (scope) => (scope === summoner ? summonerVisible : globalNames)
+  const hostShapedTools = {
+    schemas: (scope) => view(scope).map((name) => ({ name })),
+    get: (n, scope) => (view(scope).includes(n) ? {} : undefined),
+  }
+  // ① probe 面（仅 get）：get(name) 无参=全局视域 → 同样收窄为 3 名（2.9.3 真机形状）
+  const probeCtx = { tools: { get: hostShapedTools.get } }
+  assert.deepEqual(
+    filterRestrictableTools(probeCtx, EXPERT_TOOLS_DENY_LIST, 'deny'),
+    ['list_experts', 'summon_expert', 'summon_experts'],
+  )
+  // ② schemas 面同理（与 P0 主用例互为镜像：枚举缝/探测缝两条 seam 同纪律）
+  assert.deepEqual(
+    filterRestrictableTools({ tools: hostShapedTools }, EXPERT_TOOLS_DENY_LIST, 'deny'),
+    ['list_experts', 'summon_expert', 'summon_experts'],
+  )
+  // ③ 探测面收集：恒为单一全局面（scope 面已剔除）；缝缺失 → 空面（调用方原样传递）
+  assert.deepEqual(restrictProbeFaces({ tools: hostShapedTools }).map((f) => f.kind), ['schemas'])
+  assert.deepEqual(restrictProbeFaces(probeCtx).map((f) => f.kind), ['get'])
+  assert.deepEqual(restrictProbeFaces({ tools: {} }), [])
+})
+
+test('dsh-expert-294 回炉降级：宿主真未注册名收窄 + warn 可见；探测全异常保守保留；无探测缝原样传递', async (t) => {
   guardT26Env(t)
   const warns = []
   const originalWarn = console.warn
   console.warn = (m) => warns.push(String(m))
   t.after(() => { console.warn = originalWarn })
-  // ① 全链降级：宿主注册表缺 workflow/ralph（派生面未注册的降级态），插件 ctx 与
-  //    召唤者 agent scope 都不认识 → deny 收窄至 5 名、发射成功（restrict 不炸）
+  // ① 全链降级：宿主注册表缺 workflow/ralph（派生面未注册的降级态）→ deny 收窄至
+  //    5 名、allow=全局−递归清单、发射成功（restrict 不炸）；subagent/subagent_fork
+  //    在该部署的全局层 → 既留 deny 又被 allow 排除，双保险不可见。
   const known = ['list_experts', 'summon_expert', 'summon_experts', 'subagent', 'subagent_fork', 'bash']
   const f = makeT26Fixture(t, 'deny-degrade')
   const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(known), schemaNames: known })
   registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
   const summon = descriptors.find((d) => d.name === 'summon_expert')
-  const scopeCtx = { tools: { get: (n) => (known.includes(n) ? {} : undefined) } }
-  const r = await summon.execute({ expert: '甲', task: 'x' }, { agent: { ctx: scopeCtx } }) // 不炸
+  const r = await summon.execute({ expert: '甲', task: 'x' }, { agent: {} }) // 不炸
   assert.equal(r.answer, 'ok')
   assert.deepEqual(specs[0].toolFilter.deny, EXPERT_TOOLS_DENY_LIST.filter((n) => n !== 'workflow' && n !== 'ralph'))
+  assert.deepEqual(specs[0].toolFilter.allow, ['bash'])
   assert.ok(warns.some((m) => m.includes('workflow')), '收窄名有 console.warn 可见')
-  // ② 单元：双视角所有探测面均异常 → 保守保留（探测失败≠未注册，退回宿主裁决）
+  // ② 单元：探测面抛异常 → 保守保留（探测失败≠未注册，退回宿主裁决）
   const ctxThrow = { tools: { get: () => { throw new Error('boom') } } }
-  const scopeThrow = { tools: { get: () => { throw new Error('boom') } } }
-  assert.deepEqual(filterRestrictableTools(ctxThrow, EXPERT_TOOLS_DENY_LIST, 'deny', scopeThrow), [...EXPERT_TOOLS_DENY_LIST])
-  // ③ 单元：插件面缺失（无 schemas 无 get）但召唤者 scope 面可用 → scope 面独立承担探测
-  const onlyScope = {
-    tools: {
-      get: (n) => ([...EXPERT_TOOLS_DENY_LIST, 'bash'].includes(n) ? {} : undefined),
-    },
-  }
-  assert.deepEqual(filterRestrictableTools({}, EXPERT_TOOLS_DENY_LIST, 'deny', onlyScope), [...EXPERT_TOOLS_DENY_LIST])
+  assert.deepEqual(filterRestrictableTools(ctxThrow, EXPERT_TOOLS_DENY_LIST, 'deny'), [...EXPERT_TOOLS_DENY_LIST])
+  // ③ 单元：无探测缝（schemas/get 双缺）→ 原样传递（退回宿主报错，不静默）
+  assert.deepEqual(filterRestrictableTools({}, EXPERT_TOOLS_DENY_LIST, 'deny'), [...EXPERT_TOOLS_DENY_LIST])
+})
+
+test('dsh-expert-294 P1 buildRecursionAllowList：全局枚举−递归清单−run_code 动态求交；无枚举面/求交为空 → null 退回 deny-only', () => {
+  // ① schemas 枚举面：allow = 全局层注册名 − 递归防护清单 − run_code（动态枚举，勿硬编码全集）
+  const allNames = ['bash', 'read', 'workflow', 'ralph', 'subagent', 'subagent_fork', 'list_experts', 'summon_expert', 'summon_experts', 'run_code']
+  const ctxSchemas = { tools: { schemas: () => allNames.map((name) => ({ name })), get: (n) => (allNames.includes(n) ? {} : undefined) } }
+  assert.deepEqual(buildRecursionAllowList(ctxSchemas), ['bash', 'read'])
+  // ② schemas 空枚举/抛异常 → 降级 probe 模式 → null（枚举面不可用不做假修复）
+  assert.equal(buildRecursionAllowList({ tools: { schemas: () => [], get: () => ({}) } }), null)
+  assert.equal(buildRecursionAllowList({ tools: { schemas: () => { throw new Error('boom') }, get: () => ({}) } }), null)
+  // ③ 双缺面 → null
+  assert.equal(buildRecursionAllowList({ tools: {} }), null)
+  // ④ 求交后为空（全局层只剩递归防护名）→ null：空 allow 在宿主 admits() 下把全部
+  //    inherited 判为不可见（dsh-tools lib/index.js:2642-2645），绝不下发空 allow
+  assert.equal(buildRecursionAllowList({ tools: { schemas: () => EXPERT_TOOLS_DENY_LIST.map((name) => ({ name })) } }), null)
+  // ⑤ run_code 显式剔除：PTC 非原生模式下它在全局 visible 里（dsh-tools lib/index.js:2977），
+  //    而 restrict() 对该名直接抛错（:2903）
+  assert.equal(buildRecursionAllowList({ tools: { schemas: () => [{ name: 'run_code' }, { name: 'bash' }] } }).includes('run_code'), false)
+})
+
+test('dsh-expert-294 P1 resolveProfileEffect 叠加：档案未配 tools.allow 时叠加递归 allow，isToolAvailable 对派生面判不可见（#17 联动剪除）', () => {
+  const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash', 'read']
+  const ctx = { tools: { schemas: () => globalNames.map((name) => ({ name })), get: (n) => (globalNames.includes(n) ? {} : undefined) } }
+  const eff = resolveProfileEffect(ctx, { tools: { deny: ['bash'] } })
+  // allow=全局−递归清单（workflow/ralph/subagent* 不在全局层 → 不在 allow → 不可见）
+  assert.deepEqual(eff.toolFilter, { allow: ['bash', 'read'], deny: ['list_experts', 'summon_expert', 'summon_experts', 'bash'] })
+  assert.equal(eff.isToolAvailable('workflow'), false, 'P1：派生旁路面不在 allow → 不可见（deny 探测剔除无法覆盖的名字由 allow 兜住）')
+  assert.equal(eff.isToolAvailable('subagent_fork'), false, 'generation 层派生面同样不在 allow → 不可见')
+  assert.equal(eff.isToolAvailable('bash'), false, 'deny 命中优先（宿主 admits 双查：allow 放行≠放行，deny 仍否决）')
+  assert.equal(eff.isToolAvailable('read'), true)
+  // 档案自带 tools.allow：既有 #19 语义不变（不叠加递归 allow）
+  const effAllow = resolveProfileEffect(ctx, { tools: { allow: ['read'] } })
+  assert.deepEqual(effAllow.toolFilter.allow, ['read'])
+  // 无枚举面（旧代宿主）：不叠加递归 allow，退回 deny-only（deny 仍按探测面收窄为已注册子集）
+  const effProbe = resolveProfileEffect({ tools: { get: (n) => (globalNames.includes(n) ? {} : undefined) } }, { tools: { deny: ['bash'] } })
+  assert.deepEqual(effProbe.toolFilter, { deny: ['list_experts', 'summon_expert', 'summon_experts', 'bash'] })
 })
 
 test('T26 per-cwd 写锁单元：获取/拒绝（含持有者与三条出路）/同专家重入计数/死持有者偷锁/readOnly 与开关', (t) => {

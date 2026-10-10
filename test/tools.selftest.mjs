@@ -4304,6 +4304,79 @@ test('dsh-expert-291 T1 降级可见：startActivation 面但 provider 缺 prepa
   }
 })
 
+// ── dsh-expert-292 T1 选轨钉子：ctx.subagents 双面并存（旧轨面 + startActivation
+//    新轨面同时存在，宿主过渡版本形态）时保守选旧轨——注册守卫 hasLegacyStart
+//    优先（lib/tools.js registerExpertTools）与 detectResumeSeam 旧轨分支先判
+//    各一。并存面走旧轨路径，断言新轨 startActivation 全程零调用。 ───────────
+
+test('dsh-expert-292 T1 选轨钉子①a：start 与 startActivation 并存 → 注册守卫保守走旧轨，summon 发射 start 且零 startActivation', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't292-dual-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    // provider 无 prepareContinuable → seam null → one-shot 路径（发射双轨裁决面）
+    const provider = { name: 'spawn', capabilities: { persona: true, toolFilter: true } }
+    const state = { legacyStarts: [], activationCalls: 0 }
+    const ctx = {
+      tools: { register: () => {}, get: () => ({}) },
+      subagents: {
+        getProvider: () => provider,
+        // 旧轨面：start(providerName, request)（0.1.x/0.2.0 契约）
+        start: async (providerName, request) => {
+          state.legacyStarts.push({ providerName, request })
+          return {
+            result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'legacy one-shot' }] }),
+            dispose: async () => {},
+          }
+        },
+        // 新轨面并存：只要 start 存在就不得被触碰（保守选旧轨）
+        startActivation: async () => {
+          state.activationCalls += 1
+          return { result: Promise.resolve({ stopReason: 'completed', output: [] }), dispose: async () => {} }
+        },
+      },
+    }
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    // 注册守卫：hasLegacyStart 优先 → 两面并存可注册且不发新轨警告
+    assert.equal(registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) }), true)
+    assert.ok(descriptors.some((d) => d.name === 'summon_expert'))
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '后端工程师', task: '并存面任务' }, { agent: {} })
+    assert.equal(r.answer, 'legacy one-shot')
+    // 发射面：并存面走旧轨 start（providerName, request 平铺契约），新轨零调用
+    assert.equal(state.legacyStarts.length, 1)
+    assert.equal(state.legacyStarts[0].providerName, 'spawn')
+    assert.ok(state.legacyStarts[0].request.prompt[0].text.includes('并存面任务'))
+    assert.equal(state.activationCalls, 0)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('dsh-expert-292 T1 选轨钉子①b：detectResumeSeam 对旧轨续跑面与 startActivation 并存保守返回 legacy 轨（不触碰 startActivation）', async (t) => {
+  guardResumeEnv(t)
+  const provider = { name: 'spawn', prepareContinuable: async () => ({}) }
+  const state = { legacySpecs: [], activationSpecs: [] }
+  const ctx = {
+    on: (ev) => (ev === 'subagent/end' ? () => {} : () => {}),
+    subagents: {
+      getProvider: () => provider,
+      start: async () => ({}), // 旧宿主发射面共存（seam 判定不读 start，仅并存在场）
+      startContinuable: async (spec) => { state.legacySpecs.push(spec); return {} },
+      startActivation: async (spec) => { state.activationSpecs.push(spec); return {} },
+      sendMessage: async () => 'msg',
+    },
+  }
+  const seam = detectResumeSeam(ctx, provider)
+  assert.ok(seam && seam.track === 'legacy')
+  const spec = { provider: 'spawn', request: { prompt: [] } }
+  await seam.startContinuable(spec)
+  assert.equal(state.legacySpecs.length, 1)
+  assert.equal(state.legacySpecs[0], spec) // spec 原样收口（旧轨契约）
+  assert.equal(state.activationSpecs.length, 0) // 新轨零调用
+})
+
 test('parseBusMessages: 头部解析 + seq/task/attempt 尾巴剥离 + 残块跳过', () => {
   const out = [
     '--- m2 [未读] from=后端工程师 subject=T12 完成 ts=1700000000001 seq=4',

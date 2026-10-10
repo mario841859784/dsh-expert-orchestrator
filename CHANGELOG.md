@@ -2,6 +2,14 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.9.4] — 2026-10-10
+
+### Fixed
+
+- **2.9.3 的 scopeCtx 探测面真机未生效 — dsh-tools 视域方法 scope 为显式参数而 cordis 代理不注入，无参调用仍读全局视域** (dsh-expert-293-r2 T2 回炉, `lib/tools.js` + `test/tools.selftest.mjs`): **根因（源码行号实证）** — 2.9.3 新增的召唤者 agent scope 面（`exec.agent.ctx`）上调用 `schemas()`/`get(name)` 时不传 scope，而 dsh-tools 的视域方法把 scope 作为**显式参数**（`schemas(scope)` / `get(name, scope)`，dsh-tools 0.2.1-alpha.2 `lib/index.js:3021/:2940`，「omitted = the global view」），且 cordis Service 代理（cordis `lib/index.js` `createShadowMethod`）只把 `this.ctx` 重绑到访问方 ctx、**从不向省略的参数注入 scope** —— scopeCtx 面在真机退化成第二个全局视域面，preset 作用域注册名（subagent/subagent_fork/workflow，经 dsh-agent-preset-registry `composeFrom` 的 bindScopeParent 挂在 preset generation 层=祖先链层，绝不在全局层）双面双盲，被 `filterRestrictableTools` 判「definitively 未注册」剔除 → 真机 deny 收窄成 3 名（旧用例 mock `schemas = () => agentScopeNames` 零参返回作用域名，mock 绿真机红）。**修法** — 探测面显式传 `scope=exec.agent`（agent 对象即 scope key，dsh-agent-loop `lib/index.js:778` `createScope(loopCtx, this)`；宿主自用先例 dsh-tools `lib/index.js:1404` `registry.schemas(exec.agent)`）：`hostRestrictableNames(ctx, scope)` 对 `schemas(scope)/get(name, scope)` 显式传参；`restrictProbeFaces(ctx, scopeCtx, scope)` 的 scope **只透传给召唤者 scope 面**（插件 ctx 面保持全局视域——全局注册名即使被召唤者侧 restrict 隐藏也须由全局面确证保留）；旧代宿主 schemas/get 不收 scope 参数时忽略多余实参，行为与 2.9.3 一致（不回归）。用例侧 mock 重构为宿主形状（显式参数语义），双向钉死：传 scope=派发描述符 deny 7 名全保留 / 同一 scopeCtx 不传 scope→收窄 3 名（回归钉，防假形状 mock 回潮）。`npm test` 280 tests / 279 pass / 1 skipped（baseline 279/278；skip 仍为环境耦合 e2e 用例）。
+- **deny 清单补口 `ralph`（6→7 名）— workflow 同构派生旁路** (dsh-expert-293-r2 T2 回炉, `lib/tools.js`): 源码实证 dsh-tool-ralph `lib/index.js:301` 工具名 "ralph"、`:331` `ctx.workflowEngine.start` 每轮 spawn 全新子代理——与 workflow 同为绕过 tool-subagent `maxDepth:1` 熔断的派生面（workflow 旁路证据同构），此前不在 deny 表=递归侧门。`EXPERT_TOOLS_DENY_LIST` 扩至 7 名。
+- **workflow 引擎无深度配置缝 — toolFilter 可见性 deny 是唯一插件可达执法层（源码实证）** (dsh-expert-293-r2 T2 回炉, 核查结论): PtcWorkflowEngine.Config 仅 provider/maxConcurrentAgents/maxTotalAgents/maxItemsPerCall/syncTimeoutMs（dsh-workflow-ptc `lib/index.js:591-:597`），startChild 不传 maxDepth，startLocal 只认 request.maxDepth（dsh-subagent `lib/index.js:1402-:1405`）——**无宿主缝可配引擎派生深度**，cordis.patch.yml 域无需改动；preset 组合行 subagent/subagent_fork 的 `maxDepth:1` 是 tool 工具层熔断，对 workflow/ralph 引擎 spawn 无执法力，故 toolFilter 可见性 deny（spawn 期宿主 `applyChildComposition` → `childCtx.tools.restrict`）为唯一执法层，本版修复已覆盖。冒烟判据注记：生效判据为**描述符 `toolFilter.deny` = 7 名** `[list_experts, summon_expert, summon_experts, subagent, subagent_fork, workflow, ralph]`（2.9.3 真机为 3 名）+ 被召唤专家实调 **workflow 得 UNKNOWN_TOOL**；不要以 depth 报错为准。
+
 ## [2.9.3] — 2026-10-10
 
 ### Security / Fixed

@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.9.3] — 2026-10-10
+
+### Security / Fixed
+
+- **summon 派发 toolFilter deny 收窄缺口 — 插件 ctx 全局视角对 preset 作用域注册工具双盲误判，防递归不变量执法失效** (dsh-expert-293 T1, `lib/tools.js` + `test/tools.selftest.mjs`): **根因** — 召唤时按宿主实际注册过滤 `EXPERT_TOOLS_DENY_LIST` 的探测只看插件 ctx 一个视角，而插件 ctx 是全局视角，看不见 preset 作用域（召唤者 agent scope）注册的 `subagent`/`subagent_fork`/`workflow` —— 三名被双盲误判为「宿主未注册」而剔除，被召唤专家实际仅剩 3 名 deny，防递归不变量（专家不可再召唤专家工具）失去执法面，10-09 已实证 depth-2 派生链。**修法** — 新增 `restrictProbeFaces(ctx, scopeCtx)`：探测面 = 召唤者 agent scope（`exec.agent.ctx`）∪ 插件 ctx 全局视角的并集，`filterRestrictableTools` 改为按面集合裁决 —— 任一面确证注册 → 保留（不收窄）；全部面均确证未注册 → 剔除 + `console.warn`（剔除不放宽防护，未注册名本就不可见）；探测缝异常 → 保守原样传递（退回宿主报错，不静默）。并集是安全上界：宿主 dsh-tools 子代理发射时 restrict 的校验集 = 子代理 restrictableNames（全局层 + 祖先链层），scopeCtx 可见集 ⊆ 该集合，不会引入 restrict 拒收的名字。**两侧失败模式均钉死回归用例**（`test/tools.selftest.mjs`）：已注册名（含仅 preset 作用域可见者）不收窄 / 真未知名不炸 spawn（剔除 + warn）。`npm test` 279 tests / 278 pass / 1 skipped（baseline 277；skip 仍为环境耦合 e2e 用例）。防递归不变量执法面恢复：被召唤专家 deny 恢复 6 名。
+
 ## [2.9.2] — 2026-10-10
 
 ### Hardened

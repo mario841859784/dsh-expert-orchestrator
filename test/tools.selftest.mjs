@@ -39,6 +39,7 @@ import {
   RESUME_PROMPT_MAX_CHARS,
   resolveExpert,
   resolveProfileEffect,
+  restrictProbeFaces,
   rosterCandidates,
   sanitizePersona,
   splitPersona,
@@ -6625,7 +6626,14 @@ test('T26 restrictableNames 动态求交（验收单测）：schemas 枚举面�
   console.warn = (m) => warns.push(String(m))
   t.after(() => { console.warn = originalWarn })
   // ① schemas 枚举面：deny 与宿主可 restrict 名单动态求交，未知名剔除并告警
-  const ctxSchemas = { tools: { schemas: () => [{ name: 'summon_expert' }, { name: 'bash' }], get: () => ({}) } }
+  //   （dsh-expert-293 T1 注：get mock 修正为反映同一注册表——真实宿主插件 ctx 对
+  //   preset 作用域名 get() 也返回 undefined，恒返回 {} 会把未注册名误判为已注册）
+  const ctxSchemas = {
+    tools: {
+      schemas: () => [{ name: 'summon_expert' }, { name: 'bash' }],
+      get: (n) => (['summon_expert', 'bash'].includes(n) ? {} : undefined),
+    },
+  }
   assert.deepEqual(hostRestrictableNames(ctxSchemas), { mode: 'schemas', names: ['summon_expert', 'bash'] })
   assert.deepEqual(
     filterRestrictableTools(ctxSchemas, ['summon_expert', 'subagent', 'bash']),
@@ -6651,6 +6659,76 @@ test('T26 restrictableNames 动态求交（验收单测）：schemas 枚举面�
   const summon = descriptors.find((d) => d.name === 'summon_expert')
   await summon.execute({ expert: '甲', task: 'x' }, { agent: {} })
   assert.deepEqual(specs[0].toolFilter.deny, ['list_experts', 'summon_expert', 'summon_experts'])
+})
+
+test('dsh-expert-293 T1 负向主用例：preset 作用域名经召唤者 agent scope 探测面并入，summon 派发 deny=6 名', async (t) => {
+  guardT26Env(t)
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (m) => warns.push(String(m))
+  t.after(() => { console.warn = originalWarn })
+  // 缺陷现场形态：插件 ctx（全局视角）只见全局层——schemas() 枚举与 get() 探测对
+  // subagent/subagent_fork/workflow 双盲；召唤者 agent scope（exec.agent.ctx）可见全六名
+  const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash']
+  const agentScopeNames = [...EXPERT_TOOLS_DENY_LIST, 'bash']
+  const ctx = {
+    tools: {
+      schemas: () => globalNames.map((name) => ({ name })),
+      get: (n) => (globalNames.includes(n) ? {} : undefined),
+    },
+  }
+  const scopeCtx = {
+    tools: {
+      schemas: () => agentScopeNames.map((name) => ({ name })),
+      get: (n) => (agentScopeNames.includes(n) ? {} : undefined),
+    },
+  }
+  // 探测面收集：插件面 + 召唤者 scope 面
+  assert.deepEqual(
+    restrictProbeFaces(ctx, scopeCtx).map((f) => f.kind),
+    ['schemas', 'schemas'],
+  )
+  // 单元：六名全保留（求交只剔「宿主真不认识」的名，不剔「插件 ctx 不可见但已注册」的名）
+  assert.deepEqual(filterRestrictableTools(ctx, EXPERT_TOOLS_DENY_LIST, 'deny', scopeCtx), [...EXPERT_TOOLS_DENY_LIST])
+  assert.ok(!warns.some((m) => m.includes('subagent') || m.includes('workflow')), '已注册名不得有剔除告警')
+  // 全链：summon 发射 spec 的 toolFilter.deny 必须含全部 6 名
+  const f = makeT26Fixture(t, 'deny-six')
+  const { descriptors, specs, ctx: summonCtx } = makeProfileSummonCtx({ registry: new Set(globalNames), schemaNames: globalNames })
+  registerExpertTools(summonCtx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '甲', task: 'x' }, { agent: { ctx: scopeCtx } })
+  assert.deepEqual(specs[0].toolFilter.deny, [...EXPERT_TOOLS_DENY_LIST], '派发描述符 deny=6 名（含 subagent 等 preset 作用域名）')
+})
+
+test('dsh-expert-293 T1 降级：宿主真未注册名双视角双盲 → summon 不炸、收窄 + warn 可见；全面异常保守保留', async (t) => {
+  guardT26Env(t)
+  const warns = []
+  const originalWarn = console.warn
+  console.warn = (m) => warns.push(String(m))
+  t.after(() => { console.warn = originalWarn })
+  // ① 全链降级：宿主注册表缺 workflow（召唤工具未注册的降级态），插件 ctx 与
+  //    召唤者 agent scope 都不认识 → deny 收窄至 5 名、发射成功（restrict 不炸）
+  const known = ['list_experts', 'summon_expert', 'summon_experts', 'subagent', 'subagent_fork', 'bash']
+  const f = makeT26Fixture(t, 'deny-degrade')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(known), schemaNames: known })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const scopeCtx = { tools: { get: (n) => (known.includes(n) ? {} : undefined) } }
+  const r = await summon.execute({ expert: '甲', task: 'x' }, { agent: { ctx: scopeCtx } }) // 不炸
+  assert.equal(r.answer, 'ok')
+  assert.deepEqual(specs[0].toolFilter.deny, EXPERT_TOOLS_DENY_LIST.filter((n) => n !== 'workflow'))
+  assert.ok(warns.some((m) => m.includes('workflow')), '收窄名有 console.warn 可见')
+  // ② 单元：双视角所有探测面均异常 → 保守保留（探测失败≠未注册，退回宿主裁决）
+  const ctxThrow = { tools: { get: () => { throw new Error('boom') } } }
+  const scopeThrow = { tools: { get: () => { throw new Error('boom') } } }
+  assert.deepEqual(filterRestrictableTools(ctxThrow, EXPERT_TOOLS_DENY_LIST, 'deny', scopeThrow), [...EXPERT_TOOLS_DENY_LIST])
+  // ③ 单元：插件面缺失（无 schemas 无 get）但召唤者 scope 面可用 → scope 面独立承担探测
+  const onlyScope = {
+    tools: {
+      get: (n) => ([...EXPERT_TOOLS_DENY_LIST, 'bash'].includes(n) ? {} : undefined),
+    },
+  }
+  assert.deepEqual(filterRestrictableTools({}, EXPERT_TOOLS_DENY_LIST, 'deny', onlyScope), [...EXPERT_TOOLS_DENY_LIST])
 })
 
 test('T26 per-cwd 写锁单元：获取/拒绝（含持有者与三条出路）/同专家重入计数/死持有者偷锁/readOnly 与开关', (t) => {

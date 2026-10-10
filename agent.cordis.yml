@@ -186,7 +186,7 @@
         backgroundMode: continuable
         maxDepth: 1
         toolFilter:
-          deny: [list_experts, summon_expert, summon_experts, subagent_fork, workflow]
+          deny: [] # 递归隔离由召唤期运行时动态求交承担（lib/tools.js EXPERT_TOOLS_DENY_LIST × 宿主注册面）；静态点名未注册名会使宿主 restrict 整体拒绝通道
 
     - id: tool-subagent-fork
       name: '@deepseek-ai/dsh-tool-subagent'
@@ -196,7 +196,7 @@
         backgroundMode: continuable
         maxDepth: 1
         toolFilter:
-          deny: [list_experts, summon_expert, summon_experts, subagent_fork, workflow]
+          deny: [] # 同上：静态点名未注册名会使宿主 restrict 整体拒绝通道
 
     - id: tool-subagent-codex
       name: '@deepseek-ai/dsh-tool-subagent'

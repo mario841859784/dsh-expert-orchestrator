@@ -4090,6 +4090,220 @@ test('RESUMABLE_STOP_REASONS 冻结：仅 error/max-tokens 可续跑；aborted/r
   assert.ok(Object.isFrozen(RESUMABLE_STOP_REASONS))
 })
 
+// ── dsh-expert-291 T1：alpha.2 startActivation 新轨（注册守卫/发射/seam 探测式
+//    双轨）。宿主契约以 0.2.1-alpha.2 宿主源码实证为准：SubagentRuntime 无
+//    start/startContinuable；startActivation(spec)（:3032，spec 顶层 provider/
+//    label/signal，request 内嵌，返回 receipt { childId, result, dispose }）；
+//    sendMessage(sender, targetId, content, options)（:3068）；回收面 drainChildren
+//    （:3129）；spawn provider 带 prepareContinuable（dsh-subagent-spawn-in-process
+//    lib/index.js:33 实证）。 ────────────────────────────────────────────────
+
+/** alpha.2 宿主 mock：无 start/startContinuable，startActivation 面三件套+
+ *  回收/中断辅助面 + ctx.on('subagent/end')。 */
+const activationHost = ({ providerContinuable = true } = {}) => {
+  const state = { startCalls: 0, startSpecs: [], sendMessageCalls: [], interruptCalls: [], drainCalls: [], listeners: new Set() }
+  const provider = {
+    name: 'spawn',
+    capabilities: { persona: true, toolFilter: true },
+    ...(providerContinuable ? { prepareContinuable: async () => ({}) } : {}),
+  }
+  const ctx = {
+    tools: { register: () => {}, get: () => ({}) },
+    on: (ev, fn) => {
+      if (ev === 'subagent/end') {
+        state.listeners.add(fn)
+        return () => state.listeners.delete(fn)
+      }
+      return () => {}
+    },
+    subagents: {
+      getProvider: () => provider,
+      startActivation: async (spec) => {
+        state.startCalls += 1
+        state.startSpecs.push(spec)
+        return {
+          childId: `child-${state.startCalls}`,
+          messageId: `m${state.startCalls}`,
+          result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'one-shot' }] }),
+          dispose: async () => {},
+        }
+      },
+      sendMessage: async (sender, childId, content, options) => {
+        state.sendMessageCalls.push({ sender, childId, content, options })
+        return `msg-${state.sendMessageCalls.length}`
+      },
+      interrupt: (childId, authority) => { state.interruptCalls.push({ childId, authority }) },
+      drainChildren: async (parent, childIds) => { state.drainCalls.push({ parent, childIds }) },
+    },
+  }
+  const emitEnd = (info) => { for (const fn of [...state.listeners]) fn(info) }
+  return { ctx, state, emitEnd, provider }
+}
+
+test('detectResumeSeam: alpha.2 startActivation 面返回 activation seam（spec 原样收口 + 辅助面直传）；降级显式可见；双缺面维持 null', async (t) => {
+  guardResumeEnv(t)
+  const { ctx, state, provider } = activationHost()
+  const seam = detectResumeSeam(ctx, provider)
+  assert.ok(seam && seam.track === 'activation')
+  // startContinuable → startActivation spec 原样收口（顶层 provider/label/signal，request 内嵌）
+  const spec = { provider: 'spawn', label: 'expert:x', request: { prompt: [] }, signal: new AbortController().signal }
+  await seam.startContinuable(spec)
+  assert.equal(state.startSpecs.length, 1)
+  assert.equal(state.startSpecs[0], spec)
+  // sendMessage 直传四参（alpha.2：sender, targetId, content, options）
+  await seam.sendMessage('sender', 'child-1', [], {})
+  assert.equal(state.sendMessageCalls[0].childId, 'child-1')
+  assert.equal(state.sendMessageCalls[0].sender, 'sender')
+  // 回收面：alpha.2 名 drainChildren 直传
+  await seam.drainChildren({}, ['c1'])
+  assert.deepEqual(state.drainCalls[0].childIds, ['c1'])
+  // 降级①：provider 缺 prepareContinuable（宿主具备 continuation 面）→ null + onDegrade 原因可见
+  const degrades = []
+  const { ctx: ctx2, provider: p2 } = activationHost({ providerContinuable: false })
+  assert.equal(detectResumeSeam(ctx2, p2, { onDegrade: (r) => degrades.push(r) }), null)
+  assert.equal(degrades.length, 1)
+  assert.ok(degrades[0].includes('prepareContinuable'))
+  // 降级②：ctx.on 缺失（结算观察面不可用）→ null + onDegrade 原因可见
+  const degrades2 = []
+  const { ctx: ctx3, provider: p3 } = activationHost()
+  delete ctx3.on
+  assert.equal(detectResumeSeam(ctx3, p3, { onDegrade: (r) => degrades2.push(r) }), null)
+  assert.ok(degrades2[0].includes('ctx.on'))
+  // 双缺面（无 start/startContinuable/startActivation，旧宿主 0.1.7 形态）：维持静默 null
+  assert.equal(detectResumeSeam({ on: () => () => {}, subagents: { getProvider: () => provider } }, provider), null)
+  // 显式关闭（DSH_EXPERT_RESUME='0'）：静默 null 且不触发 onDegrade
+  process.env.DSH_EXPERT_RESUME = '0'
+  const degrades3 = []
+  assert.equal(detectResumeSeam(ctx, provider, { onDegrade: (r) => degrades3.push(r) }), null)
+  assert.equal(degrades3.length, 0)
+  delete process.env.DSH_EXPERT_RESUME
+})
+
+test('dsh-expert-291 T1 注册守卫双轨：alpha.2 面（startActivation 无 start）可注册；双缺面 console.error 跳过；旧面不回退', () => {
+  const dst = mkdtempSync(join(tmpdir(), 't291-guard-'))
+  try {
+    // alpha.2 面：无 start，注册成功（修复目标形态——旧守卫在该形态直接跳过注册）
+    const { ctx } = activationHost()
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    assert.equal(registerExpertTools(ctx, { dst }), true)
+    assert.ok(descriptors.some((d) => d.name === 'summon_expert'))
+    // 双缺面（仅 getProvider，两轨皆缺）：console.error 既有文案 + 返回 false（不崩溃）
+    const errs = []
+    const origError = console.error
+    console.error = (m) => errs.push(String(m))
+    let r
+    try {
+      r = registerExpertTools({ tools: { register: () => {} }, subagents: { getProvider: () => ({}) } }, { dst })
+    } finally {
+      console.error = origError
+    }
+    assert.equal(r, false)
+    assert.equal(errs.length, 1)
+    assert.ok(errs[0].includes('expert tools unavailable'))
+    // 旧面（start 无 startActivation）仍可注册（两代兼容不得回退）
+    const legacyDescriptors = []
+    registerExpertTools(
+      { tools: { register: (d) => legacyDescriptors.push(d) }, subagents: { getProvider: () => ({}), start: async () => ({}) } },
+      { dst },
+    )
+    assert.ok(legacyDescriptors.some((d) => d.name === 'summon_expert'))
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('dsh-expert-291 T1 alpha.2 面 one-shot：summon 经 startActivation 发射（顶层 provider/signal，request 内嵌）', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't291-oneshot-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    // provider 无 prepareContinuable → seam null → 降级 one-shot（走新轨发射）
+    const { ctx, state, provider } = activationHost({ providerContinuable: false })
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} })
+    assert.equal(r.answer, 'one-shot')
+    assert.equal(state.startCalls, 1)
+    const spec = state.startSpecs[0]
+    assert.equal(spec.provider, 'spawn') // 顶层 provider（alpha.2 startActivation 契约）
+    assert.ok(spec.label.startsWith('expert:'))
+    assert.ok(!('prompt' in spec) && !('persona' in spec) && !('toolFilter' in spec)) // request 内嵌，不外溢
+    assert.ok(spec.request.prompt[0].text.includes('任务'))
+    assert.ok(spec.request.toolFilter.deny.includes('summon_expert'))
+    assert.deepEqual(spec.request.parent, {}) // exec.agent 原样透传为 request.parent
+    assert.ok(spec.signal instanceof AbortSignal) // 宿主裸 throwIfAborted：缺省补永不中止 signal
+    assert.equal(spec.signal.aborted, false)
+    assert.ok(!('agentOptions' in spec.request)) // 无档案 → 键不存在（#19 语义不变）
+    assert.equal(state.sendMessageCalls.length, 0)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('dsh-expert-291 T1 alpha.2 面 continuable 全链：首轮 error → sendMessage 恰好一 turn 续跑完成', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't291-resume-'))
+  t.after(() => rmSync(dst, { recursive: true, force: true }))
+  rosterFixture(dst, ['后端工程师'])
+  const { ctx, state, emitEnd } = activationHost()
+  const descriptors = []
+  ctx.tools.register = (d) => descriptors.push(d)
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dst })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const p = summon.execute({ expert: '后端工程师', task: '实现 T1 的接口层' }, { agent: {} })
+  for (let i = 0; i < 200 && state.startCalls === 0; i++) await tick()
+  assert.equal(state.startCalls, 1)
+  const spec = state.startSpecs[0]
+  assert.equal(spec.provider, 'spawn')
+  assert.ok(spec.request.prompt[0].text.includes('实现 T1 的接口层'))
+  await tick()
+  // 首轮中断：error + 部分产出（subagent/end 词表与旧轨一致）
+  emitEnd({ id: 'child-1', stopReason: 'error', lastAssistantMessage: [{ type: 'text', text: '已导出 model.js……（中断）' }] })
+  for (let i = 0; i < 200 && state.sendMessageCalls.length === 0; i++) await tick()
+  // 恰好一个续跑 turn：sendMessage(sender, childId, content, options) 直传
+  assert.equal(state.sendMessageCalls.length, 1)
+  assert.equal(state.sendMessageCalls[0].childId, 'child-1')
+  assert.ok(state.sendMessageCalls[0].content[0].text.includes('恰好一次的续跑 turn'))
+  // 续跑 turn 完成 → summon 成功返回，不产生第二次续跑
+  emitEnd({ id: 'child-1', stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: '接口层完成' }] })
+  const r = await p
+  assert.ok(r.answer.includes('接口层完成'))
+  assert.ok(r.answer.includes('断点续跑'))
+  assert.equal(state.sendMessageCalls.length, 1)
+  assert.equal(state.drainCalls.length, 0) // 成功路径不回收
+})
+
+test('dsh-expert-291 T1 降级可见：startActivation 面但 provider 缺 prepareContinuable → console.warn + one-shot 新轨', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't291-degrade-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    const { ctx, state, provider } = activationHost({ providerContinuable: false })
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (m) => warns.push(String(m))
+    let r
+    try {
+      r = await summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} })
+    } finally {
+      console.warn = origWarn
+    }
+    assert.equal(r.answer, 'one-shot')
+    assert.equal(state.startCalls, 1) // one-shot 走新轨 startActivation（功能不静默丢失）
+    assert.equal(state.sendMessageCalls.length, 0)
+    assert.ok(warns.some((m) => m.includes('断点续跑降级为 one-shot') && m.includes('prepareContinuable')), JSON.stringify(warns))
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
 test('parseBusMessages: 头部解析 + seq/task/attempt 尾巴剥离 + 残块跳过', () => {
   const out = [
     '--- m2 [未读] from=后端工程师 subject=T12 完成 ts=1700000000001 seq=4',
@@ -5133,6 +5347,18 @@ test('T14: build 产物一致（验收③）——提交的 cordis.patch.yml 与
   // 结构性命名空间隔离：手势名与既有两技能不撞
   const existing = ['expert-orchestration', 'trim-cli']
   assert.equal(roster.some((e) => existing.includes(e.skill)), false)
+})
+
+test('T2 回归：cordis.patch.yml 两处静态 toolFilter.deny 不含可能未注册的工具名', () => {
+  // 宿主 spawn 期 tools.restrict() 对未注册名直接抛 `names unknown global tools`——
+  // 静态点名 list_experts/summon_expert/summon_experts/subagent_fork/workflow 曾使
+  // subagent/subagent_fork 两条派生通道整体被拒（2026-10-10 实证）。递归隔离改由
+  // 召唤期运行时动态求交承担（lib/tools.js EXPERT_TOOLS_DENY_LIST × filterRestrictableTools）。
+  const denyLines = T14_PATCH.split('\n').filter((l) => l.trimStart().startsWith('deny:'))
+  assert.equal(denyLines.length, 2, `deny 行数=${denyLines.length}（tool-subagent 与 tool-subagent-fork 各一）`)
+  for (const n of ['list_experts', 'summon_expert', 'summon_experts', 'subagent_fork', 'workflow']) {
+    assert.ok(denyLines.every((l) => !l.includes(n)), `静态 deny 不得点名：${n}`)
+  }
 })
 
 test('T14: gen CLI spawn 实测——两连跑幂等、--check 通过、--empty-roster 回到零手势声明面', (t) => {

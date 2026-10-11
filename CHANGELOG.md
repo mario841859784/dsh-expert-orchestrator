@@ -2,6 +2,16 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.9.6] — 2026-10-11
+
+### Reverted
+
+- **2.9.5 的递归防护 allow 白名单派发整体回退为 deny-only（2.9.3 稳定语义）** (dsh-expert-296 T1, `lib/tools.js` + `test/tools.selftest.mjs`): **实机冒烟实证**——allow 视域出自插件 ctx 的无参 `schemas()` 全局枚举，该视域只得 **34 个 MCP 连接器类工具**（+ `working_directory`），preset 组合层核心工具（read/write/edit/bash/glob/grep/web/todo/skill）全部不在视域→`buildRecursionAllowList` 求交后发出的 allow 白名单把被召唤专家的核心工作工具**全通道遮蔽**，主委派通道实质不可用。回退内容：`resolveProfileEffect`（`lib/tools.js:472/:483`）与 summon 发射点（`lib/tools.js:1483/:1509-1517`）不再叠加递归 allow，档案未配置 `tools.allow` 时一律 deny-only——deny 恒为全局层确证子集（真机 = `list_experts`/`summon_expert`/`summon_experts` 3 名，2.9.3 稳定语义）；档案自带 `tools.allow` 的既有语义（#19）不变。`buildRecursionAllowList`（`lib/tools.js:201`）**保留本体、退出全部调用路径**，停用注与可复用条件齐备（`lib/tools.js:178`）：待宿主提供「子代理工具级遮蔽缝」（枚举/探测视域完整覆盖将被 allow 遮蔽的全部 inherited 层，视域 ⊇ 核心工具全集）后方可重新接入。用例钉死（`test/tools.selftest.mjs`）：派发 `toolFilter` 仅 deny 键、全局视域含核心工具也不发白名单（`:6709`）、降级态同样 deny-only（`:6763`）、`resolveProfileEffect` 无 allow 键且核心工具保持可见（`:6792`）；`npm test` 282 tests / 281 pass / 0 fail / 1 skipped（skip 仍为环境耦合 e2e 用例）。
+
+### Fixed
+
+- **递归防护残余面的执法与管控口径（如实声明，非代码修复）**: allow 回退后 `subagent`/`subagent_fork` 派生面由宿主 `maxDepth=1` 深度熔断覆盖（2.9.3/2.9.5 两轮实机有效）；`workflow`/`ralph` 引擎派生旁路为**已知残余**（deny 探测视域看不到 generation 层注册名），管控=任务书纪律 + origin-chain 溯源 + 上游特性请求方向（宿主提供子代理工具级遮蔽缝，即 `buildRecursionAllowList` 可复用条件）。
+
 ## [2.9.5] — 2026-10-11
 
 ### Fixed

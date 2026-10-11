@@ -6696,15 +6696,18 @@ test('dsh-expert-294 回炉 P0 主用例：deny 只传全局确证名→spawn �
     ['list_experts', 'summon_expert', 'summon_experts'],
   )
   assert.ok(warns.some((m) => m.includes('subagent')), '召唤者可见但全局未注册名的剔除有 console.warn 可见')
-  // 全链：summon 发射 toolFilter = allow(P1 全局枚举−递归清单) + deny(全局确证子集)
-  // ——宿主 restrict 校验集（全局∪generation）⊇ allow ∪ deny → spawn 不再被拒。
+  // 全链：summon 发射 toolFilter = deny-only（dsh-expert-296 T1 回退：2.9.5 的
+  // allow 白名单视域出自插件 ctx 全局 schemas()，看不到 preset 组合层核心工具
+  // （read/bash 等），白名单一发即遮蔽被召唤专家核心工作工具——allow 已退出派发
+  // 路径）——deny 只含全局确证子集，宿主 restrict 校验集 ⊇ deny → spawn 不被拒。
   const f = makeT26Fixture(t, 'deny-global-only')
   const { descriptors, specs, ctx: summonCtx } = makeProfileSummonCtx({ registry: new Set(globalNames), schemaNames: globalNames })
   registerExpertTools(summonCtx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'p' }), autoClaimCwd: f.root })
   const summon = descriptors.find((d) => d.name === 'summon_expert')
   await summon.execute({ expert: '甲', task: 'x' }, { agent: summoner })
   assert.deepEqual(specs[0].toolFilter.deny, ['list_experts', 'summon_expert', 'summon_experts'], 'deny=3 名（全局层确证），spawn 不再被宿主 restrict 拒收')
-  assert.deepEqual(specs[0].toolFilter.allow, ['bash', 'read'], 'P1 allow=全局枚举−递归清单（generation 层派生面与召唤者 own 层名一并不可见）')
+  assert.ok(!('allow' in specs[0].toolFilter), 'dsh-expert-296 T1：allow 已退出派发路径——全局视域含核心工具（bash/read）也不发白名单，核心工具不再被遮蔽')
+  assert.deepEqual(specs[0].toolFilter, { deny: ['list_experts', 'summon_expert', 'summon_experts'] }, '派发 toolFilter 形状钉死：仅 deny 键')
 })
 
 test('dsh-expert-294 回炉 P0：probe 面（无 schemas 缝）同纪律收窄；探测面收集恒为单一全局面', async (t) => {
@@ -6747,8 +6750,8 @@ test('dsh-expert-294 回炉降级：宿主真未注册名收窄 + warn 可见；
   console.warn = (m) => warns.push(String(m))
   t.after(() => { console.warn = originalWarn })
   // ① 全链降级：宿主注册表缺 workflow/ralph（派生面未注册的降级态）→ deny 收窄至
-  //    5 名、allow=全局−递归清单、发射成功（restrict 不炸）；subagent/subagent_fork
-  //    在该部署的全局层 → 既留 deny 又被 allow 排除，双保险不可见。
+  //    5 名、发射成功（restrict 不炸）；subagent/subagent_fork 在该部署的全局层 →
+  //    留在 deny（dsh-expert-296 T1 后派发恒 deny-only，无 allow 白名单可发）。
   const known = ['list_experts', 'summon_expert', 'summon_experts', 'subagent', 'subagent_fork', 'bash']
   const f = makeT26Fixture(t, 'deny-degrade')
   const { descriptors, specs, ctx } = makeProfileSummonCtx({ registry: new Set(known), schemaNames: known })
@@ -6757,7 +6760,7 @@ test('dsh-expert-294 回炉降级：宿主真未注册名收窄 + warn 可见；
   const r = await summon.execute({ expert: '甲', task: 'x' }, { agent: {} }) // 不炸
   assert.equal(r.answer, 'ok')
   assert.deepEqual(specs[0].toolFilter.deny, EXPERT_TOOLS_DENY_LIST.filter((n) => n !== 'workflow' && n !== 'ralph'))
-  assert.deepEqual(specs[0].toolFilter.allow, ['bash'])
+  assert.ok(!('allow' in specs[0].toolFilter), 'dsh-expert-296 T1：降级态同样 deny-only，不发 allow 白名单')
   assert.ok(warns.some((m) => m.includes('workflow')), '收窄名有 console.warn 可见')
   // ② 单元：探测面抛异常 → 保守保留（探测失败≠未注册，退回宿主裁决）
   const ctxThrow = { tools: { get: () => { throw new Error('boom') } } }
@@ -6766,7 +6769,9 @@ test('dsh-expert-294 回炉降级：宿主真未注册名收窄 + warn 可见；
   assert.deepEqual(filterRestrictableTools({}, EXPERT_TOOLS_DENY_LIST, 'deny'), [...EXPERT_TOOLS_DENY_LIST])
 })
 
-test('dsh-expert-294 P1 buildRecursionAllowList：全局枚举−递归清单−run_code 动态求交；无枚举面/求交为空 → null 退回 deny-only', () => {
+test('dsh-expert-294 P1 buildRecursionAllowList（dsh-expert-296 T1 起停用，保留本体）：全局枚举−递归清单−run_code 动态求交；无枚举面/求交为空 → null 退回 deny-only', () => {
+  // 语义钉死仅针对函数本体（已退出调用路径，供宿主子代理工具级遮蔽缝出现后复用，
+  // 见 lib/tools.js 停用注）；派发路径已由上方全链用例钉死不含 allow。
   // ① schemas 枚举面：allow = 全局层注册名 − 递归防护清单 − run_code（动态枚举，勿硬编码全集）
   const allNames = ['bash', 'read', 'workflow', 'ralph', 'subagent', 'subagent_fork', 'list_experts', 'summon_expert', 'summon_experts', 'run_code']
   const ctxSchemas = { tools: { schemas: () => allNames.map((name) => ({ name })), get: (n) => (allNames.includes(n) ? {} : undefined) } }
@@ -6784,20 +6789,20 @@ test('dsh-expert-294 P1 buildRecursionAllowList：全局枚举−递归清单−
   assert.equal(buildRecursionAllowList({ tools: { schemas: () => [{ name: 'run_code' }, { name: 'bash' }] } }).includes('run_code'), false)
 })
 
-test('dsh-expert-294 P1 resolveProfileEffect 叠加：档案未配 tools.allow 时叠加递归 allow，isToolAvailable 对派生面判不可见（#17 联动剪除）', () => {
+test('dsh-expert-296 T1 resolveProfileEffect 回退：档案未配 tools.allow → deny-only（无 allow 键，核心工具不被遮蔽）；档案自带 allow 语义不变', () => {
   const globalNames = ['list_experts', 'summon_expert', 'summon_experts', 'bash', 'read']
   const ctx = { tools: { schemas: () => globalNames.map((name) => ({ name })), get: (n) => (globalNames.includes(n) ? {} : undefined) } }
   const eff = resolveProfileEffect(ctx, { tools: { deny: ['bash'] } })
-  // allow=全局−递归清单（workflow/ralph/subagent* 不在全局层 → 不在 allow → 不可见）
-  assert.deepEqual(eff.toolFilter, { allow: ['bash', 'read'], deny: ['list_experts', 'summon_expert', 'summon_experts', 'bash'] })
-  assert.equal(eff.isToolAvailable('workflow'), false, 'P1：派生旁路面不在 allow → 不可见（deny 探测剔除无法覆盖的名字由 allow 兜住）')
-  assert.equal(eff.isToolAvailable('subagent_fork'), false, 'generation 层派生面同样不在 allow → 不可见')
-  assert.equal(eff.isToolAvailable('bash'), false, 'deny 命中优先（宿主 admits 双查：allow 放行≠放行，deny 仍否决）')
-  assert.equal(eff.isToolAvailable('read'), true)
-  // 档案自带 tools.allow：既有 #19 语义不变（不叠加递归 allow）
+  // dsh-expert-296 T1：递归防护 allow 已停用——枚举面可用也不发白名单（2.9.5 的
+  // allow 视域看不到 preset 组合层核心工具，一发即遮蔽 read/bash 等）
+  assert.ok(!('allow' in eff.toolFilter), '档案未配 tools.allow 时 toolFilter 不含 allow 键（deny-only）')
+  assert.deepEqual(eff.toolFilter, { deny: ['list_experts', 'summon_expert', 'summon_experts', 'bash'] })
+  assert.equal(eff.isToolAvailable('bash'), false, 'deny 命中优先：deny 拒收不受 allow 停用影响')
+  assert.equal(eff.isToolAvailable('read'), true, '核心工具（档案 deny 未点名）保持可见，不被 allow 遮蔽')
+  // 档案自带 tools.allow：既有 #19 语义不变（显式白名单仍下发并参与剪除）
   const effAllow = resolveProfileEffect(ctx, { tools: { allow: ['read'] } })
   assert.deepEqual(effAllow.toolFilter.allow, ['read'])
-  // 无枚举面（旧代宿主）：不叠加递归 allow，退回 deny-only（deny 仍按探测面收窄为已注册子集）
+  // 无枚举面（旧代宿主）：deny-only（deny 仍按探测面收窄为已注册子集）
   const effProbe = resolveProfileEffect({ tools: { get: (n) => (globalNames.includes(n) ? {} : undefined) } }, { tools: { deny: ['bash'] } })
   assert.deepEqual(effProbe.toolFilter, { deny: ['list_experts', 'summon_expert', 'summon_experts', 'bash'] })
 })

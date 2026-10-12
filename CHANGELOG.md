@@ -2,6 +2,13 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.9.7] — 2026-10-12
+
+### Added
+
+- **经验池维护约定（SKILL.md §8）**：三层经验池（全局 lessons.md / 项目 .expert-lessons.md / 专家 expert-lessons/<slug>.md）的维护纪律成文——可逆归档替代删除（lessons-archive.md 保留日期+原因+原文；专家池受 2000 字符注入预算约束可直删但批量整理前快照）、软顶与修剪候选（全局 ≤15 条 active、专家池 ≤3 条/文件，超顶只出清单交用户裁决不静默驱逐）、整理触发器（超顶/大交付收口/30 天未被引用标「待复核」）、整理前快照（`.expert-lessons-history/` 保留最近 5 份，never destroy）、过时判定与改写纪律（改写为「注记+原因+日期」优先，删除须用户显式裁决）。lessons.md 头部加指针行声明约定权威以 SKILL.md 为准（本文件属 USER_DATA，只缺才补、永不覆盖）。
+- **git 实施类任务默认启用工作树插件（routing.md + lessons.md seed，能力探测门控）**：使用说明新增默认约定 bullet + 路由表新增「git 实施 / 分支与历史操作」行（首选 git-workflow-manager）；git 写型任务书默认要求 create_worktree 隔离改动（合并回主干+清理写入完成定义），第一判据为本会话工具清单是否注册 `create_worktree`（仅 DSH ≥ 0.2.1-alpha.2 提供且需 GUI 插件页启用）——未注册静默降级回主检出改动并收紧写互斥，不报错、不询问。lessons.md 同步沉淀 2026-10-12 用户裁决条目（含使用前提与实测行为：无仓库路径参数、cwd 自动切换、readOnly 专家需编排者预建）。
+
 ## [2.9.6] — 2026-10-11
 
 ### Reverted

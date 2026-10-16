@@ -77,6 +77,23 @@ import { copyFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { realpathSync } from 'node:fs' // T26 链路 cwd 归一断言用（existsSync 已于本文件 1811 行导入）
+// T3 适配（dsh-expert-alpha4）：agentPreset（preset 组合）通道——per-summon
+// Agent Preset 挂载/选择（lib/summon-preset.js；设计文档
+// dsh-expert-alpha4-t3-design.md）。
+import {
+  SUMMON_PRESET_ID_PREFIX,
+  SUMMON_RESTRICT_ROW_URL,
+  agentPresetsService,
+  buildPresetChannelToolFilter,
+  buildSummonPresetDefinition,
+  createSummonPresetCache,
+  createSummonPresetRefs,
+  ensureSummonPreset,
+  releaseSummonPreset,
+  summonCustomSkillDirs,
+  summonPresetBasePlugins,
+  summonPresetKey,
+} from '../lib/summon-preset.js'
 
 const PERSONA_LIMIT = 100000 // 与 tools.js MAX_PERSONA_CHARS 一致
 
@@ -5424,16 +5441,19 @@ test('T14: build 产物一致（验收③）——提交的 cordis.patch.yml 与
   assert.equal(roster.some((e) => existing.includes(e.skill)), false)
 })
 
-test('T2 回归：cordis.patch.yml 两处静态 toolFilter.deny 不含可能未注册的工具名', () => {
-  // 宿主 spawn 期 tools.restrict() 对未注册名直接抛 `names unknown global tools`——
-  // 静态点名 list_experts/summon_expert/summon_experts/subagent_fork/workflow 曾使
-  // subagent/subagent_fork 两条派生通道整体被拒（2026-10-10 实证）。递归隔离改由
-  // 召唤期运行时动态求交承担（lib/tools.js EXPERT_TOOLS_DENY_LIST × filterRestrictableTools）。
-  const denyLines = T14_PATCH.split('\n').filter((l) => l.trimStart().startsWith('deny:'))
-  assert.equal(denyLines.length, 2, `deny 行数=${denyLines.length}（tool-subagent 与 tool-subagent-fork 各一）`)
-  for (const n of ['list_experts', 'summon_expert', 'summon_experts', 'subagent_fork', 'workflow']) {
-    assert.ok(denyLines.every((l) => !l.includes(n)), `静态 deny 不得点名：${n}`)
-  }
+test('T3 适配：cordis.patch.yml 声明行零静态 toolFilter/deny 键（alpha.3/4 apply 硬拒）', () => {
+  // dsh-tool-subagent alpha.3/4 apply()（lib/index.js:355）对含 persona/toolFilter
+  // 配置键的组合直接 throw（Object.hasOwn 命中即拒，空 deny 也不例外）——原静态
+  // toolFilter:{deny:[]}（≤alpha.2 语义=no-op restriction）已随 T3 ①删除；递归
+  // 隔离由召唤期运行时动态求交承担（lib/tools.js EXPERT_TOOLS_DENY_LIST ×
+  // filterRestrictableTools），agentPreset 通道进一步升级为组合级省略 +
+  // generation scope restrict（lib/summon-preset.js）。≤alpha.2 无回归：该键在
+  // 旧宿主仅透传为空 deny no-op，删键生效行为等价。
+  const lines = T14_PATCH.split('\n')
+  const toolFilterLines = lines.filter((l) => l.trimStart().startsWith('toolFilter:'))
+  const denyLines = lines.filter((l) => l.trimStart().startsWith('deny:'))
+  assert.equal(toolFilterLines.length, 0, `toolFilter 行数=${toolFilterLines.length}（声明行不得携带静态 toolFilter 键）`)
+  assert.equal(denyLines.length, 0, `deny 行数=${denyLines.length}（递归隔离已全部收敛到召唤期运行时）`)
 })
 
 test('T14: gen CLI spawn 实测——两连跑幂等、--check 通过、--empty-roster 回到零手势声明面', (t) => {
@@ -8300,4 +8320,670 @@ test('T3 ① interrupt 档交付出口补强：fail 与 vote 永不拒（中断=
   assert.equal(board().tasks.T2.status, 'running', '单票未达 m=2 生效线：任务保持 running（投票语义零回归）')
   // fail-safe：全链 hash 校验经 replay 通过
   assert.equal(tb(['replay'], th).status, 0)
+})
+
+// ── T3 适配（dsh-expert-alpha4）：agentPreset（preset 组合）通道 ─────────────
+// 能力分支门禁 + per-summon Agent Preset 挂载/选择（lib/summon-preset.js，设计
+// 文档 dsh-expert-alpha4-t3-design.md）。宿主契约以 0.2.1-alpha.3/4 源码实证为
+// 准：spawn-in-process capabilities={agentOptions,agentPreset,outputSchema,
+// depthLimit}（无 persona/toolFilter）；manager 新建路径 composition 只读
+// request.agentPreset（dsh-subagent/lib/types/manager.js:386 alpha.4）；fork 等
+// inheritsParentContext provider 被 assertCapabilities 拒收独立选择。
+
+/** alpha.3/4 宿主 mock：activationHost 基础上换 preset 能力面 + agentPresets
+ *  注册台（register/resolve 契约 = dsh-agent-preset-registry lib/index.js:470/:596；
+ *  disposer 幂等语义对齐宿主 unregister：记账 + 从 active 集摘除——T12 用完即注
+ *  的全链断言面。registered 保留为「曾注册历史」，active 为「当前存活定义」）。 */
+const presetActivationHost = ({ providerContinuable = true, caps } = {}) => {
+  const host = activationHost({ providerContinuable })
+  host.provider.capabilities = caps ?? { agentOptions: true, agentPreset: true, outputSchema: true, depthLimit: true }
+  const registry = { registered: [], active: new Set(), unregisterCalls: [], resolveCalls: 0, brokenById: new Map(), failRegister: null, effectDisposers: [] }
+  host.ctx.agentPresets = {
+    register: async (definition) => {
+      if (registry.failRegister) throw registry.failRegister
+      if (registry.active.has(definition.id)) throw new Error(`Duplicate agent preset: ${definition.id}`)
+      registry.registered.push(definition)
+      registry.active.add(definition.id)
+      let disposed = false
+      return async () => {
+        if (disposed) return
+        disposed = true
+        registry.unregisterCalls.push(definition.id)
+        registry.active.delete(definition.id)
+      }
+    },
+    resolve: async (id) => {
+      registry.resolveCalls += 1
+      return registry.brokenById.has(id) ? { id, broken: registry.brokenById.get(id) } : { id }
+    },
+  }
+  host.ctx.effect = (fn) => { host.registry.effectDisposers.push(fn) }
+  host.registry = registry
+  return host
+}
+
+test('T3 ③ summonPresetKey：内容键确定性 + 区分 persona/toolFilter 变化', () => {
+  const a = summonPresetKey({ persona: '正文A', toolFilter: { deny: ['x'] } })
+  assert.equal(a, summonPresetKey({ persona: '正文A', toolFilter: { deny: ['x'] } }), '同内容同键（幂等前提）')
+  assert.notEqual(a, summonPresetKey({ persona: '正文B', toolFilter: { deny: ['x'] } }), 'persona 变化 → 新键')
+  assert.notEqual(a, summonPresetKey({ persona: '正文A', toolFilter: { deny: ['y'] } }), 'toolFilter 变化 → 新键（冷恢复 id 稳定性由内容键保证）')
+  assert.notEqual(a, summonPresetKey({ persona: '正文A', toolFilter: null }), 'null 与 undefined 同形（都归一空收窄）')
+  assert.equal(summonPresetKey({ persona: '正文A', toolFilter: undefined }), summonPresetKey({ persona: '正文A', toolFilter: null }))
+  assert.match(a, /^[0-9a-f]{16}$/)
+})
+
+test('T3 ③ buildSummonPresetDefinition：persona 首行 + 副本组合 + 收窄行末行 + 组合级递归省略', () => {
+  const def = buildSummonPresetDefinition({ id: `${SUMMON_PRESET_ID_PREFIX}abc`, persona: '专家 persona 全文', toolFilter: { deny: ['summon_expert'] } })
+  assert.equal(def.id, `${SUMMON_PRESET_ID_PREFIX}abc`)
+  assert.ok(Array.isArray(def.plugins) && def.plugins.length >= 3)
+  const [persona, ...rest] = def.plugins
+  assert.equal(persona.id, 'persona')
+  assert.equal(persona.name, '@deepseek-ai/dsh-persona')
+  assert.equal(persona.config.prefix, '专家 persona 全文')
+  // 收窄行恒末行：file URL 行名指向 summon-preset-restrict 模块，config 原样透传
+  const restrict = def.plugins[def.plugins.length - 1]
+  assert.equal(restrict.id, 'summon-restrict')
+  assert.equal(restrict.name, SUMMON_RESTRICT_ROW_URL)
+  assert.ok(restrict.name.endsWith('summon-preset-restrict.js'))
+  assert.deepEqual(restrict.config, { deny: ['summon_expert'] })
+  // 副本组合 = base 行原样嵌入（persona 与 restrict 之间）
+  assert.deepEqual(rest.slice(0, -1), summonPresetBasePlugins())
+  // 组合级递归省略：delegation 系名字在整棵定义里零出现
+  const dump = JSON.stringify(def)
+  for (const n of ['tool-subagent', 'subagent_fork', 'workflow-ptc', 'tool-workflow', 'tool-ralph', 'tool-subagent-control']) {
+    assert.ok(!dump.includes(`"${n}"`), `per-summon 组合不得含派生面行：${n}`)
+  }
+  // 无收窄 → 不携带 restrict 行（空过滤器宿主 restrict no-op throw，绝不发）
+  const bare = buildSummonPresetDefinition({ id: 'x', persona: '', toolFilter: null })
+  assert.equal(bare.plugins[bare.plugins.length - 1].id, 'tool-web')
+  assert.equal(bare.plugins[0].config.prefix, '')
+})
+
+test('T3 ③ summonPresetBasePlugins：平台条件行按 !!js 语义直算 + skill 目录同源', () => {
+  const rows = summonPresetBasePlugins()
+  const byId = new Map(rows.map((r) => [r.id, r]))
+  assert.equal(byId.get('tool-bash').disabled, process.platform === 'win32')
+  assert.equal(byId.get('tool-pwsh').disabled, process.platform !== 'win32')
+  const dirs = byId.get('skill-filesystem').config.customSkillDirs
+  assert.equal(dirs.length, 2)
+  assert.ok(dirs[0].endsWith(join('.agent-presets', 'expert-orchestrator', 'skills')))
+  assert.ok(dirs[1].endsWith(join('skills', 'expert-gestures')))
+  // DSH_HOME 优先（!!js 表达式同语义）
+  const envDirs = summonCustomSkillDirs({ DSH_HOME: '/custom-dsh' })
+  assert.equal(envDirs[0], join('/custom-dsh', '.agent-presets', 'expert-orchestrator', 'skills'))
+})
+
+test('T3 ③ buildPresetChannelToolFilter：deny-only 同源 + allow 降级可见 + 空名单不携带', () => {
+  const legacy = { deny: ['summon_expert', 'list_experts'] }
+  // 无档案：deny 取自既有直传 toolFilter（同源语义）
+  assert.deepEqual(buildPresetChannelToolFilter(null, legacy), { deny: ['summon_expert', 'list_experts'] })
+  // 档案 deny-only：取档案 deny（已含递归防护清单 ∪ 档案 deny ∪ MCP 展开）
+  assert.deepEqual(buildPresetChannelToolFilter({ toolFilter: { deny: ['a', 'b'] } }, legacy), { deny: ['a', 'b'] })
+  // 档案 allow：降级可见（warn），deny-only 执法，绝不复用 allow
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (m) => warns.push(String(m))
+  let r
+  try {
+    r = buildPresetChannelToolFilter({ toolFilter: { allow: ['read'], deny: ['summon_expert'] } }, legacy)
+  } finally {
+    console.warn = origWarn
+  }
+  assert.deepEqual(r, { deny: ['summon_expert'] })
+  assert.equal(warns.length, 1)
+  assert.ok(warns[0].includes('tools.allow') && warns[0].includes('暂不执法'))
+  // 空 deny → null（不携带 restrict 行）
+  assert.equal(buildPresetChannelToolFilter(null, { deny: [] }), null)
+})
+
+test('T3 ③ ensureSummonPreset：幂等缓存 / duplicate 复用 / broken 与注册失败 fail-fast / 服务缺失 fail-fast', async () => {
+  // 服务缺失：preset 通道无 persona 替代交付缝，fail-fast（不静默丢 persona）
+  await assert.rejects(
+    () => ensureSummonPreset({}, createSummonPresetCache(), { persona: 'p', toolFilter: null, expertName: 'E' }),
+    /agent-presets 服务不可用/,
+  )
+  // agentPresetsService 两式访问面
+  assert.equal(agentPresetsService({ agentPresets: 'A' }), 'A')
+  assert.equal(agentPresetsService({ get: (k) => (k === 'agentPresets' ? 'B' : undefined) }), 'B')
+  assert.equal(agentPresetsService({}), undefined)
+
+  const mk = () => {
+    const cache = createSummonPresetCache()
+    const reg = { registered: [], broken: new Map(), fail: null }
+    const ctx = {
+      agentPresets: {
+        register: async (def) => {
+          if (reg.fail) throw reg.fail
+          if (reg.registered.some((d) => d.id === def.id)) throw new Error(`Duplicate agent preset: ${def.id}`)
+          reg.registered.push(def)
+          return async () => {}
+        },
+        resolve: async (id) => (reg.broken.has(id) ? { id, broken: reg.broken.get(id) } : { id }),
+      },
+    }
+    return { cache, reg, ctx }
+  }
+
+  // happy：注册 + resolve 预检 + id 返回；同内容幂等（第二次不再 register）
+  {
+    const { cache, reg, ctx } = mk()
+    const id1 = await ensureSummonPreset(ctx, cache, { persona: 'p', toolFilter: { deny: ['x'] }, expertName: 'E' })
+    assert.ok(id1.startsWith(SUMMON_PRESET_ID_PREFIX))
+    assert.equal(reg.registered.length, 1)
+    const id2 = await ensureSummonPreset(ctx, cache, { persona: 'p', toolFilter: { deny: ['x'] }, expertName: 'E' })
+    assert.equal(id2, id1)
+    assert.equal(reg.registered.length, 1, '同内容键幂等：不重复注册（冷恢复 id 稳定前提）')
+    // 不同 persona → 新定义
+    await ensureSummonPreset(ctx, cache, { persona: 'p2', toolFilter: { deny: ['x'] }, expertName: 'E' })
+    assert.equal(reg.registered.length, 2)
+    assert.ok(reg.registered[0].plugins[0].config.prefix === 'p')
+    assert.ok(reg.registered[0].plugins[0].name === '@deepseek-ai/dsh-persona')
+  }
+  // duplicate（插件热重载残留竞态）：复用既有定义，不炸
+  {
+    const { cache, reg, ctx } = mk()
+    reg.registered.push(buildSummonPresetDefinition({ id: `${SUMMON_PRESET_ID_PREFIX}${summonPresetKey({ persona: 'p', toolFilter: null })}`, persona: 'p', toolFilter: null }))
+    const id = await ensureSummonPreset(ctx, cache, { persona: 'p', toolFilter: null, expertName: 'E' })
+    assert.ok(id.startsWith(SUMMON_PRESET_ID_PREFIX))
+    assert.equal(reg.registered.length, 1, 'duplicate 路径复用既有定义')
+  }
+  // broken 诊断（挂载失败）：fail-fast，绝不带病派发
+  {
+    const { cache, reg, ctx } = mk()
+    const id = `${SUMMON_PRESET_ID_PREFIX}${summonPresetKey({ persona: 'p', toolFilter: null })}`
+    reg.broken.set(id, 'row summon-restrict: tools.restrict() names unknown global tool "nope"')
+    await assert.rejects(
+      () => ensureSummonPreset(ctx, cache, { persona: 'p', toolFilter: null, expertName: 'E' }),
+      (err) => err.message.includes('挂载失败')
+        && err.message.includes('unknown global tool')
+        // T6 评审收口：broken 定义永驻 definitions（同内容键后续召唤持续 fail-fast），
+        // 错误文案必须附「热重载/重启宿主可清理」运维提示
+        && err.message.includes('热重载')
+        && err.message.includes('重启宿主'),
+    )
+  }
+  // 注册非 duplicate 异常：fail-fast 且错误信息含 preset id
+  {
+    const { cache, reg, ctx } = mk()
+    reg.fail = new Error('preset activation exploded')
+    await assert.rejects(
+      () => ensureSummonPreset(ctx, cache, { persona: 'p', toolFilter: null, expertName: 'E' }),
+      (err) => err.message.includes('注册失败') && err.message.includes(summonPresetKey({ persona: 'p', toolFilter: null })),
+    )
+  }
+})
+
+test('T11 per-summon preset 展示名可区分化：name 含专家名+内容键短哈希 + name 不入内容键 + 同内容键二次召唤 id 稳定（Duplicate 复用）', async () => {
+  const persona = 'T11 专家 persona 全文'
+  const toolFilter = { deny: ['summon_expert'] }
+  const key = summonPresetKey({ persona, toolFilter })
+  const expertName = '后端工程师'
+
+  // ① 展示名可区分：含专家名与内容键前 8 位；id 仍 = 前缀 + 完整内容键
+  const def = buildSummonPresetDefinition({ id: `${SUMMON_PRESET_ID_PREFIX}${key}`, persona, toolFilter, expertName, contentKey: key })
+  assert.equal(def.name, `dsh-expert-orchestrator · 召唤：${expertName} · ${key.slice(0, 8)}`, '展示名含专家名+短哈希（UI 可区分）')
+  assert.ok(def.name !== 'dsh-expert-orchestrator 专家召唤组合', '不再使用固定同名展示名')
+  assert.ok(def.description.includes(expertName) && def.description.includes(key.slice(0, 8)), 'description 同步携带专家名与短哈希')
+  assert.equal(def.id, `${SUMMON_PRESET_ID_PREFIX}${key}`, 'id 语义不变：前缀 + 完整内容键')
+  // 不同专家（不同 persona）→ 不同内容键 → 展示名可区分
+  const def2 = buildSummonPresetDefinition({ id: `${SUMMON_PRESET_ID_PREFIX}${summonPresetKey({ persona: '另一位', toolFilter })}`, persona: '另一位', toolFilter, expertName: '前端开发者', contentKey: summonPresetKey({ persona: '另一位', toolFilter }) })
+  assert.notEqual(def.name, def2.name, '不同专家的展示名互不相同')
+
+  // ② name 不参与 summonPresetKey 内容键：同一 persona+toolFilter 键恒定
+  assert.equal(summonPresetKey({ persona, toolFilter }), key, '内容键只覆盖 {persona, toolFilter}，展示名变化不改变键')
+
+  // ③ 同内容键二次召唤（fresh cache、既有定义 name 为旧展示名）：Duplicate 复用，
+  //    id 稳定、不重注册——name 变化不得导致已注册定义重注册（约束②）
+  {
+    const stale = buildSummonPresetDefinition({ id: `${SUMMON_PRESET_ID_PREFIX}${key}`, persona, toolFilter, expertName: '占位', contentKey: key })
+    const reg = { registered: [stale], registerCalls: 0 }
+    const ctx = {
+      agentPresets: {
+        register: async (d) => {
+          reg.registerCalls += 1
+          if (reg.registered.some((x) => x.id === d.id)) throw new Error(`Duplicate agent preset: ${d.id}`)
+          reg.registered.push(d)
+          return async () => {}
+        },
+        resolve: async (id) => ({ id }),
+      },
+    }
+    const id = await ensureSummonPreset(ctx, createSummonPresetCache(), { persona, toolFilter, expertName })
+    assert.equal(id, `${SUMMON_PRESET_ID_PREFIX}${key}`, '同内容键二次召唤 id 稳定')
+    assert.equal(reg.registerCalls, 1, 'duplicate 命中后未发起第二次注册（仅 1 次调用且被拒）')
+    assert.equal(reg.registered.length, 1, '既有定义被复用，未重注册')
+    assert.equal(reg.registered[0].name, stale.name, '复用的是既有定义（name 差异不触发重注册）')
+  }
+})
+
+// ── T12 用完即注（方案 A）：引用计数 + 收尾边沿注销 ────────────────────────────
+
+test('T12 用完即注 ①：并发同内容键两召唤引用计数——其一收尾定义仍存活、双双收尾注销被调、缓存项清除', async () => {
+  const cache = createSummonPresetCache()
+  const refs = createSummonPresetRefs()
+  // 真实 Duplicate 语义的注册台（并发同键第二路命中 Duplicate → 复用且计数 +1）
+  const reg = { registerCalls: 0, unregisterCalls: [] }
+  const active = new Set()
+  const ctx = {
+    agentPresets: {
+      register: async (def) => {
+        reg.registerCalls += 1
+        if (active.has(def.id)) throw new Error(`Duplicate agent preset: ${def.id}`)
+        active.add(def.id)
+        let disposed = false
+        return async () => {
+          if (disposed) return
+          disposed = true
+          reg.unregisterCalls.push(def.id)
+          active.delete(def.id)
+        }
+      },
+      resolve: async (id) => ({ id }),
+    },
+  }
+  const param = { persona: 'p', toolFilter: { deny: ['x'] }, expertName: 'E' }
+  const key = summonPresetKey({ persona: 'p', toolFilter: { deny: ['x'] } })
+  const id = `${SUMMON_PRESET_ID_PREFIX}${key}`
+  // 并发两召唤（fresh cache：两路同落注册竞态，第二路 Duplicate 复用且计数 +1）
+  const [id1, id2] = await Promise.all([ensureSummonPreset(ctx, cache, param, refs), ensureSummonPreset(ctx, cache, param, refs)])
+  assert.equal(id1, id2)
+  assert.equal(id1, id)
+  assert.equal(reg.registerCalls, 2, '并发两路都发起注册（fresh cache 竞态），第二路被 Duplicate 拒')
+  assert.equal(active.size, 1, '注册台只有一份定义（幂等语义不变）')
+  // 其一收尾：另一在途召唤仍持引用——warm 期间（计数>0）unregister 不被调用
+  await releaseSummonPreset(refs, cache, id1, 'E')
+  assert.deepEqual(reg.unregisterCalls, [], '其一收尾后定义仍存活（warm 保护）')
+  assert.equal(cache.get(key), id, 'warm 期间缓存项仍在')
+  // warm 期间再召唤：缓存命中，不重注册
+  const id3 = await ensureSummonPreset(ctx, cache, param, refs)
+  assert.equal(id3, id)
+  assert.equal(reg.registerCalls, 2, '缓存命中不重注册（冷恢复 id 稳定前提不变）')
+  // 双双收尾：注销被调恰好一次，缓存项清除（防下次缓存命中悬空 id）
+  await releaseSummonPreset(refs, cache, id1)
+  await releaseSummonPreset(refs, cache, id3)
+  assert.deepEqual(reg.unregisterCalls, [id], '双双收尾后注销被调恰好一次（宿主 disposer 幂等）')
+  assert.equal(active.has(id), false, '注册台定义已摘除')
+  assert.ok(!cache.has(key), '缓存项清除')
+  // 注销后同内容键再召唤：重新注册、id 稳定同键（引用计数重新起步）
+  const id4 = await ensureSummonPreset(ctx, cache, param, refs)
+  assert.equal(id4, id)
+  assert.equal(reg.registerCalls, 3, '注销后重新注册（方案 A 预期：定义随召唤生命周期进出）')
+  await releaseSummonPreset(refs, cache, id4)
+  assert.deepEqual(reg.unregisterCalls, [id, id], '新引用归零再次注销')
+})
+
+test('T12 用完即注 ②：未知键/负数/无句柄 fail-open 不注销 + 非法入参静默返回', async () => {
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (m) => warns.push(String(m))
+  try {
+    // 未知键：fail-open，warn 可见，不注销
+    await releaseSummonPreset(createSummonPresetRefs(), createSummonPresetCache(), `${SUMMON_PRESET_ID_PREFIX}unknown`, 'E')
+    assert.ok(warns.some((m) => m.includes('未知键') && m.includes('unknown')), JSON.stringify(warns))
+    // 负数：钳回 0，不注销（fail-open）
+    const refs = createSummonPresetRefs()
+    const cache = createSummonPresetCache()
+    let unregisterCalls = 0
+    refs.set('id-neg', { refs: 0, unregister: async () => { unregisterCalls += 1 } })
+    await releaseSummonPreset(refs, cache, 'id-neg')
+    assert.equal(unregisterCalls, 0, '负数不注销')
+    assert.equal(refs.get('id-neg').refs, 0, '计数钳回 0')
+    assert.ok(warns.some((m) => m.includes('引用计数为负')), JSON.stringify(warns))
+    // Duplicate 复用（无注销句柄）：归零 warn 保留，不尝试注销
+    refs.set('id-nohandle', { refs: 1, unregister: null })
+    await releaseSummonPreset(refs, cache, 'id-nohandle')
+    assert.ok(warns.some((m) => m.includes('无注销句柄')), JSON.stringify(warns))
+    assert.equal(refs.has('id-nohandle'), false, '无句柄 entry 同样出清（后续召唤走 Duplicate 重入）')
+    // 非法入参：静默返回，零异常零 warn 增量
+    const warnCount = warns.length
+    await releaseSummonPreset(null, cache, 'id')
+    await releaseSummonPreset(refs, null, 'id')
+    await releaseSummonPreset(refs, cache, '')
+    assert.equal(warns.length, warnCount, '非法入参静默返回')
+  } finally {
+    console.warn = origWarn
+  }
+})
+
+test('T12 用完即注 ③：全链成功收尾注销——one-shot answer 返回后定义被注销（缓存项同步清除）', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't12-preset-ok-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    const { ctx, state, registry } = presetActivationHost({ providerContinuable: false })
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} })
+    assert.equal(r.answer, 'one-shot')
+    const id = state.startSpecs[0].request.agentPreset
+    assert.deepEqual(registry.unregisterCalls, [id], 'run 收尾（成功边沿）注销被调恰好一次')
+    assert.equal(registry.active.has(id), false, '定义已从注册台摘除（preset 列表只保留主 expert 入口）')
+    assert.equal(registry.registered.length, 1, 'registered 保留为曾注册历史（对账面）')
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T12 用完即注 ④：全链失败边沿计数回收——one-shot stopReason=error 抛出后注销被调', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't12-preset-fail-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    const { ctx, state, registry } = presetActivationHost({ providerContinuable: false })
+    ctx.subagents.startActivation = async (spec) => {
+      state.startCalls += 1
+      state.startSpecs.push(spec)
+      return { childId: 'child-1', messageId: 'm1', result: Promise.resolve({ stopReason: 'error', output: [{ type: 'text', text: '炸了' }] }), dispose: async () => {} }
+    }
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    await assert.rejects(() => summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} }), /专家执行未正常完成/)
+    const id = state.startSpecs[0].request.agentPreset
+    assert.deepEqual(registry.unregisterCalls, [id], '失败边沿同样归还引用并注销（成功与失败皆算收尾，兜底幂等）')
+    assert.equal(registry.active.has(id), false)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T12 用完即注 ⑤：全链并发同键两召唤——先收尾者不注销（warm 保护），全部收尾后注销恰好一次', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't12-preset-concurrent-'))
+  t.after(() => rmSync(dst, { recursive: true, force: true }))
+  rosterFixture(dst, ['后端工程师'])
+  const { ctx, state, registry } = presetActivationHost({ providerContinuable: false })
+  // 受控发射：两次 startActivation 挂起，由测试逐个放行（放大在途窗口）
+  const gates = []
+  let n = 0
+  ctx.subagents.startActivation = async (spec) => {
+    state.startCalls += 1
+    state.startSpecs.push(spec)
+    const i = n++
+    return { childId: `child-${i + 1}`, messageId: `m${i + 1}`, result: new Promise((resolve) => { gates[i] = resolve }), dispose: async () => {} }
+  }
+  const descriptors = []
+  ctx.tools.register = (d) => descriptors.push(d)
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const p1 = summon.execute({ expert: '后端工程师', task: '任务A' }, { agent: {} })
+  const p2 = summon.execute({ expert: '后端工程师', task: '任务B' }, { agent: {} })
+  for (let i = 0; i < 200 && state.startCalls < 2; i++) await tick()
+  assert.equal(state.startCalls, 2)
+  const ids = state.startSpecs.map((s) => s.request.agentPreset)
+  assert.equal(ids[0], ids[1], '同专家同内容 → 同 preset id（并发共享同一引用计数）')
+  assert.deepEqual(registry.unregisterCalls, [], '两召唤在途：定义必存活')
+  gates[1]({ stopReason: 'completed', output: [{ type: 'text', text: 'B 完成' }] })
+  const r2 = await p2
+  assert.ok(r2.answer.includes('B 完成'))
+  assert.deepEqual(registry.unregisterCalls, [], '其一收尾后另一在途召唤仍持引用——warm 期间 unregister 不被调用')
+  gates[0]({ stopReason: 'completed', output: [{ type: 'text', text: 'A 完成' }] })
+  const r1 = await p1
+  assert.ok(r1.answer.includes('A 完成'))
+  assert.deepEqual(registry.unregisterCalls, [ids[0]], '双双收尾后注销被调恰好一次')
+  assert.equal(registry.active.has(ids[0]), false)
+})
+
+test('T10 agentPresetsService：cordis Proxy 形态（未声明 inject 的属性访问 throw）经 ctx.get 注入式面取服务', () => {
+  // 真机形态复现（0.2.1-alpha.4）：ctx 是 cordis Proxy，未声明 inject 的服务
+  // 属性访问直接 throw（ReflectService get trap，cordis lib/index.js:665-690），
+  // 而 ctx.get 访问器（reflect.get mixin，无 inject 要求）可用——注入式读取
+  // 必须优先，属性面首查在真机上即抛（旧实现缺陷）。
+  const service = { register: async () => async () => {} }
+  const throwingProp = new Proxy({}, {
+    get(_target, prop) {
+      if (prop === 'get') return (name) => (name === 'agentPresets' ? service : undefined)
+      throw new Error(`cannot get property "${String(prop)}" without inject`)
+    },
+  })
+  assert.equal(agentPresetsService(throwingProp), service, '属性面 throw 的 ctx 经 get 访问器取到服务')
+  // get 面优先于属性面（cordis ctx 上属性面对未注入服务是抛点，不是可用路径）
+  assert.equal(agentPresetsService({ get: () => 'G', agentPresets: 'P' }), 'G')
+  // 访问器与属性面皆不可用（宿主异常降级形态）→ undefined，由调用方 fail-fast 接管
+  const allThrow = new Proxy({}, { get() { throw new Error('cannot get property "agentPresets" without inject') } })
+  assert.equal(agentPresetsService(allThrow), undefined)
+})
+
+test('T10 真机回归：执行期 ctx 属性面抛错形态下 summon preset 通道全链成功（agentPresets 经 ctx.get 注入式面获取）', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't10-preset-proxy-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    const host = presetActivationHost({ providerContinuable: false })
+    // 把注册台从属性面迁到 get 访问器面，并把属性面复刻成真机抛错形态：
+    // cordis Proxy 对未声明 inject 的 agentPresets 属性访问 throw，get 可用。
+    const registryApi = host.ctx.agentPresets
+    delete host.ctx.agentPresets
+    host.ctx.get = (name) => (name === 'agentPresets' ? registryApi : undefined)
+    const cordisCtx = new Proxy(host.ctx, {
+      get(target, prop, receiver) {
+        if (prop === 'agentPresets') throw new Error('cannot get property "agentPresets" without inject')
+        return Reflect.get(target, prop, receiver)
+      },
+    })
+    // 属性面确认会抛（钉死 mock 形态本身，防回归时 mock 静默失真）
+    assert.throws(() => cordisCtx.agentPresets, /without inject/)
+    const descriptors = []
+    cordisCtx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(cordisCtx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} })
+    assert.equal(r.answer, 'one-shot')
+    assert.equal(host.state.startCalls, 1)
+    const spec = host.state.startSpecs[0]
+    assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+    // 注册台确经 get 注入式面走到：定义已注册（属性面在 mock 里只会 throw）
+    assert.equal(host.registry.registered.length, 1)
+    assert.equal(host.registry.registered[0].id, spec.request.agentPreset)
+    assert.equal(host.registry.registered[0].plugins[0].config.prefix, 'persona 正文')
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T3 ②③ alpha.3/4 面 one-shot：summon 经 agentPreset 发射（request 零 persona/toolFilter，persona 经 preset 交付）', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't3-preset-oneshot-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    const { ctx, state, registry } = presetActivationHost({ providerContinuable: false })
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    const r = await summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} })
+    assert.equal(r.answer, 'one-shot')
+    assert.equal(state.startCalls, 1)
+    const spec = state.startSpecs[0]
+    assert.equal(spec.provider, 'spawn')
+    // request：agentPreset 键在、persona/toolFilter 死键绝不发送（宿主 manager 只读 agentPreset）
+    assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+    assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+    assert.ok(!('agentOptions' in spec.request)) // 无档案 → 键不存在（#19 语义不变）
+    // per-summon preset 定义：persona 行携带专家 persona，收窄行 deny 全局层确证名
+    assert.equal(registry.registered.length, 1)
+    const def = registry.registered[0]
+    assert.equal(def.id, spec.request.agentPreset)
+    assert.equal(def.plugins[0].name, '@deepseek-ai/dsh-persona')
+    assert.equal(def.plugins[0].config.prefix, 'persona 正文')
+    const restrict = def.plugins[def.plugins.length - 1]
+    assert.equal(restrict.id, 'summon-restrict')
+    assert.ok(restrict.config.deny.includes('summon_expert'))
+    assert.ok(restrict.config.deny.includes('list_experts'))
+    // 组合级递归省略照常成立
+    assert.ok(!JSON.stringify(def).includes('"tool-subagent"'))
+    // T12 用完即注：run 收尾（成功边沿）后定义被注销（方案 A 裁决语义）
+    assert.deepEqual(registry.unregisterCalls, [spec.request.agentPreset])
+    assert.equal(registry.active.has(spec.request.agentPreset), false)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T3 ③/T6 preset 通道 agentOptions 键位：档案 model 经 request.agentOptions 直传（与 agentPreset 并存，preset 组合不携带 model）', async (t) => {
+  guardResumeEnv(t)
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't3-preset-model')
+  const { ctx, state, registry } = presetActivationHost({ providerContinuable: false })
+  const descriptors = []
+  ctx.tools.register = (d) => descriptors.push(d)
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { model: 'model-A' } })
+  const r = await summonProfileExpert(descriptors)
+  assert.equal(r.answer, 'one-shot')
+  const spec = state.startSpecs[0]
+  // 键位断言：agentPreset 与 agentOptions 两键并存于 request 顶层（宿主 manager
+  // composition 只读 agentPreset 交付 persona；model 解析走 request.agentOptions，
+  // T2 报告③两通道一致的实证钉子）
+  assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+  assert.equal(spec.request.agentOptions?.model, 'model-A', 'preset 通道 model 仍走 request.agentOptions 直传')
+  assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+  // preset 组合面不携带 model：定义里无该值（persona 经 preset 行，model 经 request）
+  assert.equal(registry.registered.length, 1)
+  assert.ok(!JSON.stringify(registry.registered[0]).includes('model-A'), 'per-summon preset 定义不得内嵌档案 model')
+  assert.equal(registry.registered[0].plugins[0].config.prefix, 'persona 正文')
+})
+
+test('T3 ③/T6 profile-allow 端到端 warn：preset 通道 summon 档案 tools.allow 触发降级 warn 且 deny-only 执法（组合行零 allow）', async (t) => {
+  guardResumeEnv(t)
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't3-preset-allow')
+  const { ctx, state, registry } = presetActivationHost({ providerContinuable: false })
+  const descriptors = []
+  ctx.tools.register = (d) => descriptors.push(d)
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { tools: { allow: ['bash', 'read'] } } })
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (m) => warns.push(String(m))
+  let r
+  try {
+    r = await summonProfileExpert(descriptors)
+  } finally {
+    console.warn = origWarn
+  }
+  assert.equal(r.answer, 'one-shot')
+  // 端到端 warn：单测只钉了 buildPresetChannelToolFilter 纯函数，这里钉召唤全链
+  // 恰好一次降级提示（既有 allow 降级文案，tools.allow + 暂不执法 关键词）
+  const allowWarns = warns.filter((m) => m.includes('tools.allow') && m.includes('暂不执法'))
+  assert.equal(allowWarns.length, 1, `全链恰一次 allow 降级 warn：${JSON.stringify(warns)}`)
+  const spec = state.startSpecs[0]
+  assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+  assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+  // 降级执法面：restrict 行 deny-only（递归防护 deny 求交结果），allow 绝不进组合
+  assert.equal(registry.registered.length, 1)
+  const def = registry.registered[0]
+  const restrict = def.plugins[def.plugins.length - 1]
+  assert.equal(restrict.id, 'summon-restrict')
+  assert.ok(Array.isArray(restrict.config.deny) && restrict.config.deny.includes('summon_expert') && restrict.config.deny.includes('list_experts'), 'deny-only 执法保留递归防护名单')
+  assert.ok(!('allow' in restrict.config) && !JSON.stringify(def).includes('"allow"'), 'allow 白名单绝不进 preset 组合行')
+})
+
+test('T3 ② 门禁能力分支：无 agentPreset 能力且缺 persona/toolFilter → 既有硬门禁原样 fail-fast；fork 形态语义不变', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't3-gate-'))
+  try {
+    rosterFixture(dst, ['后端工程师'])
+    // alpha.4 fork 形态（capabilities 无 persona/toolFilter/agentPreset）：
+    // 直传分支硬门禁原样保留——fail-fast 语义与改动前一致（无回归）
+    const { ctx, provider } = activationHost({ providerContinuable: false })
+    provider.capabilities = { agentOptions: true, outputSchema: true, depthLimit: true }
+    const descriptors = []
+    ctx.tools.register = (d) => descriptors.push(d)
+    registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
+    const summon = descriptors.find((d) => d.name === 'summon_expert')
+    await assert.rejects(() => summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} }), /不支持 persona 注入/)
+  } finally {
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
+test('T3 ③ alpha.3/4 面 continuable：startContinuable spec.request 携带 agentPreset；续跑链路行为保持', async (t) => {
+  guardResumeEnv(t)
+  const dst = mkdtempSync(join(tmpdir(), 't3-preset-resume-'))
+  t.after(() => rmSync(dst, { recursive: true, force: true }))
+  rosterFixture(dst, ['后端工程师'])
+  const { ctx, state, registry, emitEnd } = presetActivationHost()
+  const descriptors = []
+  ctx.tools.register = (d) => descriptors.push(d)
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: dst })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const p = summon.execute({ expert: '后端工程师', task: '实现 T3 的接口层' }, { agent: {} })
+  for (let i = 0; i < 200 && state.startCalls === 0; i++) await tick()
+  assert.equal(state.startCalls, 1)
+  const spec = state.startSpecs[0]
+  assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+  assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+  assert.equal(registry.registered.length, 1)
+  assert.equal(registry.registered[0].id, spec.request.agentPreset)
+  await tick()
+  // 首轮中断 → 恰好一续跑 turn → 完成（断点续跑行为与直传通道一致）
+  emitEnd({ id: 'child-1', stopReason: 'error', lastAssistantMessage: [{ type: 'text', text: '（中断）' }] })
+  for (let i = 0; i < 200 && state.sendMessageCalls.length === 0; i++) await tick()
+  assert.equal(state.sendMessageCalls.length, 1)
+  emitEnd({ id: 'child-1', stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: '接口层完成' }] })
+  const r = await p
+  assert.ok(r.answer.includes('接口层完成'))
+  assert.ok(r.answer.includes('断点续跑'))
+  // T12 用完即注：续跑完成收尾后注销（在途窗口——首轮中断+续跑——定义始终存活，
+  // 中断自动续跑发生在 settle 前，计数>0 保护不变）
+  assert.deepEqual(registry.unregisterCalls, [spec.request.agentPreset])
+})
+
+// T3 ③ 副本漂移对账：cordis.patch.yml preset 行（权威源=agent.cordis.yml，生成器
+// 产出）的插件行结构 − persona 行 − delegation 组 ≡ summonPresetBasePlugins()
+// （行序+id+name）。改 standing 组合不改副本 → 此用例红（评审时人工核对
+// section 等长文本的字节等值——结构性对账之外的已知残余）。
+const parsePatchPresetRows = (patchText) => {
+  const lines = patchText.split('\n')
+  const presetIdx = lines.findIndex((l) => l.trim() === '- id: preset-expert-orchestrator')
+  assert.ok(presetIdx >= 0, 'preset-expert-orchestrator 行存在')
+  const pluginsIdx = lines.findIndex((l, i) => i > presetIdx && l.trim() === 'plugins:')
+  assert.ok(pluginsIdx > presetIdx, 'preset 行 config.plugins 存在')
+  const rows = []
+  for (let i = pluginsIdx + 1; i < lines.length; i++) {
+    const m = lines[i].match(/^(\s*)- id: (.+)$/)
+    if (!m) continue
+    const level = m[1].length === 8 ? 0 : m[1].length === 12 ? 1 : -1
+    if (level < 0) continue
+    let name = null
+    for (let j = i + 1; j < lines.length; j++) {
+      const nm = lines[j].match(/^(\s*)name: (.+)$/)
+      if (nm && nm[1].length === m[1].length + 2) { name = nm[2]; break }
+      if (lines[j].match(/^(\s*)- id: /)) break
+    }
+    rows.push({ level, id: m[2], name })
+  }
+  return rows
+}
+const flattenRows = (list) =>
+  list.flatMap((row) => {
+    if (row.name?.replaceAll("'", '') === 'cordis:group') return row.config.map((c) => ({ id: c.id, name: c.name }))
+    return [{ id: row.id, name: row.name }]
+  })
+test('T3 ③ 副本漂移对账：patch preset 组合 − persona − delegation ≡ summonPresetBasePlugins（结构）', () => {
+  const rows = parsePatchPresetRows(T14_PATCH)
+  const top = rows.filter((r) => r.level === 0)
+  // persona 行（被专家 persona 替换）与 delegation 组（组合级递归省略）为刻意差异面
+  assert.equal(top[0].id, 'persona')
+  const delegation = top.find((r) => r.id === 'delegation')
+  assert.ok(delegation, 'standing preset 保留 delegation 组（编排者自己需要派生面）')
+  const kept = top.filter((r) => r.id !== 'persona' && r.id !== 'delegation')
+  const patchFlatten = flattenRows(kept.map((row) => {
+    if (row.name?.replaceAll("'", '') !== 'cordis:group') return row
+    // 组内孩子 = delegation 之后、下一 top 行之前的 level-1 行
+    const start = rows.indexOf(row) + 1
+    const end = rows.findIndex((x, i) => i >= start && x.level === 0)
+    return { id: row.id, name: row.name, config: rows.slice(start, end === -1 ? rows.length : end).map((c) => ({ id: c.id, name: c.name?.replaceAll("'", '') })) }
+  }))
+  assert.deepEqual(patchFlatten.map((r) => ({ id: r.id, name: r.name?.replaceAll("'", '') ?? r.name })), summonPresetBasePlugins().flatMap((row) => row.group ? row.config.map((c) => ({ id: c.id, name: c.name })) : [{ id: row.id, name: row.name }]))
+  // delegation 组子行被刻意省略的钉子：派生面名字全部只存在于 standing patch
+  const delegationIds = rows.filter((r) => r.level === 1).map((r) => r.id)
+  for (const n of ['tool-subagent', 'tool-subagent-fork', 'tool-workflow', 'tool-ralph', 'workflow-ptc', 'tool-subagent-control']) {
+    assert.ok(delegationIds.includes(n), `delegation 组应含 ${n}（省略钉子）`)
+    assert.ok(!summonPresetBasePlugins().some((r) => JSON.stringify(r).includes(`"${n}"`)), `副本不得含 ${n}`)
+  }
 })

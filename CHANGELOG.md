@@ -2,6 +2,21 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.9.8] — 2026-10-16
+
+### Fixed
+
+- **适配 DSH 0.2.1-alpha.4 — subagent spec 删 `persona`/`toolFilter` 增 `agentPreset` 的破坏性变化（能力分支双轨，per-summon Agent Preset 通道）** (dsh-expert-alpha4 T3/T6, `lib/tools.js` + 新增 `lib/summon-preset.js` / `lib/summon-preset-restrict.js`): **宿主破坏性变化（源码实证）** — alpha.3/4 的 spawn 路径删去 `request.persona`/`request.toolFilter`（composition 只读 `agentPreset`，直传键被静默丢弃），且声明行内 `toolFilter: {deny: []}` 在 alpha.3/4 挂载期触发 `apply()` throw（dsh-tool-subagent `lib/index.js:355`）、caps 硬门禁对 alpha.3/4 spawn 全体 fail-fast——2.9.7 在新宿主上 summon 不可用。**应对 — 能力分支双轨**（运行时能力探测，非版本号硬编码）：`caps.agentPreset === true` → **preset 通道**（`runExpert` 跳过 persona/toolFilter 硬门禁，request 只带 `agentPreset`）：per-summon Agent Preset 定义 = persona 行（dsh-persona prefix，同 section 同序等价交付）+ 工具组合静态副本（standing preset `config.plugins` 逐行副本——副本缺失则专家对组合层核心工具全部失明，2.9.5 视域纪律）+ 收窄行（仅 toolFilter 非空时携带，generation scope 挂载期 `ctx.tools.restrict({deny})`，全局层收窄语义与直传通道等价）；定义按内容键 sha256 去重、注册幂等（Duplicate 复用）、resolve(id) broken 预检 fail-fast、disposer 挂插件卸载面，服务存活期**永不主动注销**（continuable 冷恢复经 historical descriptor mount id，注销即断点续跑断裂——persona 热改产生新 hash 定义累积为已知取舍；T12 起改为「用完即注」，见本节末条）。**递归防护升级**：delegation 组（subagent/subagent_fork/workflow/ralph 等）在组合级整组省略——派生工具在子代理 scope 链上**结构性缺席**，强于旧 deny 名单（generation 层名字全局视域探不到、deny 进不去的 2.9.3/2.9.5 已知残余由此闭合），宿主 `maxDepth=1` 深度熔断继续兜底。`caps.agentPreset !== true`（≤alpha.2）→ **直传通道零变化**：persona/toolFilter 硬门禁原文逐字保留，request 仍带 persona/toolFilter，payload 逐字节不变。**明示降级面（行为差异，用户须知）**：档案 `tools.allow` 白名单在 preset 通道**降级为 console.warn + deny-only、不执法 allow**（allow 名单出自插件 ctx 全局枚举视域，遮蔽不到本 generation 副本层工具，照搬会重蹈 2.9.5「allow 全遮蔽」缺陷）；提示级剪除不受影响。
+- **声明行删除 `toolFilter: {deny: []}`** (T3-①, `agent.cordis.yml` + `cordis.patch.yml` 重生成): tool-subagent/tool-subagent_fork 两行 config 删 toolFilter 键——alpha.3/4 从「挂载期 throw」变为合法缺省；≤alpha.2 侧空 deny 经宿主编译为空 deny 集 = 无过滤 no-op，删键后不透传不 restrict，两种形态有效语义等价（逐项核实），无回归。
+- **T10 — preset 通道执行期获取 `agentPresets` 服务改为注入式读取，修复真机 summon 全体 fail** (T10, `lib/summon-preset.js` + `lib/index.js` 注释): **根因（行号证据）** — 插件 apply 的 ctx 是 cordis Proxy，`inject` 声明未含 `agentPresets`，属性面直取在 cordis `ReflectService` get trap 中直接 throw（抛点 `cannot get property "agentPresets" without inject`），`ctx.get` 兜底不可达；且 `agentPresets` 由兄弟 fiber 提供，get trap 上溯链永不可达——「不声明 inject 就算服务存在也拿不到」。**否决「加进 inject 声明」**：cordis inject 为硬依赖（缺 impl → 服务拒载），≤alpha.2 宿主无 agent-presets 服务会令插件整体拒载，破坏直传通道零变化约束。**修法**：`agentPresetsService(ctx)` 重写为 `ctx.get('agentPresets')` 注入式读取优先（与宿主 registry 自身用法同型，服务未提供返回 undefined 由既有 fail-fast 文案接管）、属性面兜底且 catch 按缺失处理；`lib/index.js` 注释写明 `agentPresets` 刻意不声明的原因防后人回填引爆旧宿主。新增 2 例回归单测复刻真机 Proxy 形态（先 `assert.throws(/without inject/)` 钉死 mock 失真再跑全链）。
+- **T12 — per-summon preset「用完即注」（用户裁决方案 A：preset 列表只保留主 expert 入口）——引用计数 + run 收尾边沿注销** (T12, `lib/summon-preset.js` + `lib/tools.js` + `test/tools.selftest.mjs`): `ensureSummonPreset` 成功路径（缓存命中/新注册/Duplicate 复用皆算）引用 +1，`runExpert` 收尾边沿（成功/失败/锁拒+兜底 finally，幂等）-1，归零调 register 返回的 unregister（宿主 disposer 幂等实证）并清缓存项防悬空 id；负数/未知键/无句柄 fail-open warn；插件 unload disposer 兜底不变。run 在途（含中断自动续跑窗口）计数 >0 定义必存活（冷恢复在途保护）；**冷恢复边缘损失如实声明**：run 收尾后同进程重物化窗口不再保障（coldResume `presets.mount(id)` 将 not-found），跨重启本就随 registry 内存态消失——设计详见 `dsh-expert-alpha4-t3-design.md` §用完即注。直传通道（≤alpha.2）零变化；`node --test` 301 例 300 过 0 挂 1 skip（既有环境门控）。
+
+### Verification
+
+- **真机验证（T8，alpha.4 六项实机 PASS，判定 pass-with-notes）**：preset 注册（首轮 fail → T10 修复 → 重启复测通过，fail-fast 路径真机实证过一次）→ 挂载+resolve → persona 到达 → 工具视域/delegation 组缺席 → 收窄名单（deny-only 不误伤核心工具）→ 注册幂等（Duplicate 复用）；部署面 sha256 与工作树全一致，`node --test` 全量 295 例 / 294 pass / 0 fail / 1 skip（既有 git 不可用环境门控，非本次引入）共 4 次全绿。
+- **验证局限（如实声明）**：①冷恢复重挂、②agentOptions 预检、③档案 allow warn 降级、④直传通道 ≤alpha.2 回归——四项仅单测覆盖、未实机演练（触发条件需人为中断在途会话或另一代宿主授权面；其中冷恢复重挂风险最高，列为发布后首批真机回归项）；alpha.3 双轨同样仅单测覆盖（用户裁决接受「单测覆盖 + 局限如实记录」口径）。四项经风险评估均不阻塞发布。
+- **评审**：同意，无阻断。
+
 ## [2.9.7] — 2026-10-12
 
 ### Added

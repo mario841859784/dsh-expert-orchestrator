@@ -92,3 +92,19 @@ H3：只入档，不作 gate。
 ## 决策
 
 待首跑后回填。（预注册：本段现在不预填任何决策。）
+
+## 预注册 amendendum（2026-10-19）：实验变量重设计——插件有/无
+
+> 本 amendendum 随本目录第二个 commit（预注册 amendendum commit）留痕，仍先于任何 dsh-eval 首跑；对上文「设置」段原变量定义构成书面修订，判定标准与 n 不受影响。
+
+1. **原变量证伪**：原唯一变量（`agent-preset-registry.config.default` 的 preset defaultId 位）在 SDK trial 路径为死代码。证据三条：
+   ① expert-orchestrator persona 系插件 profile 级注入（`@deepseek-ai/dsh-agent-preset-registry`…插件侧 `tools.js:1868`），与 preset 选择无关；
+   ② registry defaultId（`lib/index.js:463`）在 5 个 `@deepseek-ai` 包 lib 级 grep 零消费点；
+   ③ 双臂 smoke（run `20261019-060008-llpf` baseline 臂、`20261019-102731-3cym` expert 臂）两臂 systemPrompt 逐字节相同（仅 UUID 异）、26 工具逐字一致。
+   证据文件：`/vol2/@appshare/Harness/workspace/project1/capability-ab-eval/` 下 `SMOKE-REPORT-4.md`、`SMOKE-REPORT-5.md`（细节以原文件为准，此处仅引用路径，不复制大段）。
+2. **新变量**：插件有/无。expert 臂 = 插件源行在位（维持现状）；baseline 臂 = 移除插件源行（vanilla harness + preset-standard）。两臂 `config.default` 均对齐 standard（preset 位不再是变量）。双臂共同工况（非变量）：provider=newapi、model=glm-5.3-flash、effort=max（`arm.effort` 字段，`sdk-driver.js:38` 为 trial 唯一 effort 入口）。
+3. **不变项**：判定标准（H1 pass^3 +20pp 区间下界 > 0 且 A/A floor 不覆盖；H2 门禁简单场景一致性回归 = 0；H3 成本只陈述）与场景清单（23 场景）与三元组入档约定全部不变；effort=max 作为固定工况补记入三元组旁注。
+4. **时序声明**：截至本 amendendum，零评测结果数据（仅 2 个 smoke trial，无任何场景成绩数据）；本变更先于首跑，时序干净。
+5. **依据**：原始设计预留条款「若 entry.inject 使装/不装不可分离须书面声明」（「设置」段「不可分离声明义务」）的落地执行——本段即为该书面声明。
+
+本 amendendum 由源码证据驱动、coordinator 与用户双重确认（用户选择「①插件有无变量」）。

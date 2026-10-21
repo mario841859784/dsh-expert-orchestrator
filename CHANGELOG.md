@@ -2,6 +2,16 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.9.9] — 2026-10-24
+
+### Changed
+
+- **插件设置页入口迁至「插件」选项卡 plugins.bundle.config**（T10, `lib/client.js`）: 组合包详情页渲染 ExpertSourcesSettings，`settings.section` 注册移除；实现见 feat commit 17922ab（`lib/client.js` + `docs/source-management-design.md`），本发版不含 lib 逻辑改动。
+
+### Removed
+
+- **settings.nav 死键**（settings.section 挂载时代的导航 locale 键）。
+
 ## [2.9.8] — 2026-10-16
 
 ### Fixed

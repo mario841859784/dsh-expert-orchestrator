@@ -56,7 +56,7 @@
 | 1 | package.json | `dsh.client.inject` + `dsh.client.platform: "web"`；`exports["./client"]`；`dsh.bundle.patch` | 宿主 client-modules 读取 |
 | 2 | 构建 | `lib/client.js` = CJS + `window.__ModuleLoader__.load` banner/footer；externals 限平台冻结模块表 | tsdown/rollup 产出 |
 | 3 | client 入口 | `inject` 数组 + `apply(ctx) => disposer` | |
-| 4 | client UI | `ctx.slots.inject('settings.section', () => ctx.slots.register({name:'settings.section', id, order, label, locale, icon}, render))` | 面板注册唯一必需调用 |
+| 4 | client UI | `ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({name:'plugins.bundle.config', key:'<包名>', locale}, render))` | 面板注册唯一必需调用（keyed，key = 组合包 npm 包名） |
 | 5 | client 数据 | `ctx.remote.$mount(TYPERT_REMOTE)` → `ctx.get('remote.<ns>')`；TS 侧声明 `TypertRemoteNamespaceMap` | 双向数据通道 |
 | 6 | host 注册 | `apply(ctx, config)` + `Config` schemastery schema；`ctx.typert.register(TYPERT)`（host 严格描述符） | |
 | 7 | host 存储 | `ctx.settings.installSection(ctx, ns, schema, entry, hooks)`；读 `ctx.settings.get(ns)`、写 `ctx.settings.mutate(ns, ops, expectedRevision)`、修订 `ctx.settings.describe()` | 落盘 profile `settings.yaml` 顶层 ns 键 |
@@ -68,7 +68,7 @@
 
 ### 1.3 对实现的建议
 
-- 来源管理设置页复用同一模式：`dsh-expert-orchestrator` 的 package.json 增加 `dsh.client.inject`（至少 `dsh-client-ui-settings`、`dsh-api-remotes`、`dsh-client-locale`、`dsh-client-ui-slots`/`primitives`）并产出 `lib/client.js`；面板注册 `settings.section` 槽位。
+- 来源管理设置页复用同一模式：`dsh-expert-orchestrator` 的 package.json 增加 `dsh.client.inject`（至少 `dsh-client-ui-settings`、`dsh-api-remotes`、`dsh-client-locale`、`dsh-client-ui-slots`/`primitives`）并产出 `lib/client.js`；面板注册 `plugins.bundle.config` 槽位（keyed，key = 组合包 npm 包名）。
 - 来源包清单、已装来源、sha256 记录等持久化走 `ctx.settings.installSection` 新命名空间（如 `expert-sources`），自动获得 `settings.yaml` 持久化、revision 乐观锁与 UI↔host 通道；下载/验签执行逻辑放在 host 侧 Remote 方法（UI 不直接发起 GitHub 请求，天然规避浏览器 CORS）。
 - 版本差异注意：agency-agents 的 `settings-compat.ts` 专门桥接 RC（模块级 `installSettingsSection`/`settingsNamespace`）与 alpha.2（`ctx.settings.installSection`）两代 API；本机为 0.1.6-alpha.1，实现时按 alpha.2 形态直调并保留兼容分支。
 - 下载到本地的来源包文件属文件系统资产，不走 settings；settings 只存「来源元数据 + 文件清单哈希」，与 agency-agents 把 persona 正文留在 assets/、把 enabled 状态留在 settings.yaml 的分工一致。
@@ -231,7 +231,7 @@
 
 > client 侧配套（前端专家，以本契约为准联调）：descriptor `setSourceEnabled` 追加第 4 形参 `jsonParameter("ackRisks", "boolean", vBoolean())`（可选语义由 host 判空实现），`sourcesSnapshotSchema` 顶层追加可选 `confirmRequired`，toggle onChange 检查返回快照的 `confirmRequired` 触发确认弹窗后携带 `true` 重试。
 
-宿主侧按 `@deepseek-ai/dsh-typert-protocol` 的 prototype Remote 标记打标（无原生装饰器语法的 shim：以最小 context shim 调 `Remote(name)` 工厂再执行收集到的 initializer）。网关发现走 cordis.patch 根服务插入（与 agency-agents 同型）。T3 侧需：`ctx.remote.$mount` 带同名命名空间的 client contribution + 设置面板 `settings.section` 槽位注册。
+宿主侧按 `@deepseek-ai/dsh-typert-protocol` 的 prototype Remote 标记打标（无原生装饰器语法的 shim：以最小 context shim 调 `Remote(name)` 工厂再执行收集到的 initializer）。网关发现走 cordis.patch 根服务插入（与 agency-agents 同型）。T3 侧需：`ctx.remote.$mount` 带同名命名空间的 client contribution + 设置面板 `plugins.bundle.config` 槽位注册。
 
 ### classic pack（release source-packs-v1）
 

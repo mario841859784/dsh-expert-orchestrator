@@ -191,3 +191,29 @@ test('messageOf: Error.message 与字符串直转', () => {
   assert.equal(set.messageOf(new Error('x')), 'x')
   assert.equal(set.messageOf('y'), 'y')
 })
+
+// ---------- expandedSources 行级 disclosure 状态（v2.11.1 回归钉死） ----------
+// 组件闭包 hooks 非纯函数区、不可走 SET-PURE 提取，按任务书改静态断言（从简）：
+// 源码必须含 useState(new Set()) 声明、闭包 setter 的不可变更新与 disclosure 接线——
+// 钉死 v2.11.0 重构丢声明导致的渲染崩溃
+// （ReferenceError: expandedSources is not defined at ExpertSourcesSettings）。
+
+test('expandedSources: useState(new Set()) 声明与 setter 引用齐备（free identifier 回归钉死）', () => {
+  assert.match(source, /var expandedSourcesState = React\.useState\(new Set\(\)\)/)
+  assert.match(source, /var expandedSources = expandedSourcesState\[0\]/)
+  assert.match(source, /var setExpandedSources = expandedSourcesState\[1\]/)
+  // 首次使用（rows 渲染 .has）必须晚于声明：free identifier 即回归
+  const declareAt = source.indexOf('var expandedSources =')
+  const useAt = source.indexOf('expandedSources.has(')
+  assert.ok(declareAt >= 0 && useAt > declareAt)
+})
+
+test('expandedSources: toggle 不可变更新 + disclosure 接线（aria-expanded/Esc 收起）', () => {
+  // toggleExpandedSource：经闭包 setter 不可变 Set 增删（直改 prev 视为回归）
+  assert.match(source, /setExpandedSources\(function \(prev\) \{\s*var next = new Set\(prev\);/)
+  // disclosure 按钮：aria-expanded/aria-controls 指向 region，onClick 走 toggle
+  assert.match(source, /"aria-expanded": expanded, "aria-controls": filesRegionId/)
+  assert.match(source, /onClick: function \(\) \{ toggleExpandedSource\(source\.id\); \}/)
+  // region Esc 收起复用同一 toggle（回焦触发按钮）
+  assert.match(source, /if \(event\.key !== "Escape"\) return;\s*toggleExpandedSource\(source\.id\);/)
+})

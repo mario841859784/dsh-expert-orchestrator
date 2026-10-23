@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.11.1] — 2026-10-23
+
+### Fixed
+
+- **设置页渲染崩溃——`ExpertSourcesSettings` 的 `expandedSources` 未定义**（T5, `lib/client.js` + `test/client-settings.selftest.mjs`）: 生产环境设置页渲染即崩：`ReferenceError: expandedSources is not defined at client.js:1689 (Array.map at ExpertSourcesSettings client.js:1677)`，React 边界捕获后 slot `plugins.bundle.config` 崩溃、设置页不可见。根因：[2.11.0]（T2）重构时丢弃了来源行 disclosure 展开状态声明（`expandedSources`/`setExpandedSources`），但保留了对它的全部消费——rows 渲染 `expandedSources.has(source.id)`（client.js:1693）、`toggleExpandedSource` 闭包 setter（不可变 Set 增删）、disclosure 按钮 `aria-expanded`/`aria-controls` 接线、region Esc 收起回焦。修复：hooks 区补回 `var expandedSourcesState = React.useState(new Set())` 三行声明（与既有 setBusy/confirmId 等风格一致，ux-spec §3.3 Set 多开语义不变），既有 toggle 接线原样复用、零新样式；自测新增静态断言钉死（useState(new Set()) 声明 + setter 不可变更新 + 声明先于首次使用 + aria/Esc 接线；组件闭包 hooks 非纯函数区、SET-PURE 提取覆盖不到，故按静态断言从简）。版本三处 bump 2.11.1。
+
 ## [2.11.0] — 2026-10-26
 
 ### Changed

@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.11.0] — 2026-10-26
+
+### Changed
+
+- **设置页可视化——单列锚点分区 + `.eso-set-*` token 化重构**（T2, `lib/client.js` + `test/client-settings.selftest.mjs`，设计规格 `docs/settings-visual-spec.md` / `docs/settings-ux-spec.md`）: 插件设置页（slot `plugins.bundle.config`）按两份 v1.0 规格落地。**IA 重排**：单列滚动 + 顶部锚点分区条（页头→推荐→来源→去重→自定义专家→镜像→添加；`scrollIntoView` 尊重 prefers-reduced-motion），去重区无组无冲突时整区隐藏，来源空态给"添加来源"跳转链接；**CSS token 化**：旧 `.eso-*` 面样式整块替换为 `.eso-set-*`（三层底色/彩色纪律/字号字重/间距全按 visual-spec），颜色债（#e5484d、#fff、#1f2328、rgba 灰）清零，唯一豁免弹窗 scrim rgba(0,0,0,.5)，动效仅 4 个且 prefers-reduced-motion 归零 + document.hidden 暂停脉冲；**控件规格**：switch 28×16（input checkbox 外观覆盖）、6px 状态点（downloading 2s 脉冲、verifyFailed/scanRejected/error 语义色）、徽标 data-kind 五态（recommended/representative/shadowed/builtin/custom）、danger 两步删除 filled `[data-confirm]`、镜像脏态 `[data-dirty]` + 未保存提示、自定义表单卡 + prompt 字数 ≥18000 转 warn；**去重**：shadowed 成员改语义灰阶 `[data-shadowed]`（废除 opacity 弱化），恢复默认/设为代表降为 linkbtn；**弹窗统一 alertdialog**：ack/scan/rec 三确认弹窗统一 `renderConfirmModal`（focus trap + 关闭焦点还原 + 取消侧 autoFocus + Esc=取消 + overlay 点击不关），风险弹窗标题前置 6px error 圆点；**无障碍**：锚点导航 aria-label、全局反馈带 error alert + notice aria-live、行级 disclosure 可多开（aria-expanded/aria-controls + 折叠态 visibility 移出 Tab 序 + Esc 收起回焦）、busy 全局单通道禁用面；**乐观锁冲突文案**：mutate/runSetEnabled/runFetch/runApplyRecommended 统一走 `globalErrorText`（conflict → settings.conflictGeneric 全局文案，自定义区保留 custom.err.conflict）；**纯函数区**：`// SET-PURE-*` 标记隔离（computeRecommendedPlan/statusToneOf/statusTextToneOf/looksLikeSourceUrl/parseMirrorPrefixes/mirrorPrefixesValid/errorKeyOf/findingText 等），新增 `test/client-settings.selftest.mjs`（new Function 提取，先例 TB-PURE）；**词条**：zh+en 各新增 10 键（nav.* 七锚点/mirrors.dirty/settings.conflictGeneric/sources.expandHint）。Remote 契约与 14 个 Remote 方法调用语义未动；零新依赖、零构建步骤。
+
 ## [2.10.0] — 2026-10-25
 
 ### Added

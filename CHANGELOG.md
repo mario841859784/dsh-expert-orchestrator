@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.10.0] — 2026-10-25
+
+### Added
+
+- **任务板可视化——右侧 Sidebar 自定义 tab 看板 + 会话页头徽标**（T1, `lib/client.js` + `test/client-taskboard.selftest.mjs`，设计规格 `docs/taskboard-visual-spec.md` / `docs/taskboard-sidebar-ux-spec.md`）: 编排任务板在 web client 一等公民化。**Sidebar tab**：`ctx.sidebarRightTabs.register`（能力探测 fail-open，缺失 console.info 跳过不影响其余功能）注册 `{id:'dsh-expert-orchestrator/taskboard', kind:'expert-taskboard', patterns:['dsh-resource://file/**.expert-taskboards/**'], priority:'extension'}` + guide 入口，正文进 slot `sidebar.right.pane.tab`；**数据通道**：workspaceFiles list→read 编排，顶层恰一个 `*.json` 才渲染（0 个指引空态 / 多个歧义候选列表，宁漏勿错），parseBoard 宽容校验，changes watch 防抖 500ms + stat 版本比对 keyed diff 刷新（UI 态全保留、滚动锚点回滚），tab.signal abort 全释放、tab.visible=false 暂停；**看板 UI**：四泳道（需要注意→进行中→待处理→已完成，未知状态落需要注意并标注）、阻塞=卡片徽标（dep 指向 status≠done，环/未知 id 防御）、手风琴单开、深链 `#task=T3` 自动展开+2s 高亮、任务≥8 时工具条筛选（状态多选 chips+owner 单选+仅看阻塞）、窄 <720px 纵向分区/宽 ≥720px 四列 grid（容器 ResizeObserver）、刷新 150ms opacity 无 FLIP、无 toast（aria-live 播报）；**页头徽标**：slot `conversation.session.header.actions` 挂载读一次+30s 轮询 running 数（running=0 不显示，>99 显 99+），点击 `sidebarRight.openTab`；**样式**：`.eso-tb-*` 全套只用产品 `--dsw-alias-*`/`--dsw-radius-*` token，动效仅 4 个且 prefers-reduced-motion 归零；**无障碍**：disclosure/aria-expanded/aria-live/roving tabindex（↑↓/Home/End/Esc）；**测试**：纯函数区（resolveBoard/parseBoard/groupByStatus/computeDepBadges/countRunning/diffCount）以 `// TB-PURE-*` 标记从源码提取后 node --test（零构建零新依赖）。
+
 ## [2.9.9] — 2026-10-24
 
 ### Changed

@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.11.2] — 2026-10-23
+
+### Fixed
+
+- **任务板可视化在 rc.3 宿主整体未注册——workspaceFiles 扁平服务键取值途径错误**（T6, `lib/client.js` + `test/client-taskboard.selftest.mjs`）: v2.11.1 在 rc.3 宿主重启后设置页恢复，但右侧栏无任务板 tab、无 guide 入口、无页头徽标。根因：`lib/client.js` 任务板能力探测段用扁平键 `ctx.get("remote.workspaceFiles")` 取 Remote，而 rc.3 宿主不存在该扁平服务键——dsh-api-remotes 中 namespace 是 `"remote"` 服务上的属性（endpoint `workspaceFiles/read` → namespace `workspaceFiles` → receiver=`remote.workspaceFiles`），且动态 ctx 守卫 `ctx.get(name)` 为无声明可选查找（CTX_VERBS 不含 inject），插件拿不到作用域注入 → 恒 `undefined` → `tbIo=null` → `if (tbIo)` 整块跳过（tab 注册、页头徽标全部未执行，仅 console.info fail-open）。修复：主途径改为属性访问 `ctx.remote.workspaceFiles`（动态 ctx 守卫对非 function 属性原样放行，先例 dsh-client-ui-sidebar-documentpreview 运行时同款取值），兜底再试扁平键 `ctx.get("remote.workspaceFiles")` 照顾 0.1.7 旧行形态，两者皆空才走 fail-open console.info 分支；list/read/stat/changes 四方法存在性检查原样保留；sidebarRightTabs/sidebarRight 探测与 `if (tbIo)` 结构不变（其 `ctx.get` 可选查找经 reflect.provide 根作用域，本就正确）。`test/client-taskboard.selftest.mjs` 增补 2 个静态断言钉死（属性访问主途径 + 扁平键兜底、四方法检查完整）。版本三处 bump 2.11.2。
+
 ## [2.11.1] — 2026-10-23
 
 ### Fixed

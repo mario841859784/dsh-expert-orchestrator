@@ -241,3 +241,20 @@ test('diffCount: 新增/移除/字段变化各计 1，未变不计', () => {
   assert.equal(tb.diffCount(prev, prev), 0)
   assert.equal(tb.diffCount(null, prev), 2)
 })
+
+// ---------- T6 (2.11.2) workspaceFiles 取值途径（静态断言：lib/client.js apply 区非纯函数，按源码文本钉死） ----------
+
+test('T6: workspaceFiles 主途径为 ctx.remote.workspaceFiles 属性访问，扁平键仅作兜底', () => {
+  assert.ok(
+    source.includes('(ctx.remote && typeof ctx.remote === "object") ? ctx.remote.workspaceFiles : null'),
+    '源码应含 ctx.remote.workspaceFiles 属性访问主途径（rc.3 宿主无扁平服务键）',
+  )
+  assert.ok(source.includes('ctx.get("remote.workspaceFiles")'), '0.1.7 旧行扁平键兜底应保留')
+})
+
+test('T6: workspaceFiles 四方法存在性检查原样保留', () => {
+  const m = source.match(
+    /if \(workspaceFiles && typeof workspaceFiles\.list === "function" && typeof workspaceFiles\.read === "function"\s*&& typeof workspaceFiles\.stat === "function" && typeof workspaceFiles\.changes === "function"\)/,
+  )
+  assert.ok(m, 'list/read/stat/changes 四方法检查应完整保留')
+})

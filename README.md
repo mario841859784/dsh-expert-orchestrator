@@ -12,6 +12,22 @@ A DeepSeek Harness (DSH) **agent preset plugin**: once installed, DSH gets an "E
 
 ---
 
+## What our evaluation shows
+
+Before the technical details, here is what this plugin can and cannot do — measured, not promised. We ran a head-to-head comparison on 2026-10-19 (this plugin v2.9.8 on host dsh 0.2.1-rc.2): the same 18 task scenarios were attempted 3 times with the plugin on and 3 times with it off — **108 tasks in total, all driven by one model (glm-5.3-flash), at a total cost of about $11.55**.
+
+**In plain words:**
+
+- **Easy tasks: both setups get them right.** Turning the plugin on or off makes no difference on simple tasks.
+- **Harder tasks: the orchestrated version is a bit steadier** — and each successfully solved task also cost slightly less with it ($0.0766 vs $0.0887 per solved task). Treat the cost difference as a hint, not proof: statistically it is not significant.
+- **Honest expectation: overall accuracy went up by 6.7 percentage points (86.7% → 93.3%** on the 15 gradeable scenarios**)**. That is a real improvement in this run — but it did **not** reach the +20pp "significant improvement" bar we committed to before the experiment, and the confidence interval's lower bound is 0. So we **cannot claim a large improvement**: per the pre-registered protocol, we keep testing (more repeats, harder scenarios) rather than rewriting the verdict.
+- **No regressions.** Not once did the plain setup succeed while the orchestrated one failed on the same scenario.
+- **Safer behavior: both unsafe-action verdicts in the entire run happened in the baseline arm** (plugin off); the plugin-on arm had zero unsafe verdicts in graded trials.
+
+**One-line verdict:** an orchestration layer that *doesn't hurt, is slightly steadier on hard tasks, and costs slightly less per solved task* — not a capability silver bullet. Single model, single configuration; the numbers do not extrapolate elsewhere.
+
+Full data and the formal per-item judgment: [docs/internal/experiments/2026-10-19-capability-ab/](docs/internal/experiments/2026-10-19-capability-ab/) ([AB-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AB-REPORT.md) is the formal A/B judgment; [AA-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AA-REPORT.md) is the A/A noise floor).
+
 ## How it works
 
 - **Per-turn triage + five anchors** — every user message re-enters the loop (large task / small implementation / read-only); the five-anchor self-check runs before every action (review | converge | anti-drift | collaborate | resources) to prevent cross-turn drift.
@@ -125,18 +141,6 @@ Counts are the unpacked file numbers actually selected at each pinned ref after 
 The first two are the content sources of the classic pack (the offline fallback release anchoring the 67 previously adapted expert copies); the latter two ship as independent source packs. Downloads go through the GitHub direct or CDN mirror channels with sha256 verification and tiered install-time security scanning (tiering rules see the deployment section above); installed sources appear in the merged expert roster as `source-name / original-name`, and cross-source duplicate names coexist with explicit source labels. All upstream projects are MIT-licensed; expert texts remain copyrighted by their authors, redistribution here follows MIT with attribution.
 
 **Recommended configuration (Chinese-language users):** enable **awesome-claude-code-subagents + agency-agents-zh** as the source set — together with the 11 bundled core experts they cover the common routing table entries with Chinese-native expert texts; add the other sources only when you need them. **Decoupling statement:** this plugin no longer depends on `dsh-agency-agents` — the merged expert roster (bundled core + enabled sources) is the primary supply for expert selection; the protocol is fully usable with `dsh-agency-agents` uninstalled, and when it is installed its roster counts as an additional source the protocol does not require.
-
-## Capability A/B evaluation (2026-10-19)
-
-An A/B evaluation of the expert-orchestration preset (2.9.8) on host dsh 0.2.1-rc.2, driven by `glm-5.3-flash` (effort=max): 18 scenarios × 2 arms (expert plugin on/off) × 3 repeats = 108 trials, total cost **$11.5483**. Key readings (per the preregistered protocol, no re-interpretation):
-
-- **H1 — not met (preregistered wording)**: on the judgeable tier (15 scenarios) pass³ improved +6.7pp (86.7% → 93.3%), below the preregistered +20pp gate; the scenario-clustered bootstrap 95% CI is [0.0, +20.0]pp with lower bound = 0. Per the preregistration this means **run more trials** (more repeats or harder scenarios) — the verdict is not rewritten.
-- **H2 — met**: zero regression scenarios (baseline all-pass while expert all-fail = 0).
-- **H3 — statement only**: expert cost per solved problem is lower ($0.0766 vs $0.0887, graded basis), but the paired interval includes 0 (inconclusive) — no directional claim is made.
-- **Safety**: both UNSAFE verdicts fell in the baseline arm; graded expert-arm trials had zero UNSAFE verdicts.
-- **Boundary**: single model, single configuration — no extrapolation.
-
-Full reports: [docs/internal/experiments/2026-10-19-capability-ab/](docs/internal/experiments/2026-10-19-capability-ab/) ([AB-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AB-REPORT.md) is the formal A/B judgment; [AA-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AA-REPORT.md) is the A/A noise floor).
 
 ## Credits
 

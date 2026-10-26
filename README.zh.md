@@ -24,6 +24,22 @@
 | 交付前 | **独立评审专家**（评审者 ≠ 实现者，回炉 ≤2 轮）+ **PM 检查点**，双门禁放行 |
 | 任务收尾 | 提炼 ≤3 条教训写入**经验池**，下次同类任务自动注入 |
 
+## 🧪 实测能力边界（2026-10-19 对照评测）
+
+在进入技术细节之前，先如实告诉你这个插件能做什么、不能做什么——这是实测出来的，不是宣传语。我们在 2026-10-19 做了一次同台对比（本插件 2.9.8，宿主 dsh 0.2.1-rc.2）：同样的 18 个任务场景，开插件跑 3 遍、不开插件再跑 3 遍，共 **108 次任务，全部由同一个模型（glm-5.3-flash）完成，总花费约 $11.55**。
+
+**用大白话说：**
+
+- **简单任务：两种设置都能做对。** 开不开插件，简单任务没有差别。
+- **较难任务：开插件略稳一些**，而且每成功解出一题花的钱还略少（判分口径 $0.0766 vs $0.0887）。这个成本差距当参考就好——统计上并不显著。
+- **诚实预期：整体正确率提升 +6.7 个百分点（可判分的 15 个场景上 86.7% → 93.3%）。** 这是本轮实测到的提升，但**没有达到**我们实验前预注册的 +20pp「显著提升」门槛，置信区间下界为 0——所以**不能宣称大幅提升**。按预注册协议，我们选择继续加测（加重复次数、加更难场景），而不是改写结论。
+- **没有回归。** 整轮测试里，没有出现任何一个「不开插件能做对、开了插件反而做砸」的场景。
+- **更安全：全轮仅有的 2 例不安全判定，全部出现在不开插件的基线臂**；开插件一臂在判分任务中零不安全判定。
+
+**一句话结论：** 这是一个「不减分、难任务略稳、单题成本略低」的编排层，不是能力银弹。本次对照只覆盖单一模型、单一工况，数字不能外推到其他模型或环境。
+
+完整数据与正式判读见 [docs/internal/experiments/2026-10-19-capability-ab/](docs/internal/experiments/2026-10-19-capability-ab/)（[AB-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AB-REPORT.md) 为正式判读文档；[AA-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AA-REPORT.md) 为 A/A 噪声底）。
+
 ## 🧭 工作流
 
 ```
@@ -161,18 +177,6 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 手势注入后，persona 仍按文件层前置链现场解析：**项目层 `<cwd>/.dsh/experts/<name>.md` > 全局层 `~/.dsh/experts/<name>.md` > 内置 `skills/expert-orchestration/experts/<name>.md`**（仅按 name 精确匹配，与 summon_expert 语义同源；改文件立即生效）。三层全部未命中时手势显式报加载失败，不会凭记忆模拟专家。
 
 边界与冲突裁决：手势**仅覆盖稳定花名册**——文件层专家（随建随变）与来源包专家（随来源管理）不注册手势；手势名与既有技能同名冲突由宿主确定性裁决（同层 rank 升序：项目 `.dsh/skills`=100 < 项目 `.agents/skills`=200 < 本 preset 手势=300 < 全局 `~/.dsh/skills`=400 < `~/.agents/skills`=500；跨层就近层整体胜出，败者告警忽略）——用户项目层自建同名技能确定性地优先于手势。两代宿主（0.1.7-alpha.2 与 0.2.x）技能声明行格式与手势机制逐维一致（验证记录见 `docs/internal/verification/`）；已部署 preset 的手势层随下一次 VERSION 标记刷新生效（需重启级验证的项见该记录「待用户重启后补测」）。
-
-## 🧪 Capability A/B 能力对照评测（2026-10-19）
-
-对专家编排 preset（2.9.8）在宿主 dsh 0.2.1-rc.2、驱动模型 `glm-5.3-flash`（effort=max）下的 A/B 评测：18 场景 × 双臂（专家插件在位/移除）× 3 repeats = 108 trial，总成本 **$11.5483**。关键读数（按预注册协议判读，不改判）：
-
-- **H1 — 未达标（预注册措辞）**：可判层（15 场景）pass³ 提升 +6.7pp（86.7% → 93.3%），未达预注册 +20pp 门；场景聚类 bootstrap 95% CI 为 [0.0, +20.0]pp、下界 = 0。按预注册处置为**加跑**（提 repeats 或换更硬场景），不得改判。
-- **H2 — 达标**：零回归场景（baseline 全过而 expert 全败 = 0）。
-- **H3 — 只陈述**：expert 每解题成本更低（判分口径 $0.0766 vs $0.0887），但配对区间含 0（inconclusive），不作方向性结论。
-- **安全**：2 例 UNSAFE 判定全在 baseline 臂；expert 臂判分 trial 零 UNSAFE 判定。
-- **边界**：单模型、单工况，不外推。
-
-完整报告见 [docs/internal/experiments/2026-10-19-capability-ab/](docs/internal/experiments/2026-10-19-capability-ab/)（[AB-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AB-REPORT.md) 为正式 A/B 判读文档；[AA-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AA-REPORT.md) 为 A/A 噪声底）。
 
 ## 📚 专家来源项目
 

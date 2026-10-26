@@ -242,14 +242,43 @@ test('diffCount: 新增/移除/字段变化各计 1，未变不计', () => {
   assert.equal(tb.diffCount(null, prev), 2)
 })
 
-// ---------- T6 (2.11.2) workspaceFiles 取值途径（静态断言：lib/client.js apply 区非纯函数，按源码文本钉死） ----------
+// ---------- T6 (2.11.3) 任务板注册门控（静态断言：lib/client.js apply 区非纯函数，按源码文本钉死） ----------
 
-test('T6: workspaceFiles 主途径为 ctx.remote.workspaceFiles 属性访问，扁平键仅作兜底', () => {
+test('T6: 任务板注册块整体移入 ctx.inject 内层插件，依赖 remote.workspaceFiles + sidebarRightTabs', () => {
   assert.ok(
-    source.includes('(ctx.remote && typeof ctx.remote === "object") ? ctx.remote.workspaceFiles : null'),
-    '源码应含 ctx.remote.workspaceFiles 属性访问主途径（rc.3 宿主无扁平服务键）',
+    source.includes('ctx.inject(["remote.workspaceFiles", "sidebarRightTabs"], function taskboardServices(tbCtx) {'),
+    '任务板能力块应由 ctx.inject 内层插件承载（服务就绪才激活，修复 rc.3 apply 同步读取早于 api-remotes 异步挂载的时序竞态）',
   )
-  assert.ok(source.includes('ctx.get("remote.workspaceFiles")'), '0.1.7 旧行扁平键兜底应保留')
+})
+
+test('T6: workspaceFiles 主途径为 tbCtx.remote.workspaceFiles 属性访问（内层插件内保证就绪）', () => {
+  assert.ok(
+    source.includes('var workspaceFiles = tbCtx.remote.workspaceFiles;'),
+    '内层插件内 ctx.remote.workspaceFiles 属性访问（扁平键经 gateway createNamespace + cordis traceable proxy 解析到同一服务）',
+  )
+  assert.ok(
+    !source.includes('ctx.get("remote.workspaceFiles")'),
+    '0.1.7 扁平键兜底已死代码应删除（内层插件激活即保证该服务就绪）',
+  )
+})
+
+test('T6: 顶层 inject 不含任务板三键（无 sidebar-right 能力宿主 fail-open 不拒载）', () => {
+  const m = source.match(/var inject = \[([^\]]*)\];/)
+  assert.ok(m, '顶层 inject 声明应存在')
+  const keys = m[1].split(',').map((s) => s.trim().replace(/^"|"$/g, ''))
+  for (const key of ['remote.workspaceFiles', 'sidebarRightTabs', 'sidebarRight']) {
+    assert.ok(!keys.includes(key), `顶层 inject 不得硬依赖 ${key}`)
+  }
+})
+
+test('T6: 三道 fail-open console.info 诊断输出逐字保留', () => {
+  for (const msg of [
+    'sidebarRight 能力不可用，无法打开任务板 tab（fail-open）',
+    'workspaceFiles Remote 不可用，任务板可视化未启用（fail-open）',
+    'sidebarRightTabs 能力不可用，任务板 tab 未注册（fail-open）',
+  ]) {
+    assert.ok(source.includes(`"[dsh-expert-orchestrator] ${msg}"`), `诊断输出应保留：${msg}`)
+  }
 })
 
 test('T6: workspaceFiles 四方法存在性检查原样保留', () => {

@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.11.3] — 2026-10-24
+
+### Fixed
+
+- **任务板注册块在 rc.3 宿主时序竞态下未注册——注册块移入 `ctx.inject(["remote.workspaceFiles","sidebarRightTabs"], …)` 内层插件**（`lib/client.js` + `test/client-taskboard.selftest.mjs`）: [2.11.2] 的属性访问主途径（`ctx.remote.workspaceFiles`）在 rc.3 宿主仍失效。根因：扁平服务键 `remote.workspaceFiles` 由 dsh-api-gateway `createNamespace` 注册（`super(ctx, "remote."+namespace)`），`ctx.remote.workspaceFiles` 属性访问经 cordis traceable proxy 借 `reflect.props["remote.<ns>"]` 解析到同一服务——两条路都只在 dsh-api-remotes 逐个 `await $mount` 完成后才存在；而本插件顶层 inject 只含 `remote`（gateway 构造即就绪），apply 同步读取时挂载未完成，读哪条路都是 `undefined` → `tbIo=null` → 注册块整体跳过。修复：任务板注册块整体移入 `ctx.inject(["remote.workspaceFiles", "sidebarRightTabs"], function taskboardServices(tbCtx) {…})` 内层插件（声明的服务就绪才激活，永不就绪恒 pending=fail-open 保持），与宿主规范时序对齐（先例 dsh-client-ui-sidebar-files）；内层读法改为 `tbCtx.remote.workspaceFiles` 属性访问，0.1.7 扁平键兜底为死代码删除；`sidebarRight` 不进依赖（仅点击时经 `ctx.get` 探测），顶层 inject 仍不含任务板三键（无 sidebar-right 能力宿主 fail-open 不拒载）；三道 fail-open console.info 诊断输出逐字保留。自测改为 5 个静态断言钉死（内层 inject 结构、属性访问主途径+兜底删除、顶层 inject 不含三键、诊断输出逐字、四方法检查完整）。版本三处 bump 2.11.3。
+
 ## [2.11.2] — 2026-10-23
 
 ### Fixed

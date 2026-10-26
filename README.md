@@ -126,6 +126,18 @@ The first two are the content sources of the classic pack (the offline fallback 
 
 **Recommended configuration (Chinese-language users):** enable **awesome-claude-code-subagents + agency-agents-zh** as the source set — together with the 11 bundled core experts they cover the common routing table entries with Chinese-native expert texts; add the other sources only when you need them. **Decoupling statement:** this plugin no longer depends on `dsh-agency-agents` — the merged expert roster (bundled core + enabled sources) is the primary supply for expert selection; the protocol is fully usable with `dsh-agency-agents` uninstalled, and when it is installed its roster counts as an additional source the protocol does not require.
 
+## Capability A/B evaluation (2026-10-19)
+
+An A/B evaluation of the expert-orchestration preset (2.9.8) on host dsh 0.2.1-rc.2, driven by `glm-5.3-flash` (effort=max): 18 scenarios × 2 arms (expert plugin on/off) × 3 repeats = 108 trials, total cost **$11.5483**. Key readings (per the preregistered protocol, no re-interpretation):
+
+- **H1 — not met (preregistered wording)**: on the judgeable tier (15 scenarios) pass³ improved +6.7pp (86.7% → 93.3%), below the preregistered +20pp gate; the scenario-clustered bootstrap 95% CI is [0.0, +20.0]pp with lower bound = 0. Per the preregistration this means **run more trials** (more repeats or harder scenarios) — the verdict is not rewritten.
+- **H2 — met**: zero regression scenarios (baseline all-pass while expert all-fail = 0).
+- **H3 — statement only**: expert cost per solved problem is lower ($0.0766 vs $0.0887, graded basis), but the paired interval includes 0 (inconclusive) — no directional claim is made.
+- **Safety**: both UNSAFE verdicts fell in the baseline arm; graded expert-arm trials had zero UNSAFE verdicts.
+- **Boundary**: single model, single configuration — no extrapolation.
+
+Full reports: [docs/internal/experiments/2026-10-19-capability-ab/](docs/internal/experiments/2026-10-19-capability-ab/) ([AB-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AB-REPORT.md) is the formal A/B judgment; [AA-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AA-REPORT.md) is the A/A noise floor).
+
 ## Credits
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)

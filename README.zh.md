@@ -162,6 +162,18 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 
 边界与冲突裁决：手势**仅覆盖稳定花名册**——文件层专家（随建随变）与来源包专家（随来源管理）不注册手势；手势名与既有技能同名冲突由宿主确定性裁决（同层 rank 升序：项目 `.dsh/skills`=100 < 项目 `.agents/skills`=200 < 本 preset 手势=300 < 全局 `~/.dsh/skills`=400 < `~/.agents/skills`=500；跨层就近层整体胜出，败者告警忽略）——用户项目层自建同名技能确定性地优先于手势。两代宿主（0.1.7-alpha.2 与 0.2.x）技能声明行格式与手势机制逐维一致（验证记录见 `docs/internal/verification/`）；已部署 preset 的手势层随下一次 VERSION 标记刷新生效（需重启级验证的项见该记录「待用户重启后补测」）。
 
+## 🧪 Capability A/B 能力对照评测（2026-10-19）
+
+对专家编排 preset（2.9.8）在宿主 dsh 0.2.1-rc.2、驱动模型 `glm-5.3-flash`（effort=max）下的 A/B 评测：18 场景 × 双臂（专家插件在位/移除）× 3 repeats = 108 trial，总成本 **$11.5483**。关键读数（按预注册协议判读，不改判）：
+
+- **H1 — 未达标（预注册措辞）**：可判层（15 场景）pass³ 提升 +6.7pp（86.7% → 93.3%），未达预注册 +20pp 门；场景聚类 bootstrap 95% CI 为 [0.0, +20.0]pp、下界 = 0。按预注册处置为**加跑**（提 repeats 或换更硬场景），不得改判。
+- **H2 — 达标**：零回归场景（baseline 全过而 expert 全败 = 0）。
+- **H3 — 只陈述**：expert 每解题成本更低（判分口径 $0.0766 vs $0.0887），但配对区间含 0（inconclusive），不作方向性结论。
+- **安全**：2 例 UNSAFE 判定全在 baseline 臂；expert 臂判分 trial 零 UNSAFE 判定。
+- **边界**：单模型、单工况，不外推。
+
+完整报告见 [docs/internal/experiments/2026-10-19-capability-ab/](docs/internal/experiments/2026-10-19-capability-ab/)（[AB-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AB-REPORT.md) 为正式 A/B 判读文档；[AA-REPORT.md](docs/internal/experiments/2026-10-19-capability-ab/AA-REPORT.md) 为 A/A 噪声底）。
+
 ## 📚 专家来源项目
 
 11 个 bundled core 专家之外的内容来自四个 MIT 许可的上游项目。四者均已登记进 `skills/expert-orchestration/source-registry.json`，并**原样引用、不改名不改内容**（文件按上游原样解包，署名见 [NOTICE](NOTICE)）：

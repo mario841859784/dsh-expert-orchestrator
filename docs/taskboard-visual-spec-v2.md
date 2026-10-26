@@ -195,5 +195,87 @@ done 折叠 + 其余泳道全空的板区，不再是 4 个孤零零的泳道头
 - 本文不改变：手风琴单开、泳道折叠规则、过滤行触发条件、深链 `#task=`、刷新/watch 机制、键盘与读屏行为——以上以 T2/UX 规格为准。
 - 本文新增的视觉元素（完成横幅、tint 实条、泳道容器）均挂在既有 DOM 节点上，不要求 T2 新增任何交互或数据字段；完成横幅文案沿用现有数据（done 计数/总数），如 T2 另有完成态文案以其为准。
 - 若 T2 与本文在「空泳道占位」「done 折叠默认态」上冲突，以 T2 为准并回写本文 §4.2。
+- 多板切换器的视觉规格见 §9（v2.1 增补）；其交互机制、状态机与键盘/aria 规格以 UX 规格增补（taskboard-sidebar-ux-spec-v2.md §12）为准，本文 §0–§8 结论不变。
+
+---
+
+## 9. 多板切换器（v2.1 视觉增补）
+
+> 任务板「多板切换器」特性增补（任务 T1-MBS）。本节为追加小节，不修改 §0–§8 任何结论；全部样式沿用 §2 Token 修正表，**零新增 token、零十六进制字面量、零新依赖**，CSS 平铺进 `TB_CSS`（类名 `.eso-tb-*`），断点按容器宽（ResizeObserver），`prefers-reduced-motion` 全量静态化。硬约束见 §0/§2。
+> 双入口共用同一选板纯函数（裁决①）：选择板页（ambiguous 升级）与工具条紧凑切换下拉只是同一候选数据的两种视觉形态；交互与状态机见 UX 规格 §12。
+
+### 9.1 选择板页（ambiguous → 「选择板」页）
+
+出现条件：解析结果 ambiguous（候选 ≥2）。沿用 `.eso-tb-empty` 垂直居中骨架（图标 + 标题 + 正文 + 附加内容），容器类升级为 `.eso-tb-picker`（min-height 160px、max-width 420px 居中、padding 24px 12px 沿用 empty 骨架）。
+
+结构（自上而下，gap 沿用 empty 骨架 6px，正文与列表之间 16px）：
+
+1. 16px 图标（沿用 `.eso-tb-empty > svg`：label-tertiary）；
+2. 标题 `.eso-tb-picker-title`：13px/500 label-secondary（沿用 `.eso-tb-empty-title`）；
+3. 正文 `.eso-tb-picker-body`：12px label-tertiary（沿用 `.eso-tb-empty-body`）；
+4. 候选卡列表 `.eso-tb-board-cards`：纵向堆叠、宽 100%、max-width 360px 居中、卡间 gap 8px；
+5. 尾注「重新检测」linklike 按钮（沿用）。
+
+候选卡 `.eso-tb-board-card`（button 元素）：
+
+- 形态：宽 100%、padding 12px 16px、radius-md、底 bg-layer-1、边线 1px border-l1、行内 gap 8px；内容两行——行 1 显示名 13px/600 label-primary（单行 ellipsis），行 2 meta 11px label-tertiary（mtime + 「来自聊天链接」标注沿用 `tb.empty.ambiguous.chat` 的 data-chat 样式）。
+
+状态表（全部出自 §2 修正表 token）：
+
+| 状态 | 视觉 |
+|---|---|
+| default | 上行形态原样 |
+| hover | 底 `interactive-bg-hover` + 边线升 border-l2；transition 150ms ease |
+| focus-visible | 沿用既有任务板焦点环规格（2px，不新增 token/颜色） |
+| 上次使用（缓存命中标记） | 左缘 2px 实条 `state-business-primary` + 底 `interactive-bg-hover-accent`；不加 check 图标（避免与 meta 行争宽）；meta 行前置「上次使用」11px label-tertiary |
+| active/按下 | 底 `interactive-bg-hover-accent`（与 hover 底一致，边线保持 border-l2） |
+
+空态：候选恒 ≥2 才进选择页（`tbResolveBoard` 判据保证），无独立空态；列表读取异常回落 E3 broken 态。
+
+### 9.2 工具条紧凑切换下拉
+
+触发按钮 `.eso-tb-board-switch`：
+
+- 形态：高 24px、padding 0 8px、radius-sm、flex:none，位于工具条标题之后（顺序见 UX 规格 §12.11 对 §2-1 的扩展）；内容 = 板显示名 12px label-secondary + 下拉 chevron 12px label-tertiary。
+- 容器 <360px：降为纯图标按钮（仅 chevron，title=完整文件名），宽度让位标题；此按钮与开关/刷新/筛选同级，**永不裁剪**（UX §12.11）。
+- 仅候选 ≥2 时渲染；单板/无板不渲染。
+
+面板 `.eso-tb-board-menu`：
+
+- 定位：absolute，与触发按钮左缘对齐，top = 工具条底 + 4px；z-index 3（工具条为 2）；min-width 200px、max-width min(320px, 容器宽−24px)；max-height 320px、overflow-y auto；底 bg-layer-1、边线 1px border-l2、radius-md、上下 padding 4px。
+- 条目 `.eso-tb-board-option`：高 32px、padding 0 12px、radius-sm（内衬圆角）、显示名 12px label-secondary + 行尾 mtime 11px label-tertiary（有则显）。
+
+状态表：
+
+| 状态 | 视觉 |
+|---|---|
+| hover | 底 `interactive-bg-hover` |
+| focus-visible | 沿用既有焦点环（2px） |
+| selected（当前板） | 底 `interactive-bg-hover-accent` + 左缘 2px 实条 `state-business-primary` + 文字 label-primary（与 9.1 上次使用态同一视觉语言） |
+| 空态 | 面板内单行弱文字「未检测到任务板」11px label-tertiary（aria-disabled，不可选；正常数据下面板不出现空态） |
+
+- 动效：展开 150ms opacity + 4px translateY；`prefers-reduced-motion` 下静态。
+- 浮层模式：面板不得被工具条/座位边界裁剪（实现若需挂载点调整属实现取舍，验收以浮层可完整显示为准——UX §12.10 A27）。
+
+### 9.3 板显示名（裁决⑤的视觉面）
+
+- 显示名 = 文件名去 `.json` 后缀；工具条下拉、选择页卡、aria 可访问名均用显示名；完整文件名放 `title` 属性；选择页 meta 行可展示完整文件名 11px label-tertiary。
+- events 配对（`<board>.json ↔ <board>.json.events.jsonl`）不产生任何视觉元素。
+
+### 9.4 Token 对照（自查表，零新增）
+
+| 类 | 使用的 token |
+|---|---|
+| `.eso-tb-picker` / 标题 / 正文 | 沿用 `.eso-tb-empty` 系（bg-base、label-secondary、label-tertiary） |
+| `.eso-tb-board-card` / `.eso-tb-board-option` | bg-layer-1、border-l1（hover border-l2）、radius-md / radius-sm、label-primary/secondary/tertiary |
+| 选中/上次使用实条与 tint | state-business-primary、interactive-bg-hover-accent |
+| hover 命中底 | interactive-bg-hover |
+| 下拉面板 | bg-layer-1、border-l2、radius-md |
+
+### 9.5 边界与验收
+
+- 本文 §9 只定视觉；状态机、键盘 roving、aria-haspopup 取舍、切板受控重载语义、L3 缓存键扩展以 UX 规格 §12 为准。
+- 真机冒烟验收清单（分屏 20%–80% 逐档、三模式、多板/单板/无板、切板现场保留、刷新不拉走）以 UX 规格 §12.10（A26–A34）为准；本文 §7 清单不含切换器条目，不重复维护。
+- 双主题对比度：9.1/9.2 全部组合仅使用 §2 已核实的既有 token 对（interactive-bg-hover-accent、border-l2、label-* ），无新增对比度风险；tint 实条沿用方向 B 同语言，入 §7-6 双主题复查范围。
 
 —— 完 ——

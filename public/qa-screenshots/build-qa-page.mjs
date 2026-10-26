@@ -153,8 +153,97 @@ ${lane('todo', '待处理', '1', card('T5', '准备验收材料', 'ready'))}
 ${lane('done', '已完成', '2', card('T1', 'spec 消化', 'done') + card('T2', '基线核实', 'done'))}
 </div>`)
 
+// —— T4 多板切换器静态 QA 页（spec 视觉 §9 / UX §12；markup 类名与 lib/client.js 渲染一致，mock 数据）——
+// 多板 mock：mtime 新→旧，一块 fromChat、一块上次使用（缓存命中）。
+const BOARDS = [
+  { file: 'mbs-t4.json', label: 'mbs-t4', mtime: '14:32', chat: true },
+  { file: 'taskboard.json', label: 'taskboard', mtime: '13:05' },
+  { file: 'archive.json', label: 'archive', mtime: '昨天' },
+]
+
+function boardPickerCards(lastUsedFile) {
+  return `<div class="eso-tb-board-cards" role="listbox" aria-label="选择任务板">
+${BOARDS.map((b) => {
+    const isLast = b.file === lastUsedFile
+    return `<button type="button" class="eso-tb-board-card" role="option" aria-selected="${isLast}"${isLast ? ' data-lastused=""' : ''} tabindex="${isLast ? 0 : -1}" title="${b.file}">
+  <span class="eso-tb-board-card-name">${b.label}</span>
+  <span class="eso-tb-board-card-meta">${isLast ? '<span>上次使用</span>' : ''}${b.chat ? '<span data-chat="">来自聊天链接</span>' : ''}<time>${b.mtime}</time></span>
+</button>`
+  }).join('\n')}
+</div>`
+}
+
+// 密度自适应：镜像 lib/client.js ResizeObserver 断点（≥720 宽 / 480-719 标准 / 300-479 紧凑 / <300 兜底 / <360 裁剪档）
+const DENSITY_SCRIPT = '<scr' + 'ipt>(function(){var el=document.querySelector(".eso-tb-root");function fit(){var w=el.clientWidth;'
+  + 'if(w>=720)el.setAttribute("data-eso-tb-wide","");else el.removeAttribute("data-eso-tb-wide");'
+  + 'if(w<360)el.setAttribute("data-eso-tb-w360","");else el.removeAttribute("data-eso-tb-w360");'
+  + 'if(w>=300&&w<480)el.setAttribute("data-eso-tb-compact","");else el.removeAttribute("data-eso-tb-compact");'
+  + 'if(w<300)el.setAttribute("data-eso-tb-xnarrow","");else el.removeAttribute("data-eso-tb-xnarrow");}'
+  + 'fit();window.addEventListener("resize",fit);})()</scr' + 'ipt>'
+
+// S2 选择板页（ambiguous ≥3 候选 + roving 焦点落在上次使用板，spec §9.1 / §12.2）
+const pickerHtml = page('', '任务板 QA 多板选择页', `
+<div class="eso-tb-board"><div class="eso-tb-picker">
+  ${I.board}
+  <span class="eso-tb-empty-title">检测到多个任务板</span>
+  <span class="eso-tb-empty-body">请选择要打开的任务板（永不自动猜板）</span>
+  ${boardPickerCards('taskboard.json')}
+  <button type="button" class="eso-tb-linklike">重新检测</button>
+</div></div>
+<script>document.querySelector('[data-lastused]').focus()</script>${DENSITY_SCRIPT}`)
+
+function boardSwitchTrigger(open, name) {
+  return `<button type="button" class="eso-tb-board-switch" aria-haspopup="listbox" aria-expanded="${open}" aria-label="切换任务板" title="${name}.json">
+  <span class="eso-tb-board-switch-name">${name}</span>${I.chevron}
+</button>`
+}
+
+// S4 工具条下拉展开态（当前板 aria-selected 高亮 + 键盘 data-active 悬停近似，spec §9.2 / §12.3）
+const dropdownHtml = withSwitch(page('data-eso-tb-wide=""', '任务板 QA 多板下拉', `
+<div class="eso-tb-lanes">
+${lane('attention', '需要注意', '1', card('T8', '多板下拉展开态（当前板高亮 + 左缘实条）', 'failed', { owner: '测试工程师', chips: ['lib/client.js'] }))}
+${lane('done', '已完成', '2', card('T2', '纯函数层', 'done') + card('T3', 'UI 接线', 'done'))}
+</div>`), { switchName: 'mbs-t4', menu: true })
+
+// 切换后看板（选定板高亮见下拉页；本页展示切板完成态 + aria-live 播报，spec §12.5/F5）
+const switchedHtml = withSwitch(page('data-eso-tb-wide=""', '任务板 QA 多板切换后', `
+<div class="eso-tb-lanes">
+${lane('running', '进行中', '1', card('T4', '测试与真机冒烟（切换后看板：现场恢复 + 焦点回切换按钮）', 'running', { owner: '测试工程师', chips: ['test/'] }))}
+${lane('done', '已完成', '3', card('T1', 'spec 消化', 'done') + card('T2', '纯函数层', 'done') + card('T3', 'UI 接线', 'done'))}
+</div>`), { switchName: 'mbs-t4' })
+
+// S5 选定板消失内联条（旧渲染保留 + 重新检测，spec §12.1 / A33）
+const s5Html = withSwitch(page('data-eso-tb-wide=""', '任务板 QA 多板 S5 内联条', `
+<div class="eso-tb-errorstrip" data-kind="missing"><i></i><span>当前任务板已不在目录</span><button type="button" class="eso-tb-reset">重新检测</button></div>
+<div class="eso-tb-lanes">
+${lane('done', '已完成', '2', card('T2', '纯函数层（旧渲染保留，不自动换板）', 'done') + card('T3', 'UI 接线', 'done'))}
+</div>`), { switchName: 'deleted-board' })
+
+// withSwitch：在既有 page() 产物上注入 board-switch 触发钮（menu=true 时带展开面板）与 aria-live 播报
+function withSwitch(html, opts = {}) {
+  const trigger = boardSwitchTrigger(!!opts.menu, opts.switchName)
+  let injection = trigger
+  if (opts.menu) {
+    injection += `<div class="eso-tb-board-menu" role="listbox" aria-label="切换任务板" aria-activedescendant="eso-tb-board-option-0">
+${BOARDS.map((b, i) => {
+      const selected = b.file === opts.switchName + '.json'
+      return `<div class="eso-tb-board-option" id="eso-tb-board-option-${i}" role="option" aria-selected="${selected}"${i === 0 && !selected ? ' data-active=""' : ''}>
+  <span class="eso-tb-board-option-name">${b.label}</span><span class="eso-tb-board-option-time">${b.mtime}</span>
+</div>`
+    }).join('\n')}
+</div>`
+  }
+  html = html.replace('<span class="eso-tb-rev">', injection + '<span class="eso-tb-rev">')
+  return html.replace('</body>', '<div class="eso-tb-live" role="status">已切换到 ' + opts.switchName + '</div>' + DENSITY_SCRIPT + '</body>')
+}
+
 mkdirSync(import.meta.dirname, { recursive: true })
 writeFileSync(join(import.meta.dirname, 'qa-board-wide.html'), wideHtml)
 writeFileSync(join(import.meta.dirname, 'qa-board-compact.html'), compactHtml)
 writeFileSync(join(import.meta.dirname, 'qa-board-xnarrow.html'), xnarrowHtml)
-console.log('QA pages written:', ['qa-board-wide.html', 'qa-board-compact.html', 'qa-board-xnarrow.html'].join(', '))
+writeFileSync(join(import.meta.dirname, 'qa-multi-board-picker.html'), pickerHtml)
+writeFileSync(join(import.meta.dirname, 'qa-multi-board-dropdown.html'), dropdownHtml)
+writeFileSync(join(import.meta.dirname, 'qa-multi-board-switched.html'), switchedHtml)
+writeFileSync(join(import.meta.dirname, 'qa-multi-board-s5.html'), s5Html)
+console.log('QA pages written:', ['qa-board-wide.html', 'qa-board-compact.html', 'qa-board-xnarrow.html',
+  'qa-multi-board-picker.html', 'qa-multi-board-dropdown.html', 'qa-multi-board-switched.html', 'qa-multi-board-s5.html'].join(', '))

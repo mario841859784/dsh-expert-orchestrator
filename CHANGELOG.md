@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.12.0] — 2026-10-26
+
+### Added
+
+- **多板切换器**（`lib/client.js` + `docs/taskboard-visual-spec-v2.md` §9 + `docs/taskboard-sidebar-ux-spec-v2.md` §12）: 任务板新增多板切换能力——选择页与工具条下拉双入口；换板经受控重载完成；刷新永不换板（缓存/URL 均不改目标板）；L3 语境键扩展为两级（sessionId+board）；宽档下拉列宽 168px 修复（`minmax(168px, …)`）。QA 截图与页面见 `public/qa-screenshots/`（`multi-board-*.png` / `qa-multi-board-*.html`）。测试见 `test/client-taskboard.selftest.mjs` 增补用例。评审结论见 `docs/review-multi-board-t5.md`（pass）。
+
 ## [2.11.4] — 2026-10-25
 
 ### Fixed

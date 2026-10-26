@@ -2,6 +2,20 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.11.4] — 2026-10-25
+
+### Fixed
+
+- **P0：任务板样式未注入宿主——TB_CSS 注入缺失修复**（`lib/client.js`）: 任务板 UI 重做后样式常量未实际注入宿主文档，呈现层无样式生效。补齐注入路径并配静态断言钉死。
+
+### Changed
+
+- **任务板呈现层重做（方向 C 结构面板）**（`lib/client.js` + `docs/taskboard-visual-spec-v2.md` + `docs/taskboard-sidebar-ux-spec-v2.md`）: 按已评审通过的视觉与侧栏 UX 规范重做任务板呈现层为方向 C 结构面板；含 QA 页与三档（wide/compact/xnarrow）截图（`public/qa-screenshots/`）。评审结论见 `docs/review-taskboard-ui-v2-t4.md`（T4 第 2 轮 pass）。
+
+### Fixed
+
+- **3×P1 回炉修复**（`lib/client.js` + `test/client-taskboard.selftest.mjs`）: 评审标记的 3 个 P1 问题按评审意见回炉修复；`test/client-taskboard.selftest.mjs` 增补 8 个用例钉死 P0 注入与 P1 修复点。版本三处 bump 2.11.4。
+
 ## [2.11.3] — 2026-10-24
 
 ### Fixed

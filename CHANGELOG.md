@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.12.1] — 2026-10-26
+
+### Fixed
+
+- **done 泳道双列网格启用阈值 720→1100px（新增 xl 附加档）**（`lib/client.js`）: 修复默认分屏宽度下双列卡片过窄导致 CJK 任务名逐字竖排断行——双列网格改为仅在 ≥1100（`data-eso-tb-xl`）时启用，720–1099 区间回落单列。
+
 ## [2.12.0] — 2026-10-26
 
 ### Added

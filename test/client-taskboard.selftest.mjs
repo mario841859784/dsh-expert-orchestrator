@@ -828,21 +828,16 @@ test('宽档 720 边界: grid min 总宽 + board 水平 padding ≤ 720 阈值�
   assert.ok(source.includes('var wide = width >= 720;'), '宽档密度阈值应保持 720')
 })
 
-test('done 泳道双列网格: 必须锚定 data-eso-tb-xl 且不得再锚 data-eso-tb-wide（防 720–1099 区间挤压回归）', () => {
+test('done 泳道防回归: 双列 grid 规则与 data-eso-tb-xl 已彻底移除（用户裁决 2026-10-27，done 泳道卡片全程单列）', () => {
   const lines = cssRegion().split('\n')
   // cssRegion 返回原始源码切片，TB_CSS 行内引号为 JS 转义形式 data-lane=\"done\"
   const laneDone = 'data-lane=\\"done\\"'
-  const xl = lines.find((l) => l.includes('data-eso-tb-xl') && l.includes(laneDone) && l.includes('.eso-tb-lane-cards'))
-  assert.ok(xl, 'done 泳道双列 grid 规则应存在且锚定 data-eso-tb-xl')
-  assert.ok(/repeat\(2,\s*minmax\(0,1fr\)\)/.test(xl), '双列应为 repeat(2, minmax(0,1fr)) 两列结构')
-  const wideDone = lines.filter((l) => l.includes('data-eso-tb-wide') && l.includes(laneDone))
-  assert.ok(wideDone.length === 0, 'done 双列不得再锚 data-eso-tb-wide（720–1099 区间 done 泳道仅 ~170–260px，双列卡片 ~80–120px 会把 CJK 标题压成逐字竖排断行）')
-})
-
-test('xl 密度阈值边界: 观察块含 width >= 1100 的 set/remove 对（cssRegion 不可测 JS 逻辑，对源码断言）', () => {
-  assert.ok(source.includes('if (width >= 1100) el.setAttribute("data-eso-tb-xl", "");'), 'xl 档启用阈值应为 1100（根宽 ≥1100 → 泳道=(1100−48−24)/4≈257px → 双列卡片≈117px，容得下 7–8 个 CJK 字/行）')
-  assert.ok(source.includes('else el.removeAttribute("data-eso-tb-xl");'), 'xl 档应有对称的 remove 分支')
-  // 阈值算术依据（编排者裁决）：≥1100 → 泳道=(1100−48−24)/4≈257px → 双列卡片≈117px，容得下 7–8 个 CJK 字/行；720–1099 区间泳道不足此宽，维持单列
-  // 阈值语义不回归：宽档密度断点仍为 720，xl 仅是附加档
-  assert.ok(source.includes('var wide = width >= 720;'), '宽档密度阈值应保持 720，xl 为 ≥1100 附加档')
+  const doneGrid = lines.filter((l) => l.includes(laneDone) && l.includes('.eso-tb-lane-cards') && l.includes('repeat(2'))
+  assert.ok(doneGrid.length === 0, 'done 泳道不得再出现双列 grid 规则（repeat(2)），卡片应全程 flex column 单列排布')
+  const wideDone = lines.filter((l) => l.includes('data-eso-tb-wide') && l.includes(laneDone) && l.includes('.eso-tb-lane-cards'))
+  assert.ok(wideDone.length === 0, 'done 泳道卡片布局规则不得锚定任何密度属性（全程单列）')
+  const xlLeftover = lines.filter((l) => l.includes('data-eso-tb-xl'))
+  assert.ok(xlLeftover.length === 0, 'data-eso-tb-xl 死属性不得在 CSS 区残留（唯一消费方双列规则已删）')
+  const xlSource = source.split('\n').filter((l) => l.includes('data-eso-tb-xl'))
+  assert.ok(xlSource.length === 0, 'data-eso-tb-xl set/remove 源码应彻底移除（无消费方即死属性）')
 })

@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.12.2] — 2026-10-27
+
+### Changed
+
+- **done 泳道卡片全程单列（用户裁决）**（`lib/client.js`）: 移除 xl 档双列网格及 `data-eso-tb-xl` 附加档——done 泳道不再在 ≥1100 时切双列，卡片全程 flex column 单列排布；`data-eso-tb-xl` 唯一消费方已删，set/remove 源码一并移除（死属性清理）。规格文档（T1 §4.2/§5、T2 §回执清单）同步回写。
+
 ## [2.12.1] — 2026-10-26
 
 ### Fixed

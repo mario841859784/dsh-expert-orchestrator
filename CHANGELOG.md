@@ -2,6 +2,17 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.1] — 2026-11-01
+
+### Fixed
+
+- **commit-msg hook 多板运行时解析（治本）**（T1, `skills/expert-orchestration/tools/taskboard.py`）: 未固化 `--board` 时，hook 运行时以 `git rev-parse --show-toplevel` 取提交所在仓库根（取不到降级 `pwd`），扫描其 `.expert-taskboards/` 下全部 `*.json` 板联合三查——任务 id 在**任一板**内且该板内状态 running 即通过，scope 并集跨板取；worktree 私有板（`.agents/worktrees/<id>/.expert-taskboards/`）由此可过查，主仓单板行为向后兼容。测试见 `test/hook-multiboard.selftest.mjs`（新套件）。
+- **bus 毒消息自愈（message_invalid 三路径隔离续行）**（T2, `skills/expert-orchestration/tools/bus.py`）: 发件箱 flush、收件箱 read、ack 三路径对「可解析但缺必备字段」的 `message_invalid` 毒消息统一自愈——`.corrupt` 隔离（原文件内容逐字节保留）+ stderr 告警 + 跳过该条继续处理其余；投递/读取不再被单条毒消息卡死。发件箱侧游标零涉及（毒条目在投递循环前移出队列，不回退不前跳）；收件箱截断 JSON 残件维持既有显式报错不变（从未完整落盘与投递后损坏是两类异常）。测试见 `test/bus-poison.selftest.mjs`（新套件）。
+
+### Changed
+
+- **回执契约违规提示收敛单一文案源**（T3, `lib/tools.js`）: `receiptContractHint` 导出为回执违规人类可读文案的单一来源，三个消费点与 `claimFailureReason` 窄分支全部经此出文案，消除两套括号措辞（`'（缺:error）'` → `'（缺 error）'`）。
+
 ## [2.13.0] — 2026-11-01
 
 ### Fixed

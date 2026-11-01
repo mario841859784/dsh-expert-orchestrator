@@ -5,12 +5,12 @@
 // 文件系统用例使用 os.tmpdir() 临时目录，结束后清理，不触碰仓库内任何数据。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { claimFailureReason, receiptContractError } from '../lib/tools.js'
+import { claimFailureReason, receiptContractError, receiptContractHint } from '../lib/tools.js'
 import { budgetNoticeFromEnvelope } from '../lib/budget.js'
 
 const TOOLS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'expert-orchestration', 'tools')
@@ -161,53 +161,54 @@ test('T2-P6 bus send 落盘消息全字段形态：{id,from,to,subject,body,file
   assert.ok(Array.isArray(m.files))
 })
 
-test('T2-P7 bus read：收件箱消息缺必备字段 id → 具名 message_invalid（含 missing 与 path），不裸 traceback', (t) => {
+test('T2-P7 bus read：收件箱消息缺必备字段 id → 隔离 .corrupt 留痕 + stderr 具名告警，read 续行不卡死（v2.13.1 T2 毒消息自愈）', (t) => {
   const cwd = makeDir(t, 'p7')
   const d = join(cwd, '.expert-bus', 'c')
   mkdirSync(d, { recursive: true })
-  writeFileSync(join(d, '1-x.json'), JSON.stringify({ from: 'a', to: 'c', ts: 1, subject: 's' }))
+  const poison = JSON.stringify({ from: 'a', to: 'c', ts: 1, subject: 's' })
+  writeFileSync(join(d, '1-x.json'), poison)
   const r = runBus(cwd, ['read', '--box', 'c'])
-  assert.equal(r.code, 1)
-  assertSingleLineNoTraceback(r.stdout)
-  assert.deepEqual(Object.keys(r.json).sort(), ['error', 'missing', 'path'])
-  assert.equal(r.json.error, 'message_invalid')
-  assert.deepEqual(r.json.missing, ['id'])
-  assert.ok(r.json.path.endsWith('1-x.json'))
+  assert.equal(r.code, 0, `毒消息隔离后 read 应成功: ${r.stderr}`)
+  assert.match(r.stderr, /毒消息已隔离/)
+  assert.match(r.stderr, /1-x\.json/)
+  assert.match(r.stderr, /缺失必备字段/)
+  // 隔离留痕：原文件逐字节保留于 .corrupt，.json 移出
+  assert.equal(existsSync(join(d, '1-x.json')), false)
+  assert.equal(readFileSync(join(d, '1-x.json.corrupt'), 'utf-8'), poison)
 })
 
-test('T2-P8 bus read：错大小写键（From/ID）不抵充必备字段 → message_invalid missing 精确点名小写键', (t) => {
+test('T2-P8 bus read：错大小写键（From/ID）同样视为毒消息 → 隔离 .corrupt + 告警（missing 点名小写键见 stderr）', (t) => {
   const cwd = makeDir(t, 'p8')
   const d = join(cwd, '.expert-bus', 'c')
   mkdirSync(d, { recursive: true })
   writeFileSync(join(d, '1-y.json'), JSON.stringify({ ID: 'm1', From: 'a', To: 'c', TS: 1, subject: 's' }))
   const r = runBus(cwd, ['read', '--box', 'c'])
-  assert.equal(r.code, 1)
-  assert.equal(r.json.error, 'message_invalid')
-  assert.deepEqual(r.json.missing.sort(), ['from', 'id', 'to', 'ts'])
-  assert.ok(r.json.path.endsWith('1-y.json'))
+  assert.equal(r.code, 0, `毒消息隔离后 read 应成功: ${r.stderr}`)
+  assert.match(r.stderr, /毒消息已隔离/)
+  assert.ok(existsSync(join(d, '1-y.json.corrupt')), '错大小写键消息应隔离留痕')
 })
 
-test('T2-P9 bus read：消息体非 JSON 对象（数组）→ 具名 message_invalid，不 KeyError 崩进 unrecoverable', (t) => {
+test('T2-P9 bus read：消息体非 JSON 对象（数组）→ 同按 message_invalid 隔离 .corrupt，不 KeyError 崩进 unrecoverable', (t) => {
   const cwd = makeDir(t, 'p9')
   const d = join(cwd, '.expert-bus', 'c')
   mkdirSync(d, { recursive: true })
-  writeFileSync(join(d, '1-z.json'), JSON.stringify(['not', 'a', 'message']))
+  const poison = JSON.stringify(['not', 'a', 'message'])
+  writeFileSync(join(d, '1-z.json'), poison)
   const r = runBus(cwd, ['read', '--box', 'c'])
-  assert.equal(r.code, 1)
-  assertSingleLineNoTraceback(r.stdout)
-  assert.equal(r.json.error, 'message_invalid')
-  assert.deepEqual(r.json.missing, ['<消息体不是 JSON 对象>'])
+  assert.equal(r.code, 0, `数组毒消息隔离后 read 应成功: ${r.stderr}`)
+  assert.match(r.stderr, /毒消息已隔离/)
+  assert.equal(readFileSync(join(d, '1-z.json.corrupt'), 'utf-8'), poison, '数组毒消息应逐字节留痕')
 })
 
-test('T2-P10 bus ack：消息缺 id / 错大小写键 → 具名 message_invalid；正常消息 ack 链路不受影响', (t) => {
+test('T2-P10 bus ack：消息缺 id / 错大小写键 → 隔离 .corrupt 续行；正常消息 ack 链路不受影响', (t) => {
   const cwd = makeDir(t, 'p10')
   const d = join(cwd, '.expert-bus', 'bad')
   mkdirSync(d, { recursive: true })
   writeFileSync(join(d, '1-a.json'), JSON.stringify({ from: 'a', to: 'bad', ts: 1 }))
   const r = runBus(cwd, ['ack', '--box', 'bad', '--all'])
-  assert.equal(r.code, 1)
-  assert.equal(r.json.error, 'message_invalid')
-  assert.deepEqual(r.json.missing, ['id'])
+  assert.equal(r.code, 0, `毒消息隔离后 ack 应成功: ${r.stderr}`)
+  assert.match(r.stderr, /毒消息已隔离/)
+  assert.ok(existsSync(join(d, '1-a.json.corrupt')), '毒消息应隔离留痕')
   // 正常链路回归：send → read → ack 全程 code 0
   assert.equal(runBus(cwd, ['send', '--from', 'a', '--to', 'ok', '--subject', 's', '--body', 'b']).code, 0)
   assert.equal(runBus(cwd, ['read', '--box', 'ok']).code, 0)
@@ -257,10 +258,12 @@ test('T2-C3 receiptContractError：错大小写别名不抵充（OK/CMD/Error �
     { error: 'receipt_invalid', missing: ['ok'] }) // ok 非布尔同样违规
 })
 
-test('T2-C4 claimFailureReason：ok:false 缺 error → 具名 receipt_invalid(缺:error)；旧三档与非回执 JSON 不回归', (t) => {
-  // 新窄分支：失败信封缺非空 error 具名码
-  assert.equal(claimFailureReason({ ok: false }, '', ''), 'receipt_invalid(缺:error)')
-  assert.equal(claimFailureReason({ ok: false, error: '' }, '', ''), 'receipt_invalid(缺:error)')
+test('T2-C4 claimFailureReason：ok:false 缺 error → 具名 receipt_invalid（缺 error），与 receiptContractHint 单一文案源一致（v2.13.1 T3 措辞收敛）；旧三档与非回执 JSON 不回归', (t) => {
+  // 新窄分支：失败信封缺非空 error 具名码——措辞与 receiptContractHint 同源（全角括号+空格分隔）
+  assert.equal(claimFailureReason({ ok: false }, '', ''), 'receipt_invalid（缺 error）')
+  assert.equal(claimFailureReason({ ok: false, error: '' }, '', ''), 'receipt_invalid（缺 error）')
+  // 同源锚定：与 receiptContractHint 输出逐字节一致，防两套措辞回潜
+  assert.equal(claimFailureReason({ ok: false }, '', ''), receiptContractHint({ error: 'receipt_invalid', missing: ['error'] }))
   // 旧三档回归（tools.selftest.mjs:6342-6354 锚定）
   assert.equal(claimFailureReason({ message: '人读拒绝' }, '', ''), '人读拒绝')
   assert.equal(claimFailureReason({ error: 'stale_revision' }, '', ''), 'stale_revision')

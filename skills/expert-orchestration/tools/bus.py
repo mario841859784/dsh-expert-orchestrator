@@ -22,7 +22,7 @@
     回执）才推进游标 _outbox/<发送者>/cursor.json；投递中途崩溃重启后同一条消息按同 id 原子
     重投（幂等），已 ack 消息的重投不复活未读标记；游标文件损坏按安全侧处理：视为未推进、
     全部重投（at-least-once 只会多投不会丢）。发件箱/收件箱/游标/ack 回写均唯一 tmp + os.replace
-    原子落盘（ack 复用 write_json_atomic，中途崩溃只留无害 .tmp 残件，不产生收件箱截断毒丸）；旧版遗留的发件箱截断残件在投递时自愈（隔离 .corrupt 并告警后跳过），不毒丸该发送者；
+    原子落盘（ack 复用 write_json_atomic，中途崩溃只留无害 .tmp 残件，不产生收件箱截断毒丸）；旧版遗留的发件箱截断残件在投递时自愈（隔离 .corrupt 并告警后跳过），不毒丸该发送者；可解析而缺必备字段的毒消息（message_invalid）在投递/读取/ack 三路径同原则自愈（隔离 .corrupt 保留原文件内容 + stderr 告警 + 跳过该条继续处理其余，v2.13.1 T2），不卡死该发送者/信箱后续处理；
     收件箱截断残件读取时显式 unrecoverable 报错（唯一副本不静默丢）。
   ② 过代过滤：send 可携带 --task <任务id> --attempt <attempt_id>（成对，对接 taskboard.py 的
     派工代际）；read 时与任务板当前代际对账。对账板集合：--board 指定时单板严格（缺失/损坏/结构非法
@@ -233,6 +233,9 @@ def flush_outbox(a, sender):
     投递后、游标推进前崩溃 → 重启后同一条消息按同 id 原子重投（幂等，seq 不变）。
     截断残件自愈：发件箱里的截断 JSON 只可能是旧版裸 open('w') 崩溃窗口的中间态（本版原子写不产生），
     内容不可恢复且从未持久化成功——改名 .corrupt 隔离并告警后继续，保证该发送者后续 send 不被毒丸。
+    毒消息自愈（v2.13.1 T2）：可解析而 validate_msg 判 message_invalid（缺必备字段）的条目同原则
+    隔离 .corrupt（os.replace 原文件内容逐字节保留）+ stderr 告警 + 跳过该条继续投递其余——毒条目
+    在投递循环前移出队列，游标零涉及（不回退不前跳），该发送者后续投递不再被单条毒消息卡死。
     取舍：宁可丢这封从未完整落盘的消息，不让整个发送者信箱永久 exit 1（收件箱残件不走此路径，
     见 read_box——收件箱是已投递消息的唯一副本，静默丢弃违反 at-least-once，故显式报错）。"""
     d = outbox_dir(a, sender)
@@ -252,7 +255,16 @@ def flush_outbox(a, sender):
             print(f'警告：发件箱截断残件已隔离（{name}: {type(e).__name__}: {e}），该消息从未完整落盘，已跳过。',
                   file=sys.stderr)
             continue
-        validate_msg(path, entry)  # T2 回执契约：必备字段缺失在投递前具名报错（不再 deliver 中途 KeyError）
+        try:
+            validate_msg(path, entry)  # T2 回执契约：必备字段缺失在投递前具名报错（不再 deliver 中途 KeyError）
+        except BusError as e:
+            if e.code != 'message_invalid':
+                raise
+            # 毒消息自愈（v2.13.1 T2）：内容逐字节保留于 .corrupt，跳过该条不进投递循环（游标零涉及）
+            os.replace(path, path + '.corrupt')
+            print(f'警告：发件箱毒消息已隔离（{name}: 缺失必备字段 {e.fields.get("missing")}），'
+                  f'原文件内容保留于 {name}.corrupt，已跳过该条继续投递其余。', file=sys.stderr)
+            continue
         entries.append((name, entry))
     entries.sort(key=lambda ne: (msg_seq(ne[1]), ne[0]))  # M4：投递序=(seq, 文件名)，名称序仅作平局稳定排序
     for name, msg in entries:
@@ -476,9 +488,26 @@ def read_box(a, box):
         if not name.endswith('.json'):
             continue
         path = os.path.join(d, name)
-        with open(path, encoding='utf-8') as f:
-            m = json.load(f)
-        validate_msg(path, m)  # T2 回执契约：必备字段缺失/错大小写具名 message_invalid（收件箱是已投递消息唯一副本，不静默跳过）
+        try:
+            with open(path, encoding='utf-8') as f:
+                m = json.load(f)
+        except Exception:
+            raise  # 截断残件维持既有显式报错路径（收件箱原子写不产生，出现即磁盘级异常）
+        try:
+            validate_msg(path, m)  # T2 回执契约：必备字段缺失/错大小写具名 message_invalid
+        except BusError as e:
+            if e.code != 'message_invalid':
+                raise
+            # 毒消息自愈（v2.13.1 T2 裁定，只读核实后按发件箱同原则处理）：隔离 .corrupt 逐字节
+            # 保留原文件内容——「收件箱是已投递消息唯一存档」经核实不成立（bus.py 全文无发件箱
+            # 清理/GC，投递后条目永久留存，发送者侧另有全量副本），且 .corrupt 本身即留痕存档；
+            # 单条毒消息卡死整箱 read/ack 的代价远大于对一条投递后已被改动/损坏的内容放弃解析。
+            # 读取面本就带状态变更语义（过期归档同在此发生），隔离不新增命令性质。截断 JSON
+            # 残件仍走上方显式报错不变（从未完整落盘与投递后损坏是两类异常）。
+            os.replace(path, path + '.corrupt')
+            print(f'警告：收件箱毒消息已隔离（{name}: 缺失必备字段 {e.fields.get("missing")}），'
+                  f'原文件内容保留于 {name}.corrupt，已跳过该条继续读取其余。', file=sys.stderr)
+            continue
         entries.append((name, m))
     # S1b 增量读取：--since-seq N 只保留 seq > N 的消息（发件人单调序号；旧版无 seq 消息按 0 计，
     # 仅全量读可见）。先于过代过滤执行：seq≤N 的旧消息本轮不参与对账归档，留待全量读处置
@@ -571,7 +600,17 @@ def cmd_ack(a, _data=None):
         path = os.path.join(d, name)
         with open(path, encoding='utf-8') as f:
             m = json.load(f)
-        validate_msg(path, m)  # T2 回执契约：必备字段缺失/错大小写具名 message_invalid（ack 按 id 下标定位）
+        try:
+            validate_msg(path, m)  # T2 回执契约：必备字段缺失/错大小写具名 message_invalid（ack 按 id 下标定位）
+        except BusError as e:
+            if e.code != 'message_invalid':
+                raise
+            # 毒消息自愈（v2.13.1 T2）：与 read_box 同裁定——隔离 .corrupt 保留原文件内容并告警，
+            # 跳过该条继续 ack 其余；--all 不再被单条毒消息整箱卡死。
+            os.replace(path, path + '.corrupt')
+            print(f'警告：收件箱毒消息已隔离（{name}: 缺失必备字段 {e.fields.get("missing")}），'
+                  f'原文件内容保留于 {name}.corrupt，已跳过该条继续确认其余。', file=sys.stderr)
+            continue
         if a.all or m['id'] == a.id:
             m['read'] = True
             write_json_atomic(path, m)  # 原子写：ack 中途崩溃只留无害 .tmp 残件，绝不截断收件箱消息（截断一封即整箱 read/stats 永久 unrecoverable）

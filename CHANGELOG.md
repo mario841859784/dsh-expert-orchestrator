@@ -2,6 +2,21 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.0] — 2026-11-01
+
+### Fixed
+
+- **T3 竞态用例可执行位收口（关闭 [2.9.0] Known issues 第 1 条）**（`test/tools.selftest.mjs` T3 race group）: START-barrier 竞态用例的 CHILD 不再直接 execve `taskboard.py`（git 存 100644、NAS 树强制 rwx 掩盖依赖——干净 clone 会假失败），改经 `python3` 间接执行（与生产面 `lib/tools.js` `spawn('python3', …)` 同形态），干净 clone 不再依赖可执行位。[2.9.0] Known issues 第 2 条（WP-8(a) 裸 checkout 耦合）仍开放。
+
+### Changed
+
+- **回执 JSON 契约严格化**（T2, `skills/expert-orchestration/tools/taskboard.py` + `bus.py` + 消费端 `lib/tools.js`）: 全部 stdout 单行 JSON 回执按**精确键名**校验必备字段（键大小写敏感、无别名——'OK'/'Error' 等错大小写键不抵充）；必备字段缺失时生产端改发具名 `{"error":"receipt_invalid","missing":[...]}`（--json 信封为 `{"ok":false,...}` 前缀）、bus 收件箱消息缺 id/from/to/ts 时 read/ack 返回 `{"error":"message_invalid","path":...,"missing":[...]}`，均 exit 1 且绝不裸 traceback；消费端（auto-claim/续领/预算盘点）对契约违规给具名提示行「任务板回执契约违规：receipt_invalid（缺 …）」，不与 fail-open 静默混同。契约行落 `skills/expert-orchestration/SKILL.md` §7。测试见 `test/receipt-contract.selftest.mjs`（新套件）。
+
+### Added
+
+- **prompt corpus 自测**（T3, `test/prompt-corpus.selftest.mjs`）: 三处 corpus（`skills/expert-orchestration/experts/*.md`、`expert-methods/*.md`、`skills/expert-gestures/expert-*.md`）清单从事实源派生（readdir 枚举 + 与 `lib/expert-gestures.js` 花名册逻辑 import 对账，禁止手写清单）、逐文件非空 + frontmatter 必备键断言（键集按实测定）、两两归一化重复度上限（阈值实测现网分布：组内最大 dice 0.6699/0.2013/0.9494（手势文件共享生成模板，相似度天然高）、跨组最大 0.3086）+ 负样本自检。
+- **变异测试族**（T4, `test/mutation-gate.selftest.mjs`）: 29 个安全/一致性锚点变异登记表（taskboard 22 + bus 7），逐点语义变异并断言被捕获（100% 捕获）；显式 `DSH_EXPERT_MUTANTS=1` 才启用，默认整文件 skip——**默认跑批 skip 计数 1→2**（原 1 skip=既有环境门控 e2e，新增 1=变异族门控），属预期基线变化。
+
 ## [2.12.2] — 2026-10-27
 
 ### Changed

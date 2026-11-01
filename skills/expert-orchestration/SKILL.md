@@ -236,6 +236,7 @@ v2.8 M8-2 运行时门禁开关速查（详见 §3/§5/§6 对应段；沿 DSH_E
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要" --attempt <attempt_id>     # 执行方汇报必须携带派工时的 attempt_id（fail closed：任务无开放代际时被拒 {"error":"no_attempt",...}）；旧/已撤销代际返回 {"error":"stale_attempt",...}（fail/progress 同）
     python3 <技能目录>/tools/taskboard.py set_dependencies T3 --dep T1,T2               # 改依赖（整体替换）：写入前全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 并拒绝落盘
   - 查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（对损坏板逐条标注「（损坏）」）外所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback——此时如实报告编排者，禁止当作空板重建。
+  - 回执契约严格化（v2.13 T2）：taskboard.py/bus.py 的全部 stdout 单行 JSON 回执（--json 信封与人读面错误 JSON）按**精确键名**校验必备字段（键大小写敏感、无别名——'OK'/'Error' 等错大小写键不抵充），必备字段缺失时生产端改发 {"error":"receipt_invalid","missing":[...]}（--json 信封为 {"ok":false,...} 前缀）、bus 收件箱消息缺 id/from/to/ts 时 read/ack 返回 {"error":"message_invalid","path":...,"missing":[...]}，均 exit 1 且绝不裸 traceback；消费端（lib auto-claim/续领/预算盘点）对契约违规给具名提示行「任务板回执契约违规：receipt_invalid（缺 …）」，不与 fail-open 静默混同。
 
 **消息总线 bus.py**（并行专家协作必用；**全局信箱根约定（v2.8 S3/T31）**：信箱根解析规则单一——显式 `--root` 参数优先，缺省 `<cwd>/.expert-bus`（cwd 相对）。编排者与全部专家的 bus 调用（含 taskboard.py watchdog `--bus-root` 缺省值、lib 侧 trustedBusMessages 收件箱校验的目录解析）必须锚定同一 cwd＝会话工作区根，或显式传同一 `--root`；在子目录/其他 cwd 下调用会散落出多个互不相通的信箱根——发送落 A 根、读取看 B 根，消息「已发未收」且无任何报错（v2.6 D1 过代误判的放大器）。跨根疑云先用 `bus.py stats` 对账两边根，再排查投递）：
 

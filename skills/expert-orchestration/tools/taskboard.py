@@ -2550,19 +2550,44 @@ def cmd_archive(a, data, path):
         print(f'事件日志已一并归档: .expert-taskboards/archive/{os.path.basename(events_path(target))}')
 
 
+RECEIPT_INVALID = 'receipt_invalid'
+
+
+def _receipt_check(payload, required, json_mode):
+    """机器回执契约守卫（v2.13 T2 回执契约严格化）：任何 stdout 单行 JSON 回执（--json 信封与
+    人读面错误 JSON 同规）发出前按**精确键名**校验必备字段——键大小写敏感、无别名（'OK'/'Error'
+    等错大小写键不抵充必备字段）；必备字段齐备则原样 print 并返回 True，缺失则不发出本回执、
+    改发具名 receipt_invalid 结构化错误 JSON（missing 列出缺失键名，机器可解析，绝不裸
+    traceback）并抛带 receipt_emitted 标记的 SystemExit(1)（main 的 SystemExit 处理器见标记
+    即原样重抛，不再叠加 command_failed 信封，保证 stdout 恰一行）。额外键对未来字段演进透明
+    （不拒绝）。required 为空元组视为无需校验（恒通过）。"""
+    missing = [k for k in required if k not in payload]
+    if missing:
+        bad = {'ok': False, 'error': RECEIPT_INVALID, 'missing': missing} if json_mode \
+            else {'error': RECEIPT_INVALID, 'missing': missing}
+        print(json.dumps(bad, ensure_ascii=False))
+        se = SystemExit(1)
+        se.receipt_emitted = True
+        raise se
+    print(json.dumps(payload, ensure_ascii=False))
+    return True
+
+
 def _emit(a, data, path, json_mode):
     """命令输出面（main 派发尾部，锁内/无锁两路共用一份实现）：--json 信封（_JsonSink 吞人类
     stdout，信封是唯一 stdout 载荷）或缺省人类面 + revision 尾行；archive/_hook-check 不带
-    revision（与人类面末行既有约定一致）。"""
+    revision（与人类面末行既有约定一致）。--json 信封发出前经 _receipt_check 契约校验。"""
     if json_mode:
         # S1 结构化通道：人类可读 stdout 整体静默（_JsonSink 吞掉），信封是唯一 stdout 载荷；
         # stderr（视图重建告警/门禁告警等诊断面）不受影响，退出码语义与缺省完全一致。
         with contextlib.redirect_stdout(_JsonSink()):
             a.fn(a, data, path)
         envelope = {'ok': True, 'cmd': a.cmd, 'data': _structured_data(a, data)}
+        required = ['ok', 'cmd', 'data']
         if a.cmd not in ('archive', '_hook-check'):  # 与人类面末行 revision 约定一致
             envelope['revision'] = int(data.get('revision', 0))
-        print(json.dumps(envelope, ensure_ascii=False))
+            required.append('revision')
+        _receipt_check(envelope, required, json_mode)
     else:
         a.fn(a, data, path)
         if a.cmd not in ('archive', '_hook-check'):
@@ -2678,9 +2703,9 @@ def main():
     try:
         if a.cmd == 'boards':
             if json_mode:
-                print(json.dumps({'ok': True, 'cmd': 'boards',
-                                  'data': {'boards': [payload for _rel, _line, payload in _board_rows()]}},
-                                 ensure_ascii=False))
+                _receipt_check({'ok': True, 'cmd': 'boards',
+                                'data': {'boards': [payload for _rel, _line, payload in _board_rows()]}},
+                               ('ok', 'cmd', 'data'), json_mode)
             else:
                 a.fn(a)
             return
@@ -2715,16 +2740,19 @@ def main():
             payload['unrecoverable'] = True
         if json_mode:
             payload = {'ok': False, **payload}  # 信封错误面：具名错误码与既有错误字段原样保留
-        print(json.dumps(payload, ensure_ascii=False))
+        _receipt_check(payload, ('ok', 'error') if json_mode else ('error',), json_mode)
         sys.exit(1)
     except SystemExit as e:
         # 人读 sys.exit('错误：…') 类拒绝把消息打到 stderr 并以退出码 1 结束；--json 模式下 stdout
         # 仍须恰一行 JSON——归一为 {"ok":false,"error":"command_failed","message":…} 信封（退出码不变）。
-        # argparse 用法错误（exit 2）与正常退出（0/None）不在信封化范围。
+        # argparse 用法错误（exit 2）与正常退出（0/None）不在信封化范围。回执契约守卫
+        # （_receipt_check）改发的 receipt_invalid 已是恰一行具名 JSON，见标记原样重抛不叠加。
+        if getattr(e, 'receipt_emitted', False):
+            raise
         if json_mode and e.code not in (None, 0):
-            print(json.dumps({'ok': False, 'error': 'command_failed',
-                              'message': e.code if isinstance(e.code, str) else f'exit {e.code}'},
-                             ensure_ascii=False))
+            _receipt_check({'ok': False, 'error': 'command_failed',
+                            'message': e.code if isinstance(e.code, str) else f'exit {e.code}'},
+                           ('ok', 'error', 'message'), json_mode)
             sys.exit(1)
         raise
     except Exception as e:  # 兜底：深层结构异常等绝不裸 traceback，统一具名 unrecoverable JSON
@@ -2732,7 +2760,10 @@ def main():
                    'reason': f'命令执行异常: {type(e).__name__}: {e}'}
         if json_mode:
             payload = {'ok': False, **payload}
-        print(json.dumps(payload, ensure_ascii=False))
+        _receipt_check(payload,
+                       ('ok', 'error', 'unrecoverable', 'reason') if json_mode
+                       else ('error', 'unrecoverable', 'reason'),
+                       json_mode)
         sys.exit(1)
 
 

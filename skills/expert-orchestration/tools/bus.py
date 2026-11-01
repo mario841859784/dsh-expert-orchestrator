@@ -81,6 +81,42 @@ class BusError(Exception):
         self.fields = fields
 
 
+RECEIPT_INVALID = 'receipt_invalid'
+# 消息必备字段（v2.13 T2 回执契约严格化）：id/from/to/ts 是投递与展示的直接下标消费字段，
+# 任何一者缺失都会使投递/读取路径 KeyError 崩进 unrecoverable 泛化兜底（原行为无缺失明细）。
+# subject/body/files/read/seq/task/attempt_id 等一律非必备（读取面各有容错缺省），不在校验范围。
+MSG_REQUIRED_FIELDS = ('id', 'from', 'to', 'ts')
+
+
+def _receipt_check(payload, required):
+    """机器回执契约守卫（v2.13 T2 回执契约严格化，同 taskboard.py _receipt_check）：bus.py 的
+    stdout 单行 JSON 回执（BusError 面与兜底面）发出前按**精确键名**校验必备字段——键大小写
+    敏感、无别名（'Error' 等错大小写键不抵充）；齐备则原样 print 并返回 True，缺失则不发出本
+    回执、改发具名 receipt_invalid 结构化错误 JSON（missing 列出缺失键名，绝不裸 traceback）并
+    退出 1。额外键对未来字段演进透明（不拒绝）。required 为空元组视为无需校验（恒通过）。"""
+    missing = [k for k in required if k not in payload]
+    if missing:
+        print(json.dumps({'error': RECEIPT_INVALID, 'missing': missing}, ensure_ascii=False))
+        sys.exit(1)
+    print(json.dumps(payload, ensure_ascii=False))
+    return True
+
+
+def validate_msg(path, m):
+    """信箱消息必备字段契约校验（v2.13 T2 回执契约严格化）：消息是机器回执面的一部分，载入后
+    立即按**精确键名**严格校验（键大小写敏感、无别名——'From'/'ID' 等错大小写键不抵充必备
+    字段）；非 JSON 对象或必备字段（MSG_REQUIRED_FIELDS：id/from/to/ts）缺失 → 具名
+    message_invalid 结构化错误（BusError，stdout 单行 JSON，exit 1，missing 列缺失键名、path
+    指明问题条目）——不再 KeyError 裸崩进 unrecoverable 泛化兜底（原行为：reason 只有异常
+    类型，无缺失字段明细）。额外字段（subject/body/files/read/seq/task/attempt_id 及未来新增）
+    对校验透明。截断 JSON 残件在 json.load 即失败，仍走各调用方既有的自愈/报错路径，不经本校验。"""
+    if not isinstance(m, dict):
+        raise BusError('message_invalid', path=path, missing=['<消息体不是 JSON 对象>'])
+    missing = [k for k in MSG_REQUIRED_FIELDS if k not in m]
+    if missing:
+        raise BusError('message_invalid', path=path, missing=missing)
+
+
 def root(a):
     # 全局信箱根约定（v2.8 S3 成文，见文件头）：显式 --root 优先，缺省 <cwd>/.expert-bus；
     # 全部消费方必须同 cwd（会话工作区根）或同 --root，跨 cwd 调用会散落互不相通的信箱根。
@@ -210,12 +246,14 @@ def flush_outbox(a, sender):
         path = os.path.join(d, name)
         try:
             with open(path, encoding='utf-8') as f:
-                entries.append((name, json.load(f)))
+                entry = json.load(f)
         except Exception as e:
             os.replace(path, path + '.corrupt')  # 自愈：移出 .json 投递队列，不再反复触碰
             print(f'警告：发件箱截断残件已隔离（{name}: {type(e).__name__}: {e}），该消息从未完整落盘，已跳过。',
                   file=sys.stderr)
             continue
+        validate_msg(path, entry)  # T2 回执契约：必备字段缺失在投递前具名报错（不再 deliver 中途 KeyError）
+        entries.append((name, entry))
     entries.sort(key=lambda ne: (msg_seq(ne[1]), ne[0]))  # M4：投递序=(seq, 文件名)，名称序仅作平局稳定排序
     for name, msg in entries:
         s = msg_seq(msg)
@@ -437,8 +475,11 @@ def read_box(a, box):
     for name in sorted(os.listdir(d)):
         if not name.endswith('.json'):
             continue
-        with open(os.path.join(d, name), encoding='utf-8') as f:
-            entries.append((name, json.load(f)))
+        path = os.path.join(d, name)
+        with open(path, encoding='utf-8') as f:
+            m = json.load(f)
+        validate_msg(path, m)  # T2 回执契约：必备字段缺失/错大小写具名 message_invalid（收件箱是已投递消息唯一副本，不静默跳过）
+        entries.append((name, m))
     # S1b 增量读取：--since-seq N 只保留 seq > N 的消息（发件人单调序号；旧版无 seq 消息按 0 计，
     # 仅全量读可见）。先于过代过滤执行：seq≤N 的旧消息本轮不参与对账归档，留待全量读处置
     # （过滤本就是读取时点快照，语义不变）。
@@ -530,6 +571,7 @@ def cmd_ack(a, _data=None):
         path = os.path.join(d, name)
         with open(path, encoding='utf-8') as f:
             m = json.load(f)
+        validate_msg(path, m)  # T2 回执契约：必备字段缺失/错大小写具名 message_invalid（ack 按 id 下标定位）
         if a.all or m['id'] == a.id:
             m['read'] = True
             write_json_atomic(path, m)  # 原子写：ack 中途崩溃只留无害 .tmp 残件，绝不截断收件箱消息（截断一封即整箱 read/stats 永久 unrecoverable）
@@ -605,11 +647,12 @@ def main():
         payload.update(e.fields)
         if e.code == 'unrecoverable':
             payload['unrecoverable'] = True
-        print(json.dumps(payload, ensure_ascii=False))
+        _receipt_check(payload, ('error',))
         sys.exit(1)
     except Exception as e:  # 兜底：绝不裸 traceback，统一具名 unrecoverable JSON（同 taskboard.py）
-        print(json.dumps({'error': 'unrecoverable', 'unrecoverable': True,
-                          'reason': f'命令执行异常: {type(e).__name__}: {e}'}, ensure_ascii=False))
+        _receipt_check({'error': 'unrecoverable', 'unrecoverable': True,
+                        'reason': f'命令执行异常: {type(e).__name__}: {e}'},
+                       ('error', 'unrecoverable', 'reason'))
         sys.exit(1)
 
 

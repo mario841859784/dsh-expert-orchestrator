@@ -2176,7 +2176,7 @@ const PKG_ROOT_ABS = fileURLToPath(new URL('..', import.meta.url))
 
 // (a) 注册失败不拖垮插件加载：schemastery 不可解析 → Config=undefined，插件模块照常导出 apply
 test('WP-8 (a) schemastery 不可解析：buildConfigSchema 收敛 null，lib/index.js Config=undefined 且插件照常装载', async (t) => {
-  // 仓库/测试路径上 schemastery 本就不可解析：loadSchemastery 必须收敛 null 而非抛出
+  // 显式传入不存在的模块路径（/nonexistent/…）：loadSchemastery 必须收敛 null 而非抛出
   assert.equal(await loadSchemastery('/nonexistent/stub-does-not-exist.mjs'), null)
   assert.equal(await buildPluginConfigSchema(), null)
   // 不可用模块 / 空对象 / 缺方法对象 → 全部 null，绝不抛
@@ -8022,7 +8022,7 @@ sys.exit(r.returncode)
     assert.equal(runTb(dir, ['create', 'A']).code, 0)
     assert.equal(runTb(dir, ['create', 'B']).code, 0)
     const startFile = join(dir, '.start')
-    const tbArgs = JSON.stringify([TASKBOARD, '--board', join(dir, BOARD_REL), '--json', 'claim_idle', '编排者', 'T1', 'T2'])
+    const tbArgs = JSON.stringify(['python3', TASKBOARD, '--board', join(dir, BOARD_REL), '--json', 'claim_idle', '编排者', 'T1', 'T2'])
     const kids = [0, 1].map(() => new Promise((resolve) => {
       const p = spawn('python3', ['-c', CHILD, startFile, tbArgs], { cwd: dir })
       let stdout = '', stderr = ''

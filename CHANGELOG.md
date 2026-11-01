@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.2] — 2026-11-01
+
+### Fixed
+
+- **宿主 ≥0.2.2-alpha.2 上 preset 整卡「加载失败」（list-agents 行导出探测门控）**（`agent.cordis.yml` → `cordis.patch.yml` delegation 组，测试见 `test/preset-list-agents-guard.selftest.mjs`（新套件））: 宿主 0.2.2-alpha.2 的 `dsh-tool-subagent-control` 把 `list_agents` 收编进主行（`apply()` 内 `registerListAgents`）并删除 `./list-agents` 子路径导出（0.2.1-rc.5 实测仍导出且主行不注册）；preset 声明面的 `tool-subagent-list-agents` 行因此在 ≥0.2.2 宿主解析不到模块——loader 不给 fiber，registry `auditRows` 记 `never started`，`agentPresets.list()` 给整卡打 broken「加载失败」（真机 0.2.2-alpha.2 + 2.13.1 复现：隔离进程内 boot + `ctx.agentPresets.list()` 实测 broken=`tool-subagent-list-agents (…/list-agents): never started`）。修复：该行加 `disabled: !!js` 导出探测门控——`createRequire(process.argv[1])`（dsh bin，与 loader 解析宿主包同域）resolve 子路径：可解析（≤0.2.1，主行不注册 list_agents）→ 保留行；解析不到（≥0.2.2）→ 停用行，`list_agents` 由主行提供；探测自身失败一律停用（宁可少一个工具，不让整 preset broken）。隔离复现环境（拷贝 live home/profile、进程内 runProfile + `ctx.agentPresets.list()`）修复前后对照：修复前 broken 同上，修复后 expert-orchestrator 行无 broken 字段。
+
 ## [2.13.1] — 2026-11-01
 
 ### Fixed

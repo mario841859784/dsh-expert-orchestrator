@@ -174,8 +174,16 @@
     - id: tool-subagent-control
       name: '@deepseek-ai/dsh-tool-subagent-control'
 
+    # 宿主 ≥0.2.2-alpha.2 把 list_agents 收编进 tool-subagent-control 主行并
+    # 删除了 ./list-agents 子路径导出；解析不到的行被 registry 记为
+    # "never started"，整卡打「加载失败」。故按导出探测门控：子路径仍可解析
+    # （≤0.2.1，主行不注册 list_agents）→ 保留本行；解析不到 → 停用本行，
+    # list_agents 由主行提供。探测锚 process.argv[1]（dsh bin，宿主包解析域），
+    # 与 loader 解析本组合行的域一致；探测自身失败一律停用（宁可少一个工具，
+    # 不让整 preset broken）。
     - id: tool-subagent-list-agents
       name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+      disabled: !!js "(() => { try { const req = process.getBuiltinModule('node:module').createRequire(process.argv[1]); req.resolve('@deepseek-ai/dsh-tool-subagent-control/list-agents'); return false; } catch { return true; } })()"
 
     - id: tool-subagent
       name: '@deepseek-ai/dsh-tool-subagent'

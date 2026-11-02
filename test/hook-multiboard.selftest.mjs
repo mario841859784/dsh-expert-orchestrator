@@ -90,7 +90,7 @@ test('单板过/不过：消息 id 在板内且 running + 文件在 scope 内 �
   rmSync(root, { recursive: true, force: true })
 })
 
-test('单板不过：文件超出 scope → fail closed；非 running 状态 → 拒', () => {
+test('单板：scope 超界拒（fail closed）；done 后引用合法（存在性校验），终态 scope 仍约束超界', () => {
   const { repo, root } = makeRepo('single-fail')
   setupGate(repo, [['default.json', 'src']])
   let r = commit(repo, 'chore: init T1', { 'src/a.txt': 'x' })
@@ -98,12 +98,16 @@ test('单板不过：文件超出 scope → fail closed；非 running 状态 →
   r = commit(repo, 'feat: T1', { 'other/b.txt': 'x' })
   assert.equal(r.status, 1, 'scope 超界应被拒')
   assert.match(r.stderr, /超出任务 T1 scope/)
-  // done 后再提交：非 running 拒
+  // done 后再提交：② 存在性校验——终态 id 仍在板内即过（不要求 running），终态 scope 仍进并集
   const d = tb(['done', 'T1', 'x', '--by', 'x'], repo)
   assert.equal(d.status, 0)
+  spawnSync('git', ['reset'], { cwd: repo }) // 撤销上一步被拒提交遗留的暂存（other/b.txt 不得混入）
   r = commit(repo, 'feat: T1 again', { 'src/c.txt': 'x' })
-  assert.equal(r.status, 1)
-  assert.match(r.stderr, /门禁要求 running/)
+  assert.equal(r.status, 0, `done 后引用应通过（存在性校验）: ${r.stderr}`)
+  assert.match(String(r.stdout) + String(r.stderr), /id 均在板内/)
+  r = commit(repo, 'feat: T1 out of scope', { 'other/d.txt': 'x' })
+  assert.equal(r.status, 1, 'done 后 scope 超界仍应被拒')
+  assert.match(r.stderr, /超出任务 T1 scope/)
   rmSync(root, { recursive: true, force: true })
 })
 
@@ -181,15 +185,33 @@ test('多板降级：板目录存在但全部板损坏 → fail-open；好板+�
   rmSync(root, { recursive: true, force: true })
 })
 
-test('多板互斥语义：done 板的 T1 不背书 scope（running 条目才进并集）', () => {
+test('多板终态背书：done 板的 T1 scope 仍进并集（并集=src+docs；并集外文件仍拒）', () => {
   const { repo, root } = makeRepo('done-board')
   setupGate(repo, [['default.json', 'src'], ['extra.json', 'docs']])
-  // extra 板 T1 收口后，其 docs scope 不再背书；仅 default 板 running → 并集=src
+  // extra 板 T1 收口后，其 docs scope 仍背书：③ 并集取全部命中条目（含终态）= src+docs
   const d = tb(['--board', join('.expert-taskboards', 'extra.json'), 'done', 'T1', 'x', '--by', 'x'], repo)
   assert.equal(d.status, 0)
-  const r = commit(repo, 'feat: T1 after extra done', { 'src/a.txt': 'x', 'docs/b.md': 'x' })
-  assert.equal(r.status, 1, 'done 板 scope 不应背书')
-  assert.match(r.stderr, /并集: src/)
+  let r = commit(repo, 'feat: T1 after extra done', { 'src/a.txt': 'x', 'docs/b.md': 'x' })
+  assert.equal(r.status, 0, `done 板 scope 应背书（并集含终态条目）: ${r.stderr}`)
+  assert.match(String(r.stdout) + String(r.stderr), /id 均在板内.*scope 并集内/)
+  r = commit(repo, 'feat: T1 out of union', { 'other/c.txt': 'x' })
+  assert.equal(r.status, 1, '并集外文件仍应被拒')
+  // 拒绝消息点名的并集即终态背书的凭证：docs（done 板）仍在并集内
+  assert.match(r.stderr, /超出任务 T1 scope/)
+  assert.match(r.stderr, /并集: src, docs/)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test('跨板存在性+终态背书：同 id 一板 done 一板 running → 任一板存在即过，done 板 scope 跨板背书', () => {
+  const { repo, root } = makeRepo('cross-done')
+  setupGate(repo, [['default.json', 'src'], ['extra.json', 'docs']])
+  const d = tb(['--board', join('.expert-taskboards', 'extra.json'), 'done', 'T1', 'x', '--by', 'x'], repo)
+  assert.equal(d.status, 0)
+  // default 板 T1 running、extra 板 T1 done：② 任一板存在即过；只触 docs（仅 done 板 scope 覆盖，
+  // running 板只声明 src）也通过——证明 ③ 并集跨板取全部命中条目（含终态），终态板 scope 可背书
+  const r = commit(repo, 'feat: cross board T1 done+running', { 'docs/only.md': 'x' })
+  assert.equal(r.status, 0, `跨板终态背书应通过: ${r.stderr}`)
+  assert.match(String(r.stdout) + String(r.stderr), /id 均在板内/)
   rmSync(root, { recursive: true, force: true })
 })
 

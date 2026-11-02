@@ -64,8 +64,9 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
   环检测：create --dep 与 set_dependencies 写入前做全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 且不落盘。
 门禁执法平面（v2.6，默认关闭，显式开启——未 --install-hook 前任何命令不触碰 .git/hooks/）：
   --install-hook：向当前仓库 .git/hooks/commit-msg 写入零依赖 POSIX sh hook（内嵌 python3 调本工具 _hook-check 三查：
-    ① 提交消息须可解析出任务 id（形如 T<数字>）；② 消息中解析出的全部任务 id 均须在板集内且状态 running（任一不满足即拒，
-    防夹带未核 id）；③ 各任务声明 scope 时的并集内提交文件均须落在关联域内）。板集（v2.13.1 T1 多板运行时解析）：
+    ① 提交消息须可解析出任务 id（形如 T<数字>）；② 存在性校验：消息中解析出的全部任务 id 均须在板集任一板内存在
+    （running 或终态 done/failed 等均合法，板外假 id 即拒——防夹带未核 id）；③ 各任务（含终态条目）声明 scope 时的
+    并集内提交文件均须落在关联域内）。板集（v2.13.1 T1 多板运行时解析）：
     未固化 --board 时 hook 运行时以 git rev-parse --show-toplevel 取提交所在仓库根，扫描其 .expert-taskboards/ 下
     全部 *.json 板联合裁决（id 命中任一板即可，scope 并集跨板取）——worktree 私有板同样被读取，提交根与板路径解耦；
     --board 仍可把项目板路径固化进 hook（单板模式，行为与旧版一致）。已有同名 hook 时报错退出不覆盖
@@ -2243,8 +2244,8 @@ HOOK_TEMPLATE = '''#!/bin/sh
 # dsh-expert-orchestrator commit-msg 门禁 hook（由 taskboard.py --install-hook 安装，零依赖：POSIX sh + python3 + git）
 # {FPH}
 # 三查（板集：--board 固化单板，或 <git rev-parse --show-toplevel 仓库根>/.expert-taskboards/ 下全部 *.json 板联合）：
-#   ① 提交消息须可解析出任务 id（形如 T<数字>）；② 消息中解析出的全部任务 id 均须在任一板内且状态 running；
-#   ③ 各任务 scope 的并集内，提交文件均须落在关联域内。
+#   ① 提交消息须可解析出任务 id（形如 T<数字>）；② 存在性校验：消息中解析出的全部任务 id 均须在任一板内存在
+#     （running 或终态 done/failed 等均合法，板外假 id 即拒）；③ 各任务（含终态条目）scope 的并集内，提交文件均须落在关联域内。
 # 解除：python3 "{TB}" --uninstall-hook（凭上方指纹标记行辨认本插件 hook，仅移除本插件安装的）
 # 降级（fail-open，均告警放行不阻塞提交）：门禁脚本缺失 / python3 不可用 / 板集为空（无任何 *.json 板，含 archive 归档后）；
 #       三查不过则拒绝提交（fail closed）。
@@ -2268,7 +2269,7 @@ exit 0
 # 指纹标记行协议版本：稳定字符串，不随模板内容演进变化——卸载/重装凭标记行前缀辨认本插件 hook，
 # 模板任何一改都不会把已装 hook 变成"无法用工具卸载"的死 hook（评审项 ①）。
 # 旧版（模板整体哈希形态）标记行同样以该前缀开头，天然被认得——即旧版兼容回退。
-_HOOK_PROTOCOL_VERSION = 'v1'
+_HOOK_PROTOCOL_VERSION = 'v2'
 _HOOK_INSTALL_MARK = '# dsh-expert-orchestrator hook fingerprint:'
 
 
@@ -2331,7 +2332,7 @@ def cmd_install_hook(a):
         f.write(content)
     os.chmod(target, 0o755)
     print(f'expert-orchestrator 门禁 hook 已安装: {os.path.relpath(target)}')
-    print('  三查：提交消息含任务 id（T<数字>）｜消息中全部任务 id 在板集内且 running｜提交文件落在各任务 scope 并集内（未声明 scope 跳过）')
+    print('  三查：提交消息含任务 id（T<数字>）｜全部任务 id 在板集任一板内存在（running 或终态均可，防夹带板外假 id）｜提交文件落在各任务（含终态）scope 并集内（未声明 scope 跳过）')
     print('  板集：未固化 --board 时运行时按提交所在仓库根扫描 .expert-taskboards/ 全部 *.json 板（worktree 私有板同样生效）')
     print('  降级：门禁脚本缺失 / python3 不可用 / 任务板缺失（含 archive 后）均放行并告警；紧急情况 git commit --no-verify 可跳过一次')
     if a.board:
@@ -2373,8 +2374,9 @@ def _scope_match(fname, scope):
 def _hook_three_checks(a, entries, board_desc):
     """commit-msg hook 三查核心（单板/多板共用一份裁决；entries: {tid: [(task, 板名), ...]}——
     任务 id 按板独立编号，跨板同 id 属常态，故按 id 聚合板内全部条目）。
-    id 裁决（多板「任一板」语义）：id 在任一板内且该板内状态 running 即通过；scope 并集仅取
-    running 条目（已完结板的 scope 不得背书提交文件）。exit 1 = 拒绝提交（fail closed）。
+    id 裁决（多板「任一板」语义）：② 存在性校验——id 在任一板内存在即通过（running 或终态 done/failed
+    等均合法，不要求 running；板外假 id 即拒，防夹带）；③ scope 并集取全部命中条目（含终态）——
+    终态任务 scope 仍可背书提交文件。exit 1 = 拒绝提交（fail closed）。
     board_desc 仅进拒绝消息用于定位。"""
     try:
         with open(a.msgfile, 'rb') as f:
@@ -2385,21 +2387,15 @@ def _hook_three_checks(a, entries, board_desc):
     if not ids:
         sys.exit('expert-orchestrator 门禁拒绝：提交消息未解析出任务 id（形如 T<数字>）；'
                  '在消息中注明任务 id（如 "feat: xxx T3"）')
-    # ② 全部任务 id 逐个核（防夹带）：消息解析出的每个 id 都须在板集内且存在 running 条目，任一不满足即拒
-    running_hits = {}
+    # ② 存在性校验（防夹带）：消息解析出的每个 id 都须在板集任一板内存在（running 或终态均可），板外假 id 即拒
     for tid in ids:
-        hits = entries.get(tid) or []
-        if not hits:
+        if not (entries.get(tid) or []):
             sys.exit(f'expert-orchestrator 门禁拒绝：任务 {tid} 不在任务板内（板: {board_desc}）')
-        running = [(t, b) for t, b in hits if t['status'] == 'running']
-        if not running:
-            sys.exit(f'expert-orchestrator 门禁拒绝：任务 {tid} 状态为 {hits[0][0]["status"]}，'
-                     '门禁要求 running（先 claim 再提交）')
-        running_hits[tid] = running
-    # ③ scope 取全部引用任务（running 条目）scope 的并集：多任务同 commit 时文件命中任一任务的 scope 即可
+    # ③ scope 取全部引用任务（含终态条目——终态任务 scope 仍可背书提交文件）scope 的并集：
+    #   多任务同 commit 时文件命中任一任务的 scope 即可
     scopes = []
     for tid in ids:
-        for t, _b in running_hits[tid]:
+        for t, _b in entries[tid]:
             for s in (t.get('scope') or []):
                 if s not in scopes:
                     scopes.append(s)
@@ -2412,16 +2408,16 @@ def _hook_three_checks(a, entries, board_desc):
             if bad:
                 sys.exit(f'expert-orchestrator 门禁拒绝：{len(bad)} 个提交文件超出任务 {",".join(ids)} scope '
                          f'（并集: {", ".join(scopes)}）: {", ".join(sorted(bad)[:5])}')
-            print(f'expert-orchestrator 门禁通过: {",".join(ids)} running，{len(files)} 个文件均在 scope 并集内')
+            print(f'expert-orchestrator 门禁通过: {",".join(ids)} id 均在板内，{len(files)} 个文件均在 scope 并集内')
             return
-    print(f'expert-orchestrator 门禁通过: {",".join(ids)} running' + ('' if scopes else '（任务未声明 scope，跳过范围检查）'))
+    print(f'expert-orchestrator 门禁通过: {",".join(ids)} id 均在板内' + ('' if scopes else '（任务未声明 scope，跳过范围检查）'))
 
 
 def cmd_hook_check(a, data, path):
     """commit-msg hook 三查（cwd=仓库根，git 调用；exit 1 = 拒绝提交）。
     降级（fail-open）：任务板缺失（含 archive 归档把板移走——归档收口属预期流程，hook 不再阻塞提交）
     时 stderr 告警放行并提示 --install-hook/--uninstall-hook 逃生口；
-    板在而三查不过（含消息含夹带的假 id/非 running id）则 fail closed。"""
+    板在而三查不过（含消息含夹带的板外假 id）则 fail closed。"""
     if not os.path.exists(path):
         print(f'expert-orchestrator 门禁告警：任务板不存在（{path}），本次提交放行（fail-open）；'
               f'板已 archive 归档或移走属预期，若仍需门禁请重新 --install-hook，不再需要请 --uninstall-hook 移除本 hook',
@@ -2433,8 +2429,9 @@ def cmd_hook_check(a, data, path):
 
 def cmd_hook_check_multiboard(a, boards_dir):
     """commit-msg hook 多板三查（v2.13.1 T1）：hook 运行时按提交所在仓库根传板目录，扫描其下
-    全部 *.json 板联合裁决——消息解析出的全部任务 id 均须在任一板内且状态 running（同 id 跨板
-    按「任一板 running 即过、scope 并集取 running 条目」裁决，见 _hook_three_checks），scope 并集
+    全部 *.json 板联合裁决——消息解析出的全部任务 id 均须在任一板内存在（running 或终态均可，
+    存在性校验；同 id 跨板按「任一板存在即过、scope 并集取全部命中条目含终态」裁决，
+    见 _hook_three_checks），scope 并集
     跨板取。降级（fail-open，stderr 告警放行）：板目录缺失、无任何 *.json 板（含 archive 归档后）、
     或全部板加载失败；有可加载板而三查不过则 fail closed。逐板加载用 repair=False 无锁只读快照
     （hook 是只读面，绝不与写命令竞争写回），单板损坏仅告警跳过该板（不因一块坏板放大成全板

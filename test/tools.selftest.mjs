@@ -1868,8 +1868,9 @@ test('WP-3 (a) 未开启零触碰：git 仓库内跑全套 taskboard 命令，.g
   assert.equal(existsSync(join(dir, '.git', 'hooks', 'pre-commit')), false)
 })
 
-// (b) 显式开启后：绕过 taskboard 直接 commit 非法消息被拒、合法消息+running 任务放行
-test('WP-3 (b) hook 拦截实测：非法消息/任务非 running/scope 越界被拒，合法消息+running 放行', (t) => {
+// (b) 显式开启后：绕过 taskboard 直接 commit 非法消息被拒、合法消息放行（running 或终态均合法）；
+// scope 越界始终被拒（含终态条目 scope 仍约束）
+test('WP-3 (b) hook 拦截实测：非法消息/scope 越界被拒，合法消息放行；done 后存在性过、终态 scope 仍约束', (t) => {
   if (!gitAvailable) return t.skip('git 不可用')
   const { dir, git } = makeGitRepo(t, 'hook')
   assert.equal(runTb(dir, ['create', '任务A', '--scope', 'src']).code, 0)
@@ -1894,13 +1895,18 @@ test('WP-3 (b) hook 拦截实测：非法消息/任务非 running/scope 越界�
   const scopeBad = runCommit(dir, 'feat: y T1')
   assert.notEqual(scopeBad.code, 0)
   assert.ok(scopeBad.output.includes('scope'), scopeBad.output)
-  // ④ 任务非 running（已 done）→ 拒绝
+  // ④ 任务 done 后引用合法（②存在性校验：终态 id 仍在板内即过，不要求 running）；终态 scope 仍约束超界文件
   assert.equal(runTb(dir, ['done', 'T1', '完成']).code, 0)
+  spawnSync('git', ['reset'], { cwd: dir }) // 撤销 ③ 被拒提交遗留的暂存（out.txt 不得混入后续提交）
   writeFileSync(join(dir, 'src', 'a.py'), 'x = 2\n')
   git(['add', 'src/a.py'])
-  const notRunning = runCommit(dir, 'feat: z T1')
-  assert.notEqual(notRunning.code, 0)
-  assert.ok(notRunning.output.includes('running'), notRunning.output)
+  const afterDone = runCommit(dir, 'feat: z T1')
+  assert.equal(afterDone.code, 0, `done 后引用应通过（存在性校验）: ${afterDone.output}`)
+  writeFileSync(join(dir, 'out2.txt'), 'y\n')
+  git(['add', 'out2.txt'])
+  const scopeBadAfterDone = runCommit(dir, 'feat: z2 T1')
+  assert.notEqual(scopeBadAfterDone.code, 0)
+  assert.ok(scopeBadAfterDone.output.includes('scope'), scopeBadAfterDone.output)
 })
 
 // hook 安装器语义：幂等重装、--board 固化、外部 hook 不覆盖、uninstall 仅删本插件指纹
@@ -2094,9 +2100,10 @@ test('WP-3 回炉③ python3 缺失 fail-open：hook 头部拦截告警放行；
   assert.ok(output.includes('python3 不可用'), output)
 })
 
-// ④ 全部任务 id 逐核：消息解析出的每个 id 都须在板内且 running，任一不满足即拒（防「T1 T999」夹带未核 id）；
-// 多任务同 commit 的 scope 取各任务 scope 并集（文件命中任一关联域即可）。
-test('WP-3 回炉④ 全部任务 id 逐核：夹带假 id/非 running id 拒绝并点名；多任务 scope 并集放行；单 id 行为不变', (t) => {
+// ④ 全部任务 id 逐核：消息解析出的每个 id 都须在板集任一板内存在（running 或终态均合法，板外假 id 即拒，
+// 防「T1 T999」夹带未核 id）；多任务同 commit 的 scope 取各任务 scope 并集（文件命中任一关联域即可），
+// 终态条目 scope 仍背书提交文件。
+test('WP-3 回炉④ 全部任务 id 逐核：夹带假 id 拒绝并点名；多任务 scope 并集放行；done 后存在性过、终态背书；单 id 行为不变', (t) => {
   if (!gitAvailable) return t.skip('git 不可用')
   const { dir, git } = makeGitRepo(t, 'hookallids')
   assert.equal(runTb(dir, ['create', '任务A', '--scope', 'src']).code, 0) // T1
@@ -2111,18 +2118,25 @@ test('WP-3 回炉④ 全部任务 id 逐核：夹带假 id/非 running id 拒绝
   const fake = runCommit(dir, 'feat: x T1 T999')
   assert.notEqual(fake.code, 0)
   assert.ok(fake.output.includes('T999') && fake.output.includes('不在任务板内'), fake.output)
-  // 多任务全部 running：放行，scope 取并集（src ∪ docs，src 文件命中 T1 关联域即可）
+  // 多任务全部合法（running）：放行，scope 取并集（src ∪ docs，src 文件命中 T1 关联域即可）
   const multi = runCommit(dir, 'feat: x T1 T2')
   assert.equal(multi.code, 0, multi.output)
-  assert.ok(multi.output.includes('T1,T2 running') && multi.output.includes('scope 并集'), multi.output)
-  // 夹带非 running id：T2 done 后同消息被拒并点名 T2
+  assert.ok(multi.output.includes('T1,T2') && multi.output.includes('id 均在板内') && multi.output.includes('scope 并集'), multi.output)
+  // 夹带终态 id：T2 done 后同消息不再被拒（②存在性校验：running 或终态均合法）
   assert.equal(runTb(dir, ['done', 'T2', '完成']).code, 0)
   writeFileSync(join(dir, 'src', 'a.py'), 'y\n')
   git(['add', 'src/a.py'])
-  const notRunning = runCommit(dir, 'feat: x T1 T2')
-  assert.notEqual(notRunning.code, 0)
-  assert.ok(notRunning.output.includes('T2') && notRunning.output.includes('running'), notRunning.output)
+  const afterDone = runCommit(dir, 'feat: x T1 T2')
+  assert.equal(afterDone.code, 0, `done 后引用应通过（存在性校验）: ${afterDone.output}`)
+  // 终态条目 scope 仍背书：仅 docs 文件（T2 已 done 的 scope）+ T1 running 同 commit 也通过
+  mkdirSync(join(dir, 'docs'), { recursive: true })
+  writeFileSync(join(dir, 'docs', 'd.md'), 'z\n')
+  git(['add', 'docs/d.md'])
+  const doneScope = runCommit(dir, 'feat: x2 T1 T2')
+  assert.equal(doneScope.code, 0, `终态 scope 应背书: ${doneScope.output}`)
   // 单 id 行为不变（既有 WP-3 (b) 语义回归）
+  writeFileSync(join(dir, 'src', 'a.py'), 'w\n')
+  git(['add', 'src/a.py'])
   const single = runCommit(dir, 'feat: y T1')
   assert.equal(single.code, 0, single.output)
 })

@@ -2,6 +2,20 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.3] — 2026-11-03
+
+### Fixed
+
+- **commit-msg 门禁方案 B：三查②存在性校验与 ③scope 背书分离（T1, `skills/expert-orchestration/tools/taskboard.py` `_hook_three_checks`）**: 旧语义「消息中全部任务 id 均须在板内且该板内 running」与收口时序冲突——收口提交引用的任务在提交时点必然尚未 done，收口后引用已完结任务又被拒。方案 B 把两件事分离：② 改**存在性校验**——id 在板集任一板内**存在即过**（running 或终态 done/failed 等均合法），板外假 id 仍拒（防「T1 T999」夹带未核 id）；③ scope 并集**含终态条目**——已完结任务的 scope 仍可背书提交文件（running_hits 改取全部 hits）。防夹带语义保留。hook 指纹 `_HOOK_PROTOCOL_VERSION` v1→v2：旧版 hook 凭指纹标记行认得，`--install-hook` 原地升级覆盖（同步 HOOK_TEMPLATE 注释/docstring/cmd_install_hook 提示文案）。测试见 `test/hook-multiboard.selftest.mjs`（反转与新增用例，见下）。
+- **mutation 登记表 24 处行号漂移修复 + 2 处锚点修正（T5, `test/mutation-gate.selftest.mjs`）**: HEAD 既有（非本次引入）登记行号与 `taskboard.py`/`bus.py` 实际锚点行漂移 24 处（如 TB-receipt-contract 2564→2623、TB-event-hash-chain 429→433）；2 处锚点修正——TB-event-hash-chain 改指实际锚点行，BUS-corrupt-quarantine 的锚点串 `os.replace(path, path + '.corrupt')` 在 bus.py 已非唯一（v2.13.1 T2 毒消息自愈新增同形行）改写为唯一串。修复后 `DSH_EXPERT_MUTANTS=1` mutation 29/29 探针捕获全绿。
+
+### Changed
+
+- **hook-multiboard 测试反转 + 跨板用例（T2, `test/hook-multiboard.selftest.mjs`）**: 原「done 后引用拒绝」用例按方案 B 反转为「done 后引用合法」正向用例（scope 仍约束）；「done 板 scope 不背书」改写为「done 板 scope 现背书，scope 并集=src+docs，提交过」；新增跨板「一板 done 一板 running 同 id」用例；夹带板外假 id 拒、scope 超界拒等负向用例保留。
+- **文档同步（T3, `skills/expert-orchestration/SKILL.md`）**: §4 门禁执法平面与 §9 工具速查两处语义措辞与代码同源改写（存在性校验、终态 scope 可背书、防夹带语义保留说明）；README 无需改动；全仓旧措辞「须在板内且 running」零残留。
+
+**测试指引**：自测家族 `npm test` 全绿（含 `test/hook-multiboard.selftest.mjs` 反转/新增用例）；变异族 `DSH_EXPERT_MUTANTS=1 npm test`（29 点探针捕获全绿，默认 skip）。版本三处 bump 2.13.3（`package.json` / `dsh.plugin.json` / `lib/index.js`；修复 8d4c4be 起 `dsh.plugin.json` 漏 bump 漂移）。
+
 ## [2.13.2] — 2026-11-01
 
 ### Fixed

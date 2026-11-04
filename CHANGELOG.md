@@ -2,6 +2,19 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.4] — 2026-11-04
+
+### Fixed
+
+- **选择任务板页点击候选卡无响应——真根因 ReferenceError: switchBoard is not defined（T13, `lib/client.js`）**: 真实宿主取证点击候选卡 pageerror `ReferenceError: switchBoard is not defined`、选择页原地不动。根因：d44e61b 将 `switchBoard` 定义于 `[sessionId, io]` effect 闭包内，而 render 作用域 4 处裸引用（选择页候选卡 onClick、工具条板菜单确认项与选项项共 3 处 + 候选卡）——effect 未挂载/未执行时 render 路径裸引用必然 ReferenceError。修法：effect 闭包内 `apiRef.current = { refresh, redetect, switchBoard }` 桥接真身（lib/client.js:3284），render 作用域新增唯一入口 `requestSwitchBoard(file)`（lib/client.js:3553，守卫同 redetect/manualRefresh 模式，effect 未挂载时静默忽略），4 处裸引用调用点改经它。
+- **移动端触屏 tap 点击候选卡兜底（T11, `lib/client.js`）**: 触屏 tap 的 click 合成可能被宿主交互层抑制（touchstart/pointerdown preventDefault 禁 click 合成；Chrome 156 实测位移 ≥16px 走 pointercancel，pointerup 不投递）。新增纯函数 `tbIsTap(down, up)`（同 pointerId、勾股位移 ≤ TB_TAP_SLOP_PX=20、按压 ≤ TB_TAP_MAX_MS=500ms），候选卡 onPointerDown 记坐标、onPointerUp 按 tbIsTap 兜底触发 `requestSwitchBoard`；`switchBoard` 对同板重入幂等，click 后到不双重切板。候选卡样式补 `touch-action:manipulation`。边界：宿主真阻断 pointer 事件投递（inert/遮罩）插件内无法根治，只能宿主修复。
+
+### Changed
+
+- QA 静态页再生成：`public/qa-screenshots/qa-board-{compact,wide,xnarrow}.html`、`qa-multi-board-{dropdown,picker,s5,switched}.html` 共 7 页随 client.js 修复同步。
+
+**测试指引**：回归钉子见 `test/client-taskboard.selftest.mjs`（tbIsTap 判定/requestSwitchBoard 桥接/守卫用例）；自测家族 `npm test` 全绿。版本三处 bump 2.13.4（`package.json` / `dsh.plugin.json` / `lib/index.js`）。
+
 ## [2.13.3] — 2026-11-03
 
 ### Fixed

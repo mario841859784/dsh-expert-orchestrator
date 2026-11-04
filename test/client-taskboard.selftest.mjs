@@ -34,7 +34,8 @@ const tb = new Function(
     + ' isBoardEntry: tbIsBoardEntry, entryFromChat: tbEntryFromChat, listBoards: tbListBoards, pickBoard: tbPickBoard,'
     + ' boardSwitchPatch: tbBoardSwitchPatch,'
     + ' uiCacheKey: tbUiCacheKey, uiCacheSelectedKey: tbUiCacheSelectedKey, uiCacheRead: tbUiCacheRead,'
-    + ' uiCacheWrite: tbUiCacheWrite, uiCacheReadSelected: tbUiCacheReadSelected, uiCacheWriteSelected: tbUiCacheWriteSelected };',
+    + ' uiCacheWrite: tbUiCacheWrite, uiCacheReadSelected: tbUiCacheReadSelected, uiCacheWriteSelected: tbUiCacheWriteSelected,'
+    + ' isTap: tbIsTap, TB_TAP_SLOP_PX: TB_TAP_SLOP_PX };',
 )()
 
 function makeTask(overrides) {
@@ -840,4 +841,101 @@ test('done 泳道防回归: 双列 grid 规则与 data-eso-tb-xl 已彻底移除
   assert.ok(xlLeftover.length === 0, 'data-eso-tb-xl 死属性不得在 CSS 区残留（唯一消费方双列规则已删）')
   const xlSource = source.split('\n').filter((l) => l.includes('data-eso-tb-xl'))
   assert.ok(xlSource.length === 0, 'data-eso-tb-xl set/remove 源码应彻底移除（无消费方即死属性）')
+})
+
+// ---------- T11 移动端候选卡点按兜底（Android 触屏 click 合成不到达的回归钉子） ----------
+
+test('tbIsTap: 同 pointerId 位移 ≤ slop 且时长 ≤ 500ms 视为有效点按（移动端 tap 兜底判定，含边界与勾股）', () => {
+  // Chrome 156 实测：触屏位移 ≤14px 合成 click、≥16px 走 pointercancel（滚动接管，pointerup 不投递）
+  // → slop 钉 20px：覆盖宿主抑制 click 合成时 pointerup 仍投递的兜底带，仍远小于滚动位移
+  assert.equal(tb.TB_TAP_SLOP_PX, 20, 'tap slop 阈值应钉死为 20px')
+  const down = { pointerId: 7, clientX: 120, clientY: 300, timeMs: 1000 }
+  // 干净点按：零位移 / 小抖动
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 120, clientY: 300, timeMs: 1100 }), true, '零位移 tap 应命中')
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 126, clientY: 304, timeMs: 1100 }), true, '√(6²+4²)≈7.2px 抖动应命中')
+  // 边界：恰 20px 勾股距离仍有效（16,12 → 20）；超出不命中
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 136, clientY: 312, timeMs: 1100 }), true, '恰 20px 边界应命中')
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 137, clientY: 313, timeMs: 1100 }), false, '√(17²+13²)≈21.4px 应不命中（滚动/拖动）')
+  // 水平/垂直大位移（滚动意图）
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 150, clientY: 300, timeMs: 1100 }), false, '水平 30px 应不命中')
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 120, clientY: 340, timeMs: 1100 }), false, '垂直 40px 应不命中')
+  // 长按防误触发：>500ms（Android contextmenu 阈值 ~500ms）后释放不得兜底
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 120, clientY: 300, timeMs: 1650 }), false, '长按 650ms 释放应不命中')
+  assert.equal(tb.isTap(down, { pointerId: 7, clientX: 120, clientY: 300, timeMs: 1500 }), true, '恰 500ms 内释放应命中')
+  // timeMs 缺失宽容（不影响位移判定主路径）
+  assert.equal(tb.isTap({ pointerId: 7, clientX: 120, clientY: 300 }, { pointerId: 7, clientX: 120, clientY: 300 }), true, 'timeMs 缺失应跳过时长判定')
+  // pointerId 不同（多指第二指抬起）不命中
+  assert.equal(tb.isTap(down, { pointerId: 8, clientX: 120, clientY: 300, timeMs: 1100 }), false, '异 pointerId 应不命中')
+  // 缺 down 记录（pointerdown 未达/已被消费）不命中
+  assert.equal(tb.isTap(null, { pointerId: 7, clientX: 120, clientY: 300, timeMs: 1100 }), false, 'down 缺失应不命中')
+  assert.equal(tb.isTap(down, null), false, 'up 缺失应不命中')
+})
+
+test('T11 接线: 候选卡 onPointerUp 兜底 + onClick 保留 + 非主键/缺 down 守卫（桌面路径不回退）', () => {
+  const fn = source.slice(source.indexOf('function renderCandidates(candidates)'), source.indexOf('function renderStructuralEmpty'))
+  assert.ok(fn.length > 0, 'renderCandidates 函数体应可提取')
+  // 移动端兜底路径：pointerdown 记录 → pointerup 判定 → 兜底触发切板
+  assert.ok(fn.includes('onPointerDown: function (event)'), '候选卡应有 onPointerDown 坐标记录')
+  assert.ok(fn.includes('cardTapRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, timeMs: event.timeStamp }'), 'onPointerDown 应记录 pointerId/坐标/按压起始时刻')
+  assert.ok(fn.includes('onPointerUp: function (event)'), '候选卡应有 onPointerUp 兜底')
+  const upSeg = fn.slice(fn.indexOf('onPointerUp: function (event)'), fn.indexOf('onClick: function'))
+  assert.ok(upSeg.includes('cardTapRef.current = null'), 'pointerup 应消费（置空）暂存记录，防多指串扰')
+  assert.ok(upSeg.includes('event.button !== 0'), '非主键（右键/中键抬起）不得兜底触发')
+  assert.ok(upSeg.includes('!tbIsTap(down, event)'), '兜底必须经 tbIsTap 位移判定')
+  assert.ok(upSeg.includes('requestSwitchBoard(candidate.name)'), '兜底路径应经 requestSwitchBoard 触发切板（T13：render 作用域禁裸引用 effect 闭包内 switchBoard）')
+  // 桌面路径不回退：onClick 仍在（含键盘 Enter/Space 原生点击）
+  assert.ok(fn.includes('onClick: function () { requestSwitchBoard(candidate.name); }'), 'onClick 直调路径应保留（桌面不回退）')
+  // 幂等前提：switchBoard 守卫先于一切副作用——pointerup 先触发后，后到 click 不双重切板
+  const sw = source.slice(source.indexOf('function switchBoard(file)'), source.indexOf('apiRef.current = {'))
+  const guardAt = sw.indexOf('file === selectedFileRef.current')
+  assert.ok(guardAt >= 0 && guardAt < sw.indexOf('tbUiCacheWrite'), '同板重入守卫应先于 L3 落位（双触发幂等的前提）')
+  assert.ok(sw.indexOf('selectedFileRef.current = file;') < sw.indexOf('setState({ phase: "loading" })'), 'selectedFileRef 同步覆写先于 loading（click 后到时守卫已生效）')
+})
+
+// ---------- T13 根因回归钉子：render 作用域不得裸引用 effect 闭包内 switchBoard ----------
+// 真根因（T13 取证）：switchBoard 定义在 React.useEffect 闭包内（deps [sessionId, io]），
+// render 作用域 4 处裸引用 → ReferenceError: switchBoard is not defined，点击无任何反应
+// （桌面/移动皆失效；事件投递层完好，fiber props.onClick 均为 function 但一调用即抛）。
+// 修法：apiRef.current 桥接 switchBoard + render 作用域守卫包装 requestSwitchBoard，
+// 4 个调用点（候选卡 pointerup/onClick、板菜单 keydown Enter/菜单项 onClick）一律经它。
+
+test('T13 接线: apiRef 桥接 switchBoard + render 作用域 requestSwitchBoard 守卫（ReferenceError 根因回归钉子）', () => {
+  // 桥接：effect 闭包内的 switchBoard 真身必须挂到 apiRef（沿用 refresh/redetect 桥接模式）
+  const apiLine = source.split('\n').find((l) => l.includes('apiRef.current = {') && l.includes('switchBoard: switchBoard'))
+  assert.ok(apiLine, 'apiRef.current 应含 switchBoard: switchBoard（effect→render 桥）')
+  // 守卫包装：render 作用域唯一入口，经 apiRef 调用（effect 未挂载时静默忽略）
+  const guard = source.split('\n').find((l) => l.includes('function requestSwitchBoard(file)'))
+  assert.ok(guard, 'render 作用域应有 requestSwitchBoard(file) 守卫包装')
+  const guardBody = source.slice(source.indexOf(guard), source.indexOf(guard) + 300)
+  assert.ok(guardBody.includes('apiRef.current.switchBoard'), 'requestSwitchBoard 应经 apiRef.current.switchBoard 调用')
+  assert.ok(guardBody.includes('if (apiRef.current.switchBoard)'), 'requestSwitchBoard 应有守卫（effect 未挂载时静默忽略）')
+})
+
+test('T13 调用点: 全源码裸 switchBoard( 引用只剩定义/桥接/守卫三处，事件层零裸引用', () => {
+  // 全源码中含 "switchBoard(" 且非 "requestSwitchBoard(" 的行只允许：
+  // ① effect 闭包内定义 function switchBoard(file) ② requestSwitchBoard 守卫体内 apiRef 调用
+  const bare = source.split('\n')
+    .map((l, i) => ({ l: l, n: i + 1 }))
+    .filter((x) => x.l.includes('switchBoard(') && !x.l.includes('requestSwitchBoard('))
+  assert.equal(bare.length, 2, '裸 switchBoard( 引用应恰 2 处（定义 + 守卫体内经 apiRef 调用），实得 ' + bare.length + ' 处: ' + bare.map((x) => x.n).join(','))
+  assert.ok(bare[0].l.includes('function switchBoard(file)'), '第 1 处应为 effect 闭包内定义')
+  assert.ok(bare[1].l.includes('apiRef.current.switchBoard'), '第 2 处应为 requestSwitchBoard 守卫体内 apiRef 调用')
+  // 候选卡（renderCandidates）与板菜单（工具条内联段）两处事件面均经 requestSwitchBoard
+  const candidates = source.slice(source.indexOf('function renderCandidates(candidates)'), source.indexOf('function renderStructuralEmpty'))
+  assert.ok(!/[^.]switchBoard\(/.test(candidates.replace(/requestSwitchBoard\(/g, '')), 'renderCandidates 内不得裸引用 switchBoard')
+  const toolbarSeg = source.slice(source.indexOf('// —— 工具条'))
+  const menuCalls = toolbarSeg.split('\n').filter((l) => l.includes('requestSwitchBoard('))
+  assert.ok(menuCalls.length >= 2, '板菜单 keydown Enter 与菜单项 onClick 两处应经 requestSwitchBoard')
+  // 守卫定义在 render 作用域（manualRefresh 之后）
+  const around = source.slice(source.indexOf('function manualRefresh()'), source.indexOf('function manualRefresh()') + 400)
+  assert.ok(around.includes('function requestSwitchBoard(file)'), 'requestSwitchBoard 应紧邻 manualRefresh 定义于 render 作用域')
+})
+
+test('T11 CSS: 候选卡 touch-action:manipulation（触屏双击缩放/300ms 延迟歧义消除，产品 token 不新增）', () => {
+  const line = cssRegion().split('\n').find((l) => l.includes('.eso-tb-board-card{'))
+  assert.ok(line, '.eso-tb-board-card 基础规则应存在')
+  assert.ok(line.includes('touch-action:manipulation'), '候选卡应声明 touch-action:manipulation')
+  // 不扩散：兜底语义只加在候选卡（选择板页报告缺陷面），linklike/其余按钮不改动
+  const linklike = cssRegion().split('\n').find((l) => l.includes('.eso-tb-linklike{'))
+  assert.ok(linklike && !linklike.includes('touch-action'), '本次不改 .eso-tb-linklike（改动最小化）')
 })

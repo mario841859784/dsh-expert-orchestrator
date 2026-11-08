@@ -30,7 +30,8 @@ const set = new Function(
   source.slice(beginIndex + BEGIN.length, endIndex)
     + '\n;return { BUILTIN_SOURCE_ID, LEGACY_SOURCE_ID, messageOf, errorKeyOf, findingText,'
     + ' looksLikeSourceUrl, parseMirrorPrefixes, mirrorPrefixesValid, statusToneOf,'
-    + ' statusTextToneOf, computeRecommendedPlan };',
+    + ' statusTextToneOf, computeRecommendedPlan, normProfileKey, resolveExpertModelSource,'
+    + ' expertSourceLabels, suggestGroupMembers, sortedKeysJson };',
 )()
 
 function makeSource(overrides) {
@@ -216,4 +217,185 @@ test('expandedSources: toggle 不可变更新 + disclosure 接线（aria-expande
   assert.match(source, /onClick: function \(\) \{ toggleExpandedSource\(source\.id\); \}/)
   // region Esc 收起复用同一 toggle（回焦触发按钮）
   assert.match(source, /if \(event\.key !== "Escape"\) return;\s*toggleExpandedSource\(source\.id\);/)
+})
+
+// ---------- T10 专家档案与分组：生效来源徽标推导（硬门抽查 3 例） ----------
+// 前端 resolveExpertModelSource 必须与 lib/expert-profiles.js resolveExpertModel（T8 后端链）
+// 逐例对账：model 值一致，source 映射 expert/group/defaults ↔ 非空返回，session ↔ null。
+
+import { resolveExpertModel } from '../lib/expert-profiles.js'
+
+const noopWarn = () => {}
+
+function assertBadgeMatchesBackend(name, experts, groups, defaults, context) {
+  // resolveExpertModel 吃 loadExpertProfiles 的平面合并视图（专家名顶层平铺 +
+  // groups/defaults 增量键，见其 JSDoc）；前端函数吃三键分离形参——语义对账。
+  const profiles = { ...experts, groups, defaults }
+  const expected = resolveExpertModel(profiles, name, noopWarn)
+  const actual = set.resolveExpertModelSource(experts, groups, defaults, name)
+  assert.equal(actual.model, expected, context + ': model 与 T8 链一致')
+  if (expected === null) {
+    assert.equal(actual.source, 'session', context + ': 后端 null ↔ 前端 session')
+    assert.equal(actual.group, null, context + ': session 无组名')
+  }
+  return actual
+}
+
+test('徽标抽查① 仅 experts 键：逐专家命中 → expert，未配置 → session（对账 T8 链）', () => {
+  const experts = { 'pm-expert': { model: 'deepseek-chat' } }
+  const actual = assertBadgeMatchesBackend('pm-expert', experts, {}, {}, '仅 experts/命中')
+  assert.equal(actual.source, 'expert')
+  assert.equal(actual.group, null)
+  // 归一命中（trim+lower）与 T8 链一致
+  const norm = assertBadgeMatchesBackend('  PM-Expert ', experts, {}, {}, '仅 experts/归一')
+  assert.equal(norm.source, 'expert')
+  assert.equal(norm.model, 'deepseek-chat')
+  // 未配置专家 → session，后端返回 null
+  const miss = assertBadgeMatchesBackend('nobody', experts, {}, {}, '仅 experts/未配置')
+  assert.equal(miss.source, 'session')
+  assert.equal(miss.model, null)
+  // 保留键不作专家名（T8 链同规）
+  const reserved = assertBadgeMatchesBackend('groups', experts, {}, {}, '仅 experts/保留键')
+  assert.equal(reserved.source, 'session')
+})
+
+test('徽标抽查② experts+groups 重叠：逐专家 > 组（声明顺序首个）> 首组无 model 落 defaults（对账 T8 链）', () => {
+  const experts = { alice: { model: 'expert-model' } }
+  const groups = {
+    'g-a': { model: 'group-a-model', members: ['alice', 'bob'] },
+    'g-b': { model: 'group-b-model', members: ['Alice'] }, // 多组命中，声明顺序首个 g-a 胜
+  }
+  // alice 有逐专家 model → expert 胜过组
+  const alice = assertBadgeMatchesBackend('alice', experts, groups, {}, '重叠/逐专家胜')
+  assert.equal(alice.source, 'expert')
+  assert.equal(alice.model, 'expert-model')
+  // bob 无逐专家条目 → 首个命中组 g-a
+  const bob = assertBadgeMatchesBackend('bob', experts, groups, {}, '重叠/组命中')
+  assert.equal(bob.source, 'group')
+  assert.equal(bob.model, 'group-a-model')
+  assert.equal(bob.group, 'g-a')
+  // 多组命中（bob 亦属 g-b？否——多组命中场景单独构造：carol 属 g-b 与 g-c，声明顺序 g-b 先）
+  const groups2 = {
+    'g-b': { model: 'b-model', members: ['carol'] },
+    'g-c': { model: 'c-model', members: ['Carol'] },
+  }
+  const carol = assertBadgeMatchesBackend('carol', {}, groups2, {}, '重叠/多组首个')
+  assert.equal(carol.source, 'group')
+  assert.equal(carol.model, 'b-model')
+  // 首个命中组无 model → 组层无值落 defaults（T8 链 break 语义）
+  const groups3 = {
+    'g-empty': { members: ['dave'] },
+    'g-late': { model: 'late-model', members: ['dave'] },
+  }
+  const defaults = { model: 'fallback-model' }
+  const dave = assertBadgeMatchesBackend('dave', {}, groups3, defaults, '重叠/首组无model落defaults')
+  assert.equal(dave.source, 'defaults')
+  assert.equal(dave.model, 'fallback-model')
+})
+
+test('徽标抽查③ 全空：experts/groups/defaults 皆空 → session（对账 T8 链 null）', () => {
+  const actual = assertBadgeMatchesBackend('anyone', {}, {}, {}, '全空')
+  assert.equal(actual.source, 'session')
+  assert.equal(actual.model, null)
+  assert.equal(actual.group, null)
+  // 仅 defaults：兜底命中
+  const fallback = assertBadgeMatchesBackend('anyone', {}, {}, { model: 'defaults-model' }, '仅 defaults')
+  assert.equal(fallback.source, 'defaults')
+  assert.equal(fallback.model, 'defaults-model')
+  // 仅组无 model 且无 defaults → session（后端 null）
+  const noModel = assertBadgeMatchesBackend('anyone', {}, { g: { members: ['anyone'] } }, {}, '组无model无defaults')
+  assert.equal(noModel.source, 'session')
+})
+
+// ---------- T10 其余纯函数 ----------
+
+test('expertSourceLabels: 跨来源同名标签去重共现、custom 标注、归一键', () => {
+  const sources = [
+    { id: 's1', name: '来源一', files: [{ name: '审查员', file: 'a.md' }, { name: 'Bob', file: 'b.md' }] },
+    { id: 's2', name: '来源二', files: [{ name: 'bob', file: 'b2.md' }] },
+  ]
+  const customs = [{ name: 'Bob', division: 'dev' }]
+  const labels = set.expertSourceLabels(sources, customs)
+  assert.deepEqual(labels['bob'], [
+    { kind: 'source', label: '来源一' },
+    { kind: 'source', label: '来源二' },
+    { kind: 'custom' },
+  ])
+  assert.deepEqual(labels['审查员'], [{ kind: 'source', label: '来源一' }])
+  assert.equal(labels[undefined], undefined)
+})
+
+test('suggestGroupMembers: division 归一匹配、保序去重、空 division 返回 []', () => {
+  const customs = [
+    { name: 'A', division: 'Dev' },
+    { name: 'B', division: 'dev' },
+    { name: 'C', division: 'review' },
+    { name: 'A', division: 'dev' }, // 重名不重复建议
+  ]
+  assert.deepEqual(set.suggestGroupMembers(customs, ' dev '), ['A', 'B'])
+  assert.deepEqual(set.suggestGroupMembers(customs, 'review'), ['C'])
+  assert.deepEqual(set.suggestGroupMembers(customs, ''), [])
+  assert.deepEqual(set.suggestGroupMembers(customs, 'nope'), [])
+})
+
+test('sortedKeysJson: 键序无关且值敏感（脏态比较基础）', () => {
+  assert.equal(set.sortedKeysJson({ a: 1, b: 2 }), set.sortedKeysJson({ b: 2, a: 1 }))
+  assert.notEqual(set.sortedKeysJson({ a: 1 }), set.sortedKeysJson({ a: 2 }))
+  assert.equal(set.sortedKeysJson({ experts: {}, groups: null }), set.sortedKeysJson({ groups: null, experts: {} }))
+})
+
+test('normProfileKey: trim+lower 归一口径', () => {
+  assert.equal(set.normProfileKey('  PM-Expert '), 'pm-expert')
+  assert.equal(set.normProfileKey(42), '')
+})
+
+// ---------- T10 面板接线（组件闭包静态断言，先例：expandedSources 钉死） ----------
+
+test('profiles 面板接线：加载/保存/invalid 错误分支/分区与 nav 入口', () => {
+  // 初载 getExpertProfiles（fail-open：非 function 跳过）
+  assert.match(source, /typeof remote\.getExpertProfiles !== "function"\) return undefined/)
+  assert.match(source, /remote\.getExpertProfiles\(\)/)
+  // 独立保存流：整文档三键替换 + 成功回读刷新
+  assert.match(source, /remote\.saveExpertProfiles\(\{\s*experts: plainObjectOf\(doc\.experts\),/)
+  assert.match(source, /errorKeyOf\(cause\) === "invalid" \? t\("profiles\.err\.invalid"\) : messageOf\(cause\)/)
+  assert.match(source, /acceptProfilesView\(unwrap\(result\)\)/)
+  // 分区与 nav 入口
+  assert.match(source, /id: "eso-set-sec-profiles", label: t\("nav\.profiles"\)/)
+  assert.match(source, /id: "eso-set-sec-profiles", "aria-label": t\("profiles\.title"\)/)
+})
+
+test('profiles 分组 disclosure：expandedGroups useState(new Set()) + aria-controls 接线（回归钉死）', () => {
+  assert.match(source, /var expandedGroupsState = React\.useState\(new Set\(\)\)/)
+  assert.match(source, /var expandedGroups = expandedGroupsState\[0\]/)
+  assert.match(source, /setExpandedGroups\(function \(prev\) \{\s*var next = new Set\(prev\);/)
+  assert.match(source, /"aria-controls": groupRegionId,/)
+  assert.match(source, /onClick: function \(\) \{ toggleExpandedGroup\(groupName\); \}/)
+  // 成员归组视图来源标注（expertSourceLabels 在组件内消费）
+  assert.match(source, /expertSourceLabels\(snapshot\.sources, customList\)/)
+})
+
+// ---------- T10 双语词条：新增 key zh/en 各声明一次 ----------
+
+const T10_LOCALE_KEYS = [
+  'nav.profiles', 'profiles.title', 'profiles.desc', 'profiles.chain.hint', 'profiles.loading',
+  'profiles.experts.title', 'profiles.experts.empty', 'profiles.experts.add', 'profiles.experts.namePlaceholder',
+  'profiles.expert.modelLabel', 'profiles.expert.effortLabel', 'profiles.expert.toolsLabel',
+  'profiles.expert.skillsLabel', 'profiles.expert.mcpLabel', 'profiles.expert.none',
+  'profiles.expert.delete', 'profiles.expert.deleteConfirm', 'profiles.expert.deleteAria',
+  'profiles.groups.title', 'profiles.groups.empty', 'profiles.groups.add',
+  'profiles.group.nameLabel', 'profiles.group.modelLabel', 'profiles.group.membersLabel',
+  'profiles.group.memberCount', 'profiles.group.expand', 'profiles.group.membersEmpty',
+  'profiles.group.delete', 'profiles.group.deleteConfirm', 'profiles.group.deleteAria',
+  'profiles.group.namePlaceholder', 'profiles.group.membersPlaceholder', 'profiles.group.divisionPick',
+  'profiles.defaults.modelLabel', 'profiles.badge.expert', 'profiles.badge.group',
+  'profiles.badge.defaults', 'profiles.badge.session', 'profiles.source.custom',
+  'profiles.dirty', 'profiles.save', 'profiles.saved', 'profiles.err.invalid', 'profiles.err.form',
+]
+
+test('T10 双语词条：每个新 key 在 zh/en 字典各声明一次', () => {
+  for (const key of T10_LOCALE_KEYS) {
+    const pattern = new RegExp('"' + key.replace(/\./g, '\\.') + '":')
+    const count = source.split(pattern).length - 1
+    assert.equal(count, 2, 'key "' + key + '" 应在 zh/en 各声明一次，实际 ' + count + ' 次')
+  }
 })

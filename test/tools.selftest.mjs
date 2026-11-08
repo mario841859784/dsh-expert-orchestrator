@@ -2215,9 +2215,11 @@ test('WP-8 (b) Config schema 构建：volatile 支持时标记 live 开关；旧
   const built = buildConfigSchema(mod)
   assert.ok(built, '桩 schemastery 下应成功构建')
   assert.equal(typeof built.toJSON, 'function') // 宿主 SettingsForms.schema 的形态检查
-  assert.deepEqual(Object.keys(built.dict).sort(), ['autoClaim', 'expertTools'])
+  assert.deepEqual(Object.keys(built.dict).sort(), ['autoClaim', 'expertTools', 'replyLanguage']) // T7：新增 replyLanguage
   assert.equal(built.dict.autoClaim.meta.volatile, true)
   assert.equal(built.dict.autoClaim.meta.default, true) // 默认开启（缺省=现行为，环境变量仍可关）
+  assert.equal(built.dict.replyLanguage.meta.volatile, true) // T7：回复语言 live 开关（缺省 zh）
+  assert.equal(built.dict.replyLanguage.meta.default, 'zh')
   assert.equal(built.dict.expertTools.dict.provider.meta.default, 'spawn')
   // 旧副本（无 .volatile() 方法）：字段降级注册为普通字段，构建不抛
   const stubOld = writeSchemasteryStub(t, 'novolatile', { withVolatile: false })

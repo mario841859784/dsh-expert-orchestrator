@@ -18,6 +18,7 @@ import {
   parseExpertDefaults,
   parseExpertGroup,
   profileForExpert,
+  resolveExpertModel,
   validateExpertProfileDocument,
 } from '../lib/expert-profiles.js'
 import { remoteGetExpertProfiles, remoteSaveExpertProfiles } from '../lib/index.js'
@@ -326,7 +327,183 @@ test('T6 E2E：remoteSaveExpertProfiles 写全局层 → 新 summon 立即生效
   assert.deepEqual(view.defaults, {})
 })
 
-// ── ⑤ client.js descriptor 契约对齐（源文本级：client.js 为浏览器模块，node
+// ── ⑤ T8 model 优先级链解析（逐专家 > 领域组 > defaults > null）──────────────
+
+test('T8 回归硬门：无 groups/defaults 时 resolveExpertModel 行为与「直接取 per-expert 档案 model」逐字节一致', () => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const flat = { 甲: { model: 'm1' }, 乙: { tools: { deny: ['bash'] } } } // 平面视图（无增量键）
+  assert.equal(resolveExpertModel(flat, '甲', warn), 'm1')
+  assert.equal(resolveExpertModel(flat, '乙', warn), null) // 档案无 model → null（现状行为）
+  assert.equal(resolveExpertModel(flat, '不存在', warn), null)
+  assert.equal(resolveExpertModel(flat, ' Backend-Engineer ', warn), null)
+  assert.deepEqual(warns, [], '回归硬门：平面视图零告警')
+  // loadExpertProfiles 真实产物同验（无键 → 平面对象）
+  assert.equal(resolveExpertModel(loadExpertProfiles({}), '任何人', warn), null)
+  assert.deepEqual(warns, [])
+  // 退化输入
+  assert.equal(resolveExpertModel(null, '甲', warn), null)
+  assert.equal(resolveExpertModel({}, '甲', warn), null)
+  assert.equal(resolveExpertModel({}, '', warn), null)
+  assert.equal(resolveExpertModel({}, null, warn), null)
+  // 保留键守卫沿用 profileForExpert：groups/defaults 永不作为专家名命中
+  const doc = { groups: { 组A: { model: 'g1', members: ['甲'] } }, defaults: { model: 'd1' } }
+  assert.equal(resolveExpertModel(doc, 'groups', warn), 'd1') // 走 defaults 兜底而非组对象
+  assert.equal(resolveExpertModel(doc, 'defaults', warn), 'd1')
+})
+
+test('T8 优先级链四档：逐专家 > 领域组 > defaults > 未设置=null；组成员精确/归一口径', () => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const doc = {
+    甲: { model: 'per' },
+    乙: { effort: 'high' }, // 有档案但无 model → 落组层
+    groups: {
+      组A: { model: 'groupA', members: ['乙', ' Backend-Engineer '] },
+      组B: { model: 'groupB', members: ['丙'] },
+      组C: { members: ['丁'] }, // members-only 组：组层无值
+    },
+    defaults: { model: 'fallback' },
+  }
+  // ① 逐专家胜组/兜底
+  assert.equal(resolveExpertModel(doc, '甲', warn), 'per')
+  // ② 组层：精确成员命中
+  assert.equal(resolveExpertModel(doc, '乙', warn), 'groupA')
+  // ② 组层：归一口径（trim + lower）
+  assert.equal(resolveExpertModel(doc, ' backend-engineer ', warn), 'groupA')
+  assert.equal(resolveExpertModel(doc, ' Backend-Engineer', warn), 'groupA')
+  // ③ 有档案无 model → 组层兜上；组层 members-only 无 model → defaults 兜上
+  assert.equal(resolveExpertModel(doc, '丁', warn), 'fallback')
+  // ④ 全链未设置 → null
+  assert.equal(resolveExpertModel({ ...doc, defaults: {} }, '戊', warn), null)
+  assert.equal(resolveExpertModel({ ...doc, 甲: { effort: 'high' }, defaults: {} }, '甲', warn), null) // 档案无 model + 组未命中甲（甲非成员）+ 无兜底
+  assert.deepEqual(warns, [], '单组命中/未命中零告警')
+})
+
+test('T8 多组命中：按组声明顺序取首个命中 + stderr 告警（归组重叠提示）；单组命中不告警', () => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const doc = {
+    groups: {
+      组A: { model: 'first', members: ['甲', '乙'] },
+      组B: { model: 'second', members: ['甲'] },
+      组C: { model: 'third', members: ['BACKEND-ENGINEER'] },
+    },
+    defaults: { model: 'fallback' },
+  }
+  assert.equal(resolveExpertModel(doc, '甲', warn), 'first', '声明顺序首个命中胜')
+  assert.equal(warns.length, 1)
+  assert.ok(warns[0].includes('甲') && warns[0].includes('组A') && warns[0].includes('组B') && warns[0].includes('归组重叠'), warns)
+  warns.length = 0
+  // 单组命中不告警：'Backend-Engineer' 仅归一命中组C（组A 成员无归一命中）
+  assert.equal(resolveExpertModel(doc, 'Backend-Engineer', warn), 'third')
+  assert.deepEqual(warns, [], '单组命中不告警')
+})
+
+test('T8 多组命中（归一 pass）：两组成员大小写/空白差异同归一命中 → 首个声明组胜 + 告警', () => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const doc = {
+    groups: {
+      组A: { model: 'norm-first', members: ['backend-engineer'] },
+      组B: { model: 'norm-second', members: ['BACKEND-ENGINEER'] },
+    },
+  }
+  // key='Backend-Engineer'：两组成员均无精确（trim）命中，归一（trim+lower）双命中 → 首个声明组胜 + 告警
+  assert.equal(resolveExpertModel(doc, 'Backend-Engineer', warn), 'norm-first')
+  assert.equal(warns.length, 1)
+  assert.ok(warns[0].includes('组A') && warns[0].includes('组B') && warns[0].includes('归组重叠'), warns)
+  // 首个命中组无 model → 组层无值落 defaults（多命中告警照发）
+  warns.length = 0
+  const docNoModel = {
+    groups: {
+      组A: { members: ['甲'] },
+      组B: { model: 'b', members: ['甲'] },
+    },
+    defaults: { model: 'fallback' },
+  }
+  assert.equal(resolveExpertModel(docNoModel, '甲', warn), 'fallback')
+  assert.equal(warns.length, 1)
+})
+
+// ── ⑥ T8 summon 接线 E2E：组/兜底 model 经 agentOptions 下发与预检降级 ────────
+
+test('T8 E2E：组成员/兜底 model 新 summon 生效（链=逐专家>组>defaults）；无 groups/defaults 时与现状逐字节一致', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't8-chain')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // 回归硬门（E2E 侧）：文档仅有 experts 键（无 groups/defaults 键）→ 逐专家 model 照常
+  f.writeDoc({ experts: { 测试专家: { model: 'per-model' } } })
+  await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  assert.equal(specs[0].agentOptions?.model, 'per-model')
+  // 组成员：无 per-expert model → 组级 model 下发
+  f.writeDoc({ experts: {}, groups: { 领域组: { model: 'group-model', members: ['测试专家'] } }, defaults: { model: 'default-model' } })
+  await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  assert.equal(specs[1].agentOptions?.model, 'group-model')
+  // 逐专家 > 组：补 per-expert model 后新 summon 即取逐专家值
+  f.writeDoc({ experts: { 测试专家: { model: 'per-model-2' } }, groups: { 领域组: { model: 'group-model', members: ['测试专家'] } }, defaults: { model: 'default-model' } })
+  await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  assert.equal(specs[2].agentOptions?.model, 'per-model-2')
+  // defaults 兜底：非组成员且无 per-expert model
+  f.writeDoc({ experts: {}, groups: { 领域组: { model: 'group-model', members: ['别人'] } }, defaults: { model: 'default-model' } })
+  await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  assert.equal(specs[3].agentOptions?.model, 'default-model')
+  // 全链未设置：无 agentOptions 键（现状行为零变化）
+  f.writeDoc({ experts: {}, groups: { 领域组: { members: ['别人'] } } })
+  await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  assert.ok(!('agentOptions' in specs[4]), '链上无 model → 无 agentOptions 键')
+  // 组/兜底只承载 model：组成员的 tools/skills 面不受组层影响（无档案行为）
+  f.writeDoc({ experts: {}, groups: { 领域组: { model: 'group-model', members: ['测试专家'] } } })
+  await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  assert.equal(specs[5].agentOptions?.model, 'group-model')
+  assert.ok(!('allow' in specs[5].toolFilter), '组层不承载 tools——toolFilter 无 allow 面')
+  assert.ok(!specs[5].persona.includes('专家档案约束'), '组层不承载 skills——persona 无约束行')
+})
+
+test('T8 E2E：组模型来源经 effort-preflight 降级缝——缺 agentOptions 能力时告警文案含组 model 值（effort-preflight.js:44 语义覆盖组来源）', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't8-degrade')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: {} }) // 无 agentOptions 能力
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  f.writeDoc({ experts: {}, groups: { 领域组: { model: 'group-model', members: ['测试专家'] } }, defaults: { model: 'default-model' } })
+  const captured = []
+  const origWarn = console.warn
+  console.warn = (m) => captured.push(String(m))
+  try {
+    await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  } finally {
+    console.warn = origWarn
+  }
+  assert.ok(!('agentOptions' in specs[0]), '缺能力 provider 不得传 agentOptions')
+  assert.ok(
+    captured.some((m) => m.includes('专家档案 model=group-model 未生效：provider') && m.includes('未声明 agentOptions 能力（旧代宿主，降级可见）')),
+    captured,
+  )
+})
+
+test('T8 E2E：多组命中告警到 host 日志面（console.warn），summon 照常按首个声明组下发', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 't8-overlap')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  f.writeDoc({ experts: {}, groups: { 组A: { model: 'first', members: ['测试专家'] }, 组B: { model: 'second', members: ['测试专家'] } } })
+  const captured = []
+  const origWarn = console.warn
+  console.warn = (m) => captured.push(String(m))
+  try {
+    await summon.execute({ expert: '测试专家', task: '任务' }, { agent: {} })
+  } finally {
+    console.warn = origWarn
+  }
+  assert.equal(specs[0].agentOptions?.model, 'first', '按声明顺序取首个命中')
+  assert.ok(captured.some((m) => m.includes('测试专家') && m.includes('组A') && m.includes('组B') && m.includes('归组重叠')), captured)
+})
+
+// ── ⑦ client.js descriptor 契约对齐（源文本级：client.js 为浏览器模块，node
 // 侧不可 import；既有 client-settings.selftest.mjs 亦以提取面校验，口径一致）──
 
 test('T6 client.js 契约对齐：EXPERT_SOURCES_DESCRIPTORS 含 getExpertProfiles/saveExpertProfiles，host 具名导出同名', () => {

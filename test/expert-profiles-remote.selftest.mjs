@@ -517,3 +517,67 @@ test('T6 client.js 契约对齐：EXPERT_SOURCES_DESCRIPTORS 含 getExpertProfil
   // 参数面：saveExpertProfiles 的 input 参数名/wire 与 host 形参对齐（input）
   assert.ok(clientSrc.includes('jsonParameter("input", "ExpertProfilesDoc"'))
 })
+
+// ── ⑧ lib/remote.js wire 收口（T13）：expertSources 命名空间两方法委托到
+// lib/index.js host 具名实现（T6 交付时 scope 外未做 → 此前远程调用以
+// gateway/method-unavailable 失败）。lib/remote.js 在 dev checkout 降级为
+// plain service（typert 协议不可解析），但方法统一挂 prototype 且不依赖
+// this，故直接取 prototype 方法调用——对 typert/plain 两分支同型成立。
+
+test('T13 wire getExpertProfiles：委托 host 真相——DSH_HOME 注入下返回全局层文档 + 双层 merged 视图', async (t) => {
+  const f = makeProfileFixture(t, 'wire-get')
+  guardProfilesEnv(t)
+  const savedHome = process.env.DSH_HOME
+  process.env.DSH_HOME = f.root
+  t.after(() => {
+    if (savedHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedHome
+  })
+  const svc = (await import('../lib/remote.js')).default
+  assert.equal(typeof svc.prototype.getExpertProfiles, 'function', 'wire 缺 getExpertProfiles 方法')
+  assert.equal(typeof svc.prototype.saveExpertProfiles, 'function', 'wire 缺 saveExpertProfiles 方法')
+  f.writeDoc({ experts: { 测试专家: { model: 'wire-model' } }, defaults: { model: 'wire-fallback' } })
+  const view = await svc.prototype.getExpertProfiles()
+  assert.equal(view.path, f.homePath, 'wire 结果 path 锚点应为 DSH_HOME 注入的全局层路径')
+  assert.deepEqual(view.experts, { 测试专家: { model: 'wire-model' } })
+  assert.deepEqual(view.groups, {})
+  assert.deepEqual(view.defaults, { model: 'wire-fallback' })
+  assert.deepEqual(view.merged, { 测试专家: { model: 'wire-model' }, defaults: { model: 'wire-fallback' } }, 'merged 应为 host 侧双层合并视图（文档形态：experts 条目 + 顶层 groups/defaults 键，无项目层=全局层）')
+})
+
+test('T13 wire saveExpertProfiles：整文档替换委托 + 首写无备份/覆写滚动备份；校验失败 e.key=invalid 经 wire 原样透传且原文件字节不变', async (t) => {
+  const f = makeProfileFixture(t, 'wire-save')
+  guardProfilesEnv(t)
+  const savedHome = process.env.DSH_HOME
+  process.env.DSH_HOME = f.root
+  t.after(() => {
+    if (savedHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedHome
+  })
+  const svc = (await import('../lib/remote.js')).default
+  const saveWire = svc.prototype.saveExpertProfiles
+  const getWire = svc.prototype.getExpertProfiles
+  const r1 = await saveWire({ experts: { 甲: { model: 'm1' } }, defaults: { model: 'fb' } })
+  assert.equal(r1.path, f.homePath)
+  assert.equal(r1.backup, null, '首写（原文件不存在）backup 应为 null')
+  assert.deepEqual(r1.experts, { 甲: { model: 'm1' } })
+  assert.deepEqual(await getWire().then((v) => v.experts), { 甲: { model: 'm1' } }, 'wire 写后 wire 读应 roundtrip 一致')
+  const r2 = await saveWire({ experts: { 乙: { model: 'm2' } } })
+  assert.equal(r2.backup, f.homePath + '.bak', '覆写应产生写前滚动备份')
+  assert.ok(existsSync(r2.backup))
+  // 校验失败经 wire 原样透传：e.key='invalid'（host profilesInvalidError），
+  // 原文件字节不变（err-time 零写副作用）。
+  const before = readFileSync(f.homePath)
+  await assert.rejects(
+    () => saveWire({ experts: { 丙: { unknown_field: 'x' } } }),
+    (e) => e.key === 'invalid' && /专家档案文档非法/.test(e.message),
+  )
+  assert.deepEqual(readFileSync(f.homePath), before, '校验失败后原文件字节必须不变')
+})
+
+test('T13 wire 契约对齐：lib/remote.js 具名导入 host 实现且 wire 方法形参与 client descriptor positional 面一致', async () => {
+  const remoteSrc = readFileSync(join(repoRoot, 'lib', 'remote.js'), 'utf-8')
+  assert.ok(remoteSrc.includes('remoteGetExpertProfiles, remoteSaveExpertProfiles,'), 'remote.js 缺 host 具名导入')
+  assert.ok(remoteSrc.includes('async getExpertProfiles() {'), 'wire 方法缺 getExpertProfiles（descriptor 无参 → wire 无参）')
+  assert.ok(remoteSrc.includes('async saveExpertProfiles(input) {'), 'wire 方法缺 saveExpertProfiles（descriptor [input] → wire positional input）')
+})

@@ -4,6 +4,10 @@
 // loadExpertLessons / withLessonHint）/ P2 方法论分层（extractPersonaMethod /
 // splitPersona）。文件系统用例使用 os.tmpdir() 临时目录，结束后清理，不触碰
 // 仓库内任何数据。
+// T9（gh-issues-1-2）：本文件大量断言按 zh 提示行字面（含 summon E2E 与 model
+// 降级告警逐字节契约）——钉 zh 语言，保证 DSH_EXPERT_REPLY_LANG=en 全量验收
+// 运行时本文件仍按 zh 断言（en 行为面由 test/messages.selftest.mjs 覆盖）。
+process.env.DSH_EXPERT_REPLY_LANG = 'zh'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, renameSync, symlinkSync } from 'node:fs'

@@ -2,6 +2,13 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.14.0] — 2026-11-09
+
+### Added
+
+- **专家分组 model：groups/defaults 与三级优先级链（issue#1，`lib/expert-profiles.js` + `lib/tools.js` + `lib/index.js` + `lib/remote.js`）**: 档案文档 `expert-profiles.json` 顶层新增两个保留键（T6 `b3466d3` 解析 + T8 `fd84f62` 接线）——`groups`：`{"<组名>": {"model": "...", "members": ["<专家名>", …]}}` 领域组级默认（成员名集合指向专家，两目录均可用，同名组项目层覆盖全局层）；`defaults`：`{"model": "..."}` 全档案兜底。生效优先级链**逐专家 > 领域组 > defaults > 未设置=主会话模型**——领域组按声明顺序取首个命中组（未声明 model 视为组层无值继续下落），多组同时声明取声明在前的首个并 stderr 告警；组层/defaults 层 model 以 profile.model 形态过 agentOptions 能力预检。解析读宽松（字段级容错非法值忽略告警）、写严格（设置页校验）；groups/defaults 仅承载 model（effort 留扩展位）；无 groups/defaults 行为逐字节一致（T8 回归硬门）。设置页新增「专家档案」分区（T10 `beda70d`）：逐专家 model/effort 编辑、组列表/组级 model/成员归组带来源 badge、defaults 兜底行、生效来源徽标（逐专家/组/兜底/主会话模型）；远程读写经 wire 薄委托接通（T13 `a1e46b4`，原子写+滚动 `.bak`）。SKILL.md §6 档案段同步补 groups/defaults 说明。回复稿见 `issues/issue-1-reply.md`（待编排者审后发布）。
+- **回复语言选项 replyLanguage（issue#2，`lib/host-settings.js` + `lib/tools.js` + `lib/messages.js` + `lib/index.js`）**: 宿主设置页 Config 新增 `replyLanguage`（`zh|en`，默认 `zh`，volatile，T7 `ff618d3`），env `DSH_EXPERT_REPLY_LANG` 精确 `en`/`zh` 覆盖优先于 Config；读取端缺省/缺失/非法值一律降级 `zh` 零变化。`lib/messages.js` zh/en 字典 39 key 收口全部 lib 注入协议行（auto-claim/自动续领/预算/振荡/断点续跑/经验提示头/effort 预检告警，T9 `3d90d60`）——scope 为**插件生成的提示与协议行**（人读行+模型可读行），`【】` tag 与 console 前缀不译；zh 逐字节一致契约保持（中文行为严格 no-op）。`lib/index.js` apply 一行透传 + wire 收口（T13 `e0e158c`/`a1e46b4`），设置页开关改后新 summon 即时生效。SKILL.md 任务书模板固定段与 persona 正文翻译不在本期（协议面改动需对照实验）；经验池内容、python 工具输出不在本期。回复稿见 `issues/issue-2-reply.md`（待编排者审后发布）。
+
 ## [2.13.4] — 2026-11-04
 
 ### Fixed

@@ -71,7 +71,7 @@
 | 特性 | 说明 |
 |------|------|
 | 🛡️ **委派安全门禁**（WP-7） | 围绕 `summon_expert` 的四层可审计执法：**origin chain 链路溯源**——每次派发在任务书末行追加标记，链上出现重复 (专家, cwd) 对即拒绝且报错含完整链路、深度由链长推导（默认开启，A/B 实验档案见 `docs/internal/experiments/`）；**四小门禁**——工件归属登记（`taskboard.py own`，冲突具名 `artifact_owned`）、A→B→A 委派振荡告警（非阻断）、effort 能力预检、per-cwd 写锁（`DSH_EXPERT_CWD_LOCK=1`，同 cwd 第二位写型专家当场拒绝而非排队）；**per-专家工具调用硬预算**（`DSH_EXPERT_TOOL_BUDGET`，默认关闭）——事件溯源计数（模型自报不计入）、三档（告警/收尾/中断——交付出口永不拒绝）、`budget <id> [--reset]`；**idle-edge 自动续领**（`DSH_EXPERT_IDLE_RECLAIM=1`，默认关闭）——最后一位在途专家成功收尾时经既有 claim 路径以 owner=编排者 领取 ready 无 owner 任务，领取≠派工、绝不自动召唤专家 |
-| 🧩 **per-专家档案与 prompt 瘦身**（WP-6 余项） | `~/.dsh/expert-profiles.json`（全局层）+ `<当前目录>/.dsh/expert-profiles.json`（项目层覆盖）按专家调 model / toolFilter 白黑名单 / skills / MCP server 白名单 / effort，每次 summon 现场重读（热改文件下次召唤即生效）；toolFilter 收窄与递归防护 deny 求并不放宽、空 allow fail-closed；persona 中 `<!-- tools: … -->…<!-- /tools -->` 标记段在点名工具对该专家全部不可见时整段剪除 |
+| 🧩 **per-专家档案与 prompt 瘦身**（WP-6 余项） | `~/.dsh/expert-profiles.json`（全局层）+ 项目层档案 `<会话cwd>/.dsh/expert-profiles.json`（项目层覆盖；路径锚定 **summon 会话工作目录**，每次 summon 现算：显式 cwd 参数 > 宿主会话 cwd > `expertTools.cwd` 配置 > 宿主进程 cwd 兜底——v2.13.6 前锚点固化在宿主进程 cwd，已修复）按专家调 model / toolFilter 白黑名单 / skills / MCP server 白名单 / effort，每次 summon 现场重读（热改文件下次召唤即生效）；toolFilter 收窄与递归防护 deny 求并不放宽、空 allow fail-closed；persona 中 `<!-- tools: … -->…<!-- /tools -->` 标记段在点名工具对该专家全部不可见时整段剪除 |
 | 🧾 **评审台账收口** | v2.7 评审后置 14 项台账全部处置：`taskboard.py --json` 结构化信封、bus 信箱根约定成文、归档同秒碰撞唯一后缀、视图超前/损坏归档板升格 `unrecoverable`，另四项书面裁定留档 |
 | 🔌 **兼容性** | `engines.dsh` / `@deepseek-ai/dsh-tools` 区间自 2.6.0 起未变（静态 semver 矩阵复验，记录见 `docs/internal/verification/`）；PROTOCOL 刷新清单维持 14 项 |
 
@@ -174,7 +174,7 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 
 内置 11 位专家已注册为 **modelInvocable:false 宿主技能**（`skills/expert-gestures/expert-<name>.md`，与 preset 声明一并由 `scripts/gen-preset-declaration.mjs` 从 bundled-core 花名册生成）：在消息里直接输入 `/expert-<名称>`（如 `/expert-backend-engineer`、`/expert-tech-writer`），宿主 pre-step 钩子会**确定性注入**对应手势技能——不消耗模型调用、无模型自主决策环节（此类技能不进模型技能目录，模型经 skill 工具调用会被宿主拒绝，因此不产生任何 token 目录开销）。
 
-手势注入后，persona 仍按文件层前置链现场解析：**项目层 `<cwd>/.dsh/experts/<name>.md` > 全局层 `~/.dsh/experts/<name>.md` > 内置 `skills/expert-orchestration/experts/<name>.md`**（仅按 name 精确匹配，与 summon_expert 语义同源；改文件立即生效）。三层全部未命中时手势显式报加载失败，不会凭记忆模拟专家。
+手势注入后，persona 仍按文件层前置链现场解析：**项目层 `<会话cwd>/.dsh/experts/<name>.md`（锚定 summon 会话工作目录，非宿主进程当前目录；v2.13.6 修复）> 全局层 `~/.dsh/experts/<name>.md` > 内置 `skills/expert-orchestration/experts/<name>.md`**（仅按 name 精确匹配，与 summon_expert 语义同源；改文件立即生效）。三层全部未命中时手势显式报加载失败，不会凭记忆模拟专家。
 
 边界与冲突裁决：手势**仅覆盖稳定花名册**——文件层专家（随建随变）与来源包专家（随来源管理）不注册手势；手势名与既有技能同名冲突由宿主确定性裁决（同层 rank 升序：项目 `.dsh/skills`=100 < 项目 `.agents/skills`=200 < 本 preset 手势=300 < 全局 `~/.dsh/skills`=400 < `~/.agents/skills`=500；跨层就近层整体胜出，败者告警忽略）——用户项目层自建同名技能确定性地优先于手势。两代宿主（0.1.7-alpha.2 与 0.2.x）技能声明行格式与手势机制逐维一致（验证记录见 `docs/internal/verification/`）；已部署 preset 的手势层随下一次 VERSION 标记刷新生效（需重启级验证的项见该记录「待用户重启后补测」）。
 

@@ -2,6 +2,7 @@
 
 > 回复对象：[issue #1 — 目前不能给expert的专家指定模型，只能用主会话的模型](https://github.com/mario841859784/dsh-expert-orchestrator/issues/1)（@XSANElimos）
 > 状态：草稿，待编排者审后发布。本稿对应 v2.13.5。
+> 勘误备注：正文项目层表述已按 v2.13.6 修复语义勘正（锚定 summon 会话 cwd）；已发布评论 6730390548 的勘误跟进稿见 issues/issue-1-followup.md。
 
 ---
 
@@ -9,7 +10,7 @@
 
 ## 逐专家指定 model（v2.8 起已有，v2.13.5 补齐设置页与远程读写）
 
-专家档案文件 `~/.dsh/expert-profiles.json`（全局层）与 `<当前工作目录>/.dsh/expert-profiles.json`（项目层，同名专家项目层覆盖全局层）中，给任意专家配置 `model` 字段即可：
+专家档案文件 `~/.dsh/expert-profiles.json`（全局层）与项目层档案 `<会话工作目录>/.dsh/expert-profiles.json`（项目层，同名专家项目层覆盖全局层；项目层路径锚定的是 **summon 会话的工作目录**——由 summon 显式 cwd 参数、宿主会话 cwd 或 `expertTools.cwd` 配置解析，而非宿主进程的当前目录）中，给任意专家配置 `model` 字段即可：
 
 ```json
 {

@@ -1,11 +1,11 @@
 # Issue #2 Reply draft (English)
 
 > Target: [issue #2 — Add an option to choose the plugin's reply language](https://github.com/mario841859784/dsh-expert-orchestrator/issues/2) (@DarkHeros09)
-> Status: draft, awaiting orchestrator review before publishing. Matches v2.14.0.
+> Status: draft, awaiting orchestrator review before publishing. Matches v2.13.5.
 
 ---
 
-Thanks for the suggestion! v2.14.0 adds a **reply language option** with two switches:
+Thanks for the suggestion! v2.13.5 adds a **reply language option** with two switches:
 
 ## How to switch to English
 
@@ -31,6 +31,6 @@ Mechanical markers (`【…】` tags) and console prefixes stay untranslated so 
 
 ## For developers
 
-The strings live in a `zh`/`en` dictionary (`lib/messages.js`). The `zh` output is byte-for-byte identical to pre-2.14.0, so Chinese-language behavior is a strict no-op — the translation surface only activates when `en` is selected.
+The strings live in a `zh`/`en` dictionary (`lib/messages.js`). The `zh` output is byte-for-byte identical to pre-2.13.5, so Chinese-language behavior is a strict no-op — the translation surface only activates when `en` is selected.
 
 Feel free to follow up if the English coverage misses any line you run into.

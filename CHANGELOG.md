@@ -2,7 +2,7 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
-## [2.14.0] — 2026-11-09
+## [2.13.5] — 2026-11-09
 
 ### Added
 

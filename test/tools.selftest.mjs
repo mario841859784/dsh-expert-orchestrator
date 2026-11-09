@@ -38,6 +38,7 @@ import {
   parseTaskIds,
   parseToolGuidanceSections,
   pruneUnavailableToolSections,
+  profileKeyAliasResolver,
   registerExpertTools,
   RESUMABLE_STOP_REASONS,
   RESUME_PROGRESS_MAX_ITEMS,
@@ -280,6 +281,38 @@ test('resolveExpert: alias 指向不存在的 source/path → missing', () => {
   const broken = { aliases: { 野名: { source: 'nowhere', path: 'x.md' } } }
   assert.equal(resolveExpert([solo], broken, '野名').reason, 'missing')
   assert.equal(resolveExpert([solo], null, '孤名专家').ok, true) // aliases 缺省不炸
+})
+
+// ── T2（gh-issues-1-2 追问）：档案键/groups members 别名反查器 ───────────────
+test('T2 profileKeyAliasResolver: alias 反查 > title 唯一反查；title 多命中宁拒勿猜；无表/查不到=null', () => {
+  const candidates = [
+    { source: 'bundled-core', file: 'be.md', name: 'backend-engineer', title: '后端工程师' },
+    { source: 'bundled-core', file: 'f1.md', name: 'fe-a', title: '重复title' },
+    { source: 'bundled-core', file: 'f2.md', name: 'fe-b', title: '重复title' },
+    { source: 'agency-agents-zh', file: 'engineering/engineering-git-workflow-master.md', name: 'Git 工作流大师', title: 'Git 工作流大师' },
+  ]
+  const aliases = { aliases: { 'Git 工作流工程师': { source: 'agency-agents-zh', path: 'engineering/engineering-git-workflow-master.md', nativeName: 'Git 工作流大师', match: 'renamed' } } }
+  const r = profileKeyAliasResolver(aliases, candidates)
+  assert.equal(r('后端工程师'), 'backend-engineer', 'title 唯一反查（bundled-core 中文显示名）')
+  assert.equal(r(' 后端工程师 '), 'backend-engineer', 'trim 后反查')
+  assert.equal(r('Git 工作流工程师'), 'Git 工作流大师', 'alias 惯用名 → nativeName')
+  assert.equal(r('重复title'), null, 'title 多命中宁拒勿猜')
+  assert.equal(r('野名'), null, '查不到=null')
+  assert.equal(r(''), null)
+  assert.equal(r(null), null)
+  // alias 优先于 title：同键两路可达时以 alias 表为准（与 resolveExpert 链序一致）
+  const aliases2 = { aliases: { '后端工程师': { source: 'x', path: 'y.md', nativeName: 'backend-engineer-v2', match: 'exact' } } }
+  assert.equal(profileKeyAliasResolver(aliases2, candidates)('后端工程师'), 'backend-engineer-v2')
+  // 降级路径：无别名表 → title 反查仍可用；无花名册 → alias 反查仍可用
+  assert.equal(profileKeyAliasResolver(null, candidates)('后端工程师'), 'backend-engineer')
+  assert.equal(profileKeyAliasResolver(aliases, null)('Git 工作流工程师'), 'Git 工作流大师')
+  // 双双缺失：恒 null（未传 resolver 之外的第二重零变化前提）
+  assert.equal(profileKeyAliasResolver(null, null)('后端工程师'), null)
+  // alias 条目缺 nativeName → 落 title 唯一反查兜住；兜不住 → null
+  const aliases3 = { aliases: { '后端工程师': { source: 'x', path: 'y.md', match: 'exact' } } }
+  assert.equal(profileKeyAliasResolver(aliases3, candidates)('后端工程师'), 'backend-engineer')
+  const aliases4 = { aliases: { 野名: { source: 'x', path: 'y.md', match: 'exact' } } }
+  assert.equal(profileKeyAliasResolver(aliases4, candidates)('野名'), null)
 })
 
 test('EXPERT_TOOLS_DENY_LIST: 递归防护清单冻结且含派生工具', () => {
@@ -6472,6 +6505,65 @@ test('T34 备忘(a) E2E：tools.allow=[] 空数组 fail-closed——toolFilter.a
     '消费面 fail-closed：点名工具全部不可见 → guidance 段全剪（#17 联动）',
   )
   assert.ok(specs[0].persona.includes('正文'), '段外正文不受影响')
+})
+
+// ── T2（gh-issues-1-2 追问）：档案键别名反查 summon 全链 E2E ─────────────────
+test('T2 E2E：档案键 后端工程师/软件架构师/backend-engineer 三形态命中；groups members 中文归组同缝；查不到=title 缺失=现状零变化', async (t) => {
+  guardProfilesEnv(t)
+  guardT26Env(t)
+  const f = makeProfileFixture(t, 't2-alias-reverse')
+  const rosterPath = join(f.dst, 'expert-sources', 'merged', 'roster.json')
+  const aliasesPath = join(f.dst, 'skills', 'expert-orchestration', 'roster-aliases.json')
+  mkdirSync(join(f.dst, 'skills', 'expert-orchestration'), { recursive: true })
+  const writeRoster = (withTitles) => writeFileSync(rosterPath, JSON.stringify({
+    core: [
+      withTitles
+        ? { source: 'bundled-core', file: 'be.md', name: 'backend-engineer', title: '后端工程师' }
+        : { source: 'bundled-core', file: 'be.md', name: 'backend-engineer' },
+      { source: 'agency-agents-zh', file: 'engineering/engineering-software-architect.md', name: '软件架构师', title: '软件架构师' },
+    ],
+  }))
+  const writeAliases = () => writeFileSync(aliasesPath, JSON.stringify({
+    aliases: { '软件架构师': { source: 'agency-agents-zh', path: 'engineering/engineering-software-architect.md', nativeName: '软件架构师', match: 'exact' } },
+  }))
+  writeRoster(true)
+  writeAliases()
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, {
+    dst: f.dst,
+    autoClaimCwd: f.root,
+    profilesPaths: { homePath: f.homePath, projectPath: f.projectPath },
+    getExpertContentImpl: () => ({ content: 'persona 正文' }),
+  })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const summonAs = async (name) => {
+    const at = specs.length
+    await summon.execute({ expert: name, task: '任务' }, { agent: {} })
+    return specs[at]
+  }
+  // ① 三形态档案键：中文 title 键 ↔ 原生名查询（title 反查）；zh 原生名键直查；
+  //    中文显示名 summon（title 解析）与英文 id summon 命中同一档案键
+  f.writeProfiles({ '后端工程师': { model: 'm-be' }, '软件架构师': { model: 'm-arch' } })
+  assert.equal((await summonAs('backend-engineer')).agentOptions?.model, 'm-be', '英文 id summon → 中文 title 档案键命中')
+  assert.equal((await summonAs('后端工程师')).agentOptions?.model, 'm-be', '中文 title summon → 同一档案键（与 ① 逐字节同缝）')
+  assert.equal((await summonAs('软件架构师')).agentOptions?.model, 'm-arch', 'zh 原生名（alias 表 exact 键）档案键命中')
+  // ② groups members 中文归组同缝生效（组层 resolveExpertModel 经同一反查器）
+  //    （writeProfiles 帮手只承载 experts 面，groups 面直接写原始文档）
+  writeFileSync(f.projectPath, JSON.stringify({
+    experts: {},
+    groups: { 后端组: { model: 'grp-be', members: ['后端工程师'] }, 架构组: { model: 'grp-arch', members: ['软件架构师'] } },
+  }, null, 2))
+  assert.equal((await summonAs('backend-engineer')).agentOptions?.model, 'grp-be', 'members 中文 title 归组 → 原生名 summon 命中组层')
+  assert.equal((await summonAs('后端工程师')).agentOptions?.model, 'grp-be', '中文 summon 同缝命中组层')
+  assert.equal((await summonAs('软件架构师')).agentOptions?.model, 'grp-arch', 'members zh 原生名（alias 反查）归组命中')
+  // ③ 查不到 → 现状零变化：花名册条目无 title（title 反查无源）→ 无档案面输出
+  writeRoster(false)
+  f.writeProfiles({ '后端工程师': { model: 'm-be' } })
+  const bare = await summonAs('backend-engineer')
+  assert.ok(!('agentOptions' in bare), 'title 缺失 → 反查不命中 → 无 agentOptions 键（现状行为）')
+  // ④ title 恢复后同缝恢复命中（证明 ③ 的未命中确由 title 反查缺源驱动）
+  writeRoster(true)
+  assert.equal((await summonAs('backend-engineer')).agentOptions?.model, 'm-be')
 })
 
 // ═══════════════════════════════════════════════════════════════════════════

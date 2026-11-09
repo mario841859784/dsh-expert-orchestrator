@@ -383,6 +383,59 @@ test('T8 优先级链四档：逐专家 > 领域组 > defaults > 未设置=null�
   assert.deepEqual(warns, [], '单组命中/未命中零告警')
 })
 
+// ── T2（gh-issues-1-2 追问）：档案键别名反查——profileForExpert / resolveExpertModel
+// 可选 aliasResolver 参数；未传 = 行为零变化（现状逐字节）。resolver 替身在此以
+// 手工映射模拟 lib/tools.js profileKeyAliasResolver 的产出形态（(key) => 原生名
+// | null），该工厂本体与其 summon 接线 E2E 在 test/tools.selftest.mjs 覆盖。
+
+test('T2 profileForExpert 别名反查：档案键=惯用名/title 经 aliasResolver 归一命中；未传/反查不命中=零变化；保留键守卫约束反查遍', () => {
+  // 替身映射：后端工程师→backend-engineer（title 反查形态）、Git 工作流工程师→
+  // Git 工作流大师（roster-aliases 惯用名反查形态）
+  const resolver = (k) => ({ '后端工程师': 'backend-engineer', 'Git 工作流工程师': 'Git 工作流大师' }[k] ?? null)
+  const profiles = { '后端工程师': { model: 'm-be' }, 'Git 工作流工程师': { tools: { deny: ['bash'] } } }
+  // ① 中文 title 键对原生名查询命中
+  assert.deepEqual(profileForExpert(profiles, 'backend-engineer', resolver), { model: 'm-be' })
+  // ② 归一口径（trim+lower）在反查后同样成立（与既有双遍一致）
+  assert.deepEqual(profileForExpert(profiles, ' Backend-Engineer ', resolver), { model: 'm-be' })
+  // ③ 惯用名键对重命名后的原生名查询命中
+  assert.deepEqual(profileForExpert(profiles, 'Git 工作流大师', resolver), { tools: { deny: ['bash'] } })
+  // ④ 未传 / 非 resolver → 与现状逐字节一致（null）
+  assert.equal(profileForExpert(profiles, 'backend-engineer'), null)
+  assert.equal(profileForExpert(profiles, 'backend-engineer', null), null)
+  // ⑤ 反查不命中 → null（调用方按无档案走）
+  assert.equal(profileForExpert(profiles, '其他人', resolver), null)
+  // ⑥ 保留键守卫同样约束反查遍：resolver 即便把 'defaults' 映射到原生名，
+  //    groups/defaults 增量字段也永不作为专家条目命中
+  const guardResolver = (k) => (k === 'defaults' || k === '后端工程师' ? 'backend-engineer' : null)
+  const doc = { groups: { 组A: { model: 'g1', members: [] } }, defaults: { model: 'd1' }, '后端工程师': { model: 'm-be' } }
+  assert.deepEqual(profileForExpert(doc, 'backend-engineer', guardResolver), { model: 'm-be' }, '经合法键命中而非 defaults 增量字段')
+  assert.equal(profileForExpert({ defaults: { model: 'd1' } }, 'backend-engineer', guardResolver), null)
+  // ⑦ 确定性：两键反查归一到同一原生名 → 键序首个命中
+  const dup = { '后端工程师': { model: 'first' }, 'BE 别名': { model: 'second' } }
+  assert.deepEqual(profileForExpert(dup, 'backend-engineer', (k) => ({ '后端工程师': 'backend-engineer', 'BE 别名': 'backend-engineer' }[k] ?? null)), { model: 'first' })
+})
+
+test('T2 resolveExpertModel 别名反查：per-expert 与组层 members 同缝归一；未传=零变化；反查不命中→链照旧', () => {
+  const warns = []
+  const warn = (m) => warns.push(m)
+  const resolver = (k) => ({ '后端工程师': 'backend-engineer', 'DevOps 自动化工程师': 'DevOps 自动化师' }[k] ?? null)
+  // ① per-expert 档案键中文 → 命中
+  const flat = { '后端工程师': { model: 'm1' } }
+  assert.equal(resolveExpertModel(flat, 'backend-engineer', warn, resolver), 'm1')
+  assert.equal(resolveExpertModel(flat, 'backend-engineer', warn), null, '未传 resolver=现状行为（null）')
+  // ② 组 members 中文归组（精确遍经反查命中）
+  const doc = { groups: { 后端组: { model: 'g1', members: ['后端工程师'] } } }
+  assert.equal(resolveExpertModel(doc, 'backend-engineer', warn, resolver), 'g1')
+  assert.equal(resolveExpertModel(doc, 'backend-engineer', warn), null, '未传 resolver=现状行为（组不命中）')
+  // ③ 归一（lower）遍经反查同样成立
+  assert.equal(resolveExpertModel(doc, 'Backend-Engineer', warn, resolver), 'g1')
+  // ④ 反查不命中 → 链照旧走 defaults（反查绝不放大命中面）
+  const doc2 = { groups: { 后端组: { model: 'g1', members: ['后端工程师'] }, 运维组: { model: 'g2', members: ['DevOps 自动化工程师'] } }, defaults: { model: 'd1' } }
+  assert.equal(resolveExpertModel(doc2, '其他人', warn, resolver), 'd1')
+  assert.equal(resolveExpertModel(doc2, 'DevOps 自动化师', warn, resolver), 'g2', '重命名惯用名成员反查命中')
+  assert.deepEqual(warns, [], '零告警')
+})
+
 test('T8 多组命中：按组声明顺序取首个命中 + stderr 告警（归组重叠提示）；单组命中不告警', () => {
   const warns = []
   const warn = (m) => warns.push(m)

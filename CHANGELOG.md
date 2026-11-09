@@ -2,6 +2,14 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.6] — 2026-11-10
+
+### Fixed
+
+- **项目层锚点 cwd 缝——档案/任务板/续跑/写锁等 8 处从宿主进程 cwd 改为 summon 会话 cwd（T1 `001533d`, `lib/session-cwd.js` + `lib/tools.js` + `lib/index.js`）**: 新增单点解析缝 `resolveSessionCwd`（显式 `cwd` 参数 > 宿主会话 cwd（`workingDirectory get(session)`，降级 `exec.agent.session.header.cwd`）> `expertTools.cwd` 配置 > `process.cwd()` 兜底），专家档案、任务板、续跑、写锁等 8 处项目层锚点全部改经此缝注册/解析，不再固化宿主进程 cwd；`summon_expert`/`summon_experts` 增可选 `cwd` 参数（不传行为不变）。
+- **专家档案键别名反查（T2 `bee8979`, `lib/expert-profiles.js`）**: 档案键以惯用名（roster-aliases）或花名册显示名（title）书写时归一为原生名命中；`groups.members` 同缝归一；未传/查不到行为不变。
+- **文档：项目层档案路径表述勘误（T3 `f09d8d5`, `README.md`/`README.zh.md`/`skills/expert-orchestration/SKILL.md`/`issues/issue-1-reply.md`）**: 对齐 2.13.6 解析缝语义（T1）；另落盘 issue#1 跟进评论稿 `issues/issue-1-followup.md`（待编排者审后发布）。
+
 ## [2.13.5] — 2026-11-09
 
 ### Added

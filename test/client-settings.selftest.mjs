@@ -209,14 +209,59 @@ test('expandedSources: useState(new Set()) 声明与 setter 引用齐备（free 
   assert.ok(declareAt >= 0 && useAt > declareAt)
 })
 
-test('expandedSources: toggle 不可变更新 + disclosure 接线（aria-expanded/Esc 收起）', () => {
+test('expandedSources: toggle 不可变更新 + kit DisclosureRow 接线（v2.13.9 换皮）', () => {
   // toggleExpandedSource：经闭包 setter 不可变 Set 增删（直改 prev 视为回归）
   assert.match(source, /setExpandedSources\(function \(prev\) \{\s*var next = new Set\(prev\);/)
-  // disclosure 按钮：aria-expanded/aria-controls 指向 region，onClick 走 toggle
-  assert.match(source, /"aria-expanded": expanded, "aria-controls": filesRegionId/)
-  assert.match(source, /onClick: function \(\) \{ toggleExpandedSource\(source\.id\); \}/)
-  // region Esc 收起复用同一 toggle（回焦触发按钮）
+  // 来源行披露归 kit DisclosureRow：受控 open + onToggle 走同一 toggle（aria-expanded 归 kit leading 按钮）
+  assert.match(source, /var filesDisclosure = fileList\.length === 0 \? null : React\.createElement\(Primitives\.DisclosureRow, \{/)
+  assert.match(source, /open: expanded,/)
+  assert.match(source, /onToggle: function \(\) \{ toggleExpandedSource\(source\.id\); \},/)
+  // region Esc 收起复用同一 toggle
   assert.match(source, /if \(event\.key !== "Escape"\) return;\s*toggleExpandedSource\(source\.id\);/)
+})
+
+// ---------- v2.13.9 kit 换皮不变量（seed require / 成员哨兵 / 残余 CSS / kit 消费） ----------
+
+test('seed require：@deepseek-ai 前缀与无 scope 两形态探测 + 降级哨兵（不抛错）', () => {
+  assert.match(source, /require\("@deepseek-ai\/dsh-client-ui-primitives"\)/)
+  assert.match(source, /require\("dsh-client-ui-primitives"\)/)
+  // 2.13.9 修正：kit 缺失/成员不合一律降级（KIT_DEGRADED + 占位面板），不再装载期 throw
+  assert.match(source, /dsh-client-ui-primitives 不可用（宿主 seed 表缺失）/)
+  assert.match(source, /var KIT_REQUIRED = \["Button", "Input", "Modal", "Switch", "StateDot", "Tag", "Pill", "DisclosureRow"\];/)
+  // 成员判定双形态：普通函数 或 带 $$typeof symbol 的 React 组件对象（forwardRef/memo）
+  assert.match(source, /typeof kitMember === "function"/)
+  assert.match(source, /typeof kitMember\.\$\$typeof === "symbol"/)
+  assert.match(source, /var KIT_DEGRADED = false;/)
+  assert.match(source, /设置面板降级为错误占位，任务板不受影响 \(degraded\)/)
+  // 装载期硬失败仅剩 react 哨兵（kit 面不得再抛）
+  assert.doesNotMatch(source, /throw new Error\("dsh-expert-orchestrator client: dsh-client-ui-primitives/)
+  assert.match(source, /throw new Error\("dsh-expert-orchestrator client: react 不可用"\)/)
+})
+
+test('kit 消费：八类原子组件全部经 Primitives.* 引用', () => {
+  for (const member of ['Button', 'Input', 'Modal', 'Switch', 'StateDot', 'Tag', 'Pill', 'DisclosureRow']) {
+    assert.match(source, new RegExp('Primitives\\.' + member + '\\b'), 'Primitives.' + member + ' 应被消费')
+  }
+})
+
+test('残余设置区 CSS：零 hex/rgba 字面量（控件视觉全归 kit）', () => {
+  const cssStart = source.indexOf('var CSS = [')
+  assert.ok(cssStart >= 0, 'var CSS = [ 应存在')
+  const cssEnd = source.indexOf('].join("\\n");', cssStart)
+  assert.ok(cssEnd > cssStart, 'CSS 数组应以 ].join 结束')
+  const css = source.slice(cssStart, cssEnd)
+  assert.doesNotMatch(css, /#[0-9a-fA-F]{3,8}\b/)
+  assert.doesNotMatch(css, /rgba?\(/)
+  // 控件样式类不得回流：换皮后这些视觉全归 kit
+  for (const gone of ['eso-set-btn', 'eso-set-badge', 'eso-set-dot', 'eso-set-switch', 'eso-set-navbtn', 'eso-set-linkbtn', 'eso-set-warnbadge', 'eso-set-modal-overlay']) {
+    assert.ok(!css.includes(gone), '残余 CSS 不应含 ' + gone)
+  }
+})
+
+test('kit Modal 本地化：closeLabel 词条 zh/en 各一次', () => {
+  const count = source.split(/"modal\.close":/).length - 1
+  assert.equal(count, 2)
+  assert.match(source, /closeLabel: t\("modal\.close"\)/)
 })
 
 // ---------- T10 专家档案与分组：生效来源徽标推导（硬门抽查 3 例） ----------
@@ -364,12 +409,13 @@ test('profiles 面板接线：加载/保存/invalid 错误分支/分区与 nav �
   assert.match(source, /id: "eso-set-sec-profiles", "aria-label": t\("profiles\.title"\)/)
 })
 
-test('profiles 分组 disclosure：expandedGroups useState(new Set()) + aria-controls 接线（回归钉死）', () => {
+test('profiles 分组 disclosure：expandedGroups useState(new Set()) + kit DisclosureRow 接线（回归钉死）', () => {
   assert.match(source, /var expandedGroupsState = React\.useState\(new Set\(\)\)/)
   assert.match(source, /var expandedGroups = expandedGroupsState\[0\]/)
   assert.match(source, /setExpandedGroups\(function \(prev\) \{\s*var next = new Set\(prev\);/)
-  assert.match(source, /"aria-controls": groupRegionId,/)
-  assert.match(source, /onClick: function \(\) \{ toggleExpandedGroup\(groupName\); \}/)
+  // 分组成员披露归 kit DisclosureRow：受控 open + onToggle（aria-expanded 归 kit）
+  assert.match(source, /open: isExpanded,/)
+  assert.match(source, /onToggle: function \(\) \{ toggleExpandedGroup\(groupName\); \},/)
   // 成员归组视图来源标注（expertSourceLabels 在组件内消费）
   assert.match(source, /expertSourceLabels\(snapshot\.sources, customList\)/)
 })
@@ -398,4 +444,117 @@ test('T10 双语词条：每个新 key 在 zh/en 字典各声明一次', () => {
     const count = source.split(pattern).length - 1
     assert.equal(count, 2, 'key "' + key + '" 应在 zh/en 各声明一次，实际 ' + count + ' 次')
   }
+})
+
+// ---------- 2.13.9 全文件装载 harness（真实 kit 形状回归钉） ----------
+// 首版成员哨兵误写 `typeof !== "function"` 误伤 forwardRef/memo 组件对象，装载期第一轮
+// 即抛错拖垮整个 web boot（desktop 4 次崩溃实证）；静态断言钉不住装载行为——本组用例
+// 真实执行 client.js 全文：window stub 捕获 factory，require 桩按宿主 0.2.2-rc.1 真实
+// kit 形状供给（Button/Input=forwardRef、DisclosureRow=memo，typeof 均为 "object"）。
+
+const reactStub = {
+  createElement: (type, props, ...children) => ({ $$react: true, type, props: props ?? {}, children }),
+}
+
+const makeForwardRefStub = () => ({ $$typeof: Symbol.for('react.forward_ref'), render: function () {} })
+const makeMemoStub = () => ({ $$typeof: Symbol.for('react.memo'), type: function () {} })
+const realShapeKit = () => ({
+  Button: makeForwardRefStub(), Input: makeForwardRefStub(),
+  Modal: function () {}, Switch: function () {}, StateDot: function () {},
+  Tag: function () {}, Pill: function () {}, DisclosureRow: makeMemoStub(),
+})
+
+const loadClientBundle = ({ kit } = {}) => {
+  let factory = null
+  const windowStub = { __ModuleLoader__: { load: (m) => { factory = m.factory } } }
+  const requireStub = (name) => {
+    if (name === 'react') return reactStub
+    if (name === '@deepseek-ai/dsh-client-ui-primitives' || name === 'dsh-client-ui-primitives') {
+      if (kit === 'missing') throw new Error('Cannot find module')
+      if (typeof kit === 'function') return kit()
+      return realShapeKit()
+    }
+    throw new Error('unexpected require: ' + name)
+  }
+  new Function('window', source)(windowStub)
+  assert.ok(factory, 'factory 未被 window.__ModuleLoader__.load 捕获')
+  return factory(requireStub)
+}
+
+/** apply 的 ctx stub（对照宿主 cordis 契约实测形状）：
+ *  - effect no-op（样式/词条 effect 需要 document，测试不执行）；
+ *  - slots.inject 必须真调用 cb（inject 返回 disposer，注册对象在 slots.register 捕获）；
+ *  - ctx.inject no-op → 任务板内层插件保持休眠；apply 为 async，须 await。 */
+const makeApplyCtx = () => {
+  const registered = []
+  const injected = []
+  return {
+    registered,
+    injected,
+    ctx: {
+      effect: () => {},
+      locale: { register: () => {}, bind: () => (key) => key },
+      remote: { $mount: async () => () => {} },
+      get: (name) => (name === 'remote.expertSources' ? {} : undefined),
+      slots: {
+        inject: (name, cb) => { injected.push(name); return cb() },
+        register: (meta, component) => { registered.push({ meta, component }); return () => {} },
+      },
+      inject: () => {},
+    },
+  }
+}
+
+// 递归收集 createElement 产物树中的 type，供「占位产物零 kit 组件类型」断言
+const collectTypes = (node, out = []) => {
+  if (node == null || typeof node !== 'object') return out
+  if (node.$$react) {
+    out.push(node.type)
+    for (const child of [].concat(node.children ?? [])) collectTypes(child, out)
+  }
+  return out
+}
+
+test('2.13.9 装载回归钉：宿主真实 kit 形状（forwardRef/memo 对象）→ 装载成功不抛', () => {
+  const mod = loadClientBundle()
+  assert.equal(typeof mod.apply, 'function')
+  assert.ok(Array.isArray(mod.inject))
+})
+
+test('2.13.9 真形状 kit → apply 注册真设置面板（summary 走 settings.desc）', async () => {
+  const mod = loadClientBundle()
+  const h = makeApplyCtx()
+  await mod.apply(h.ctx)
+  assert.deepEqual(h.injected, ['plugins.bundle.config'])
+  assert.equal(h.registered.length, 1)
+  // t 桩返回键名：真面板 summary = settings.desc，占位面板 = set.kitDegraded（行为区分钉）
+  assert.equal(h.registered[0].component({ view: 'summary' }), 'settings.desc')
+})
+
+test('2.13.9 kit 整体缺失 → 装载不抛 + 占位面板契约（summary 字符串 / detail div / 零 kit 类型）', async () => {
+  const mod = loadClientBundle({ kit: 'missing' })
+  const h = makeApplyCtx()
+  await mod.apply(h.ctx)
+  assert.deepEqual(h.injected, ['plugins.bundle.config'])
+  assert.equal(h.registered.length, 1)
+  const panel = h.registered[0].component
+  assert.equal(panel({ view: 'summary' }), 'set.kitDegraded')
+  const detail = panel({})
+  assert.equal(detail.type, 'div')
+  for (const type of collectTypes(detail)) {
+    assert.equal(typeof type, 'string', '占位产物树不得含 kit 组件类型')
+  }
+  const text = JSON.stringify(detail.children)
+  assert.ok(text.includes('dsh-client-ui-primitives 不可用'), '占位应含哨兵 reason：' + text)
+  assert.ok(text.includes('set.kitDegraded'))
+})
+
+test('2.13.9 kit 成员缺失（删 Tag）→ 同降级路径，reason 点名缺失成员', async () => {
+  const mod = loadClientBundle({ kit: () => { const k = realShapeKit(); delete k.Tag; return k } })
+  const h = makeApplyCtx()
+  await mod.apply(h.ctx)
+  assert.equal(h.registered.length, 1)
+  const detail = h.registered[0].component({})
+  assert.equal(detail.type, 'div')
+  assert.ok(JSON.stringify(detail.children).includes('dsh-client-ui-primitives.Tag 不可用'))
 })

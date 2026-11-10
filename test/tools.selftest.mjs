@@ -946,7 +946,9 @@ const runBus = (cwd, args, env = {}) => {
 }
 
 const makeBusDir = (t, label) => {
-  const dir = mkdtempSync(join(tmpdir(), `wp2-bus-${label}-`))
+  // realpath 归一为物理路径：macOS 下 tmpdir() 可能是 /var/...（symlink），子进程 python3 os.getcwd() 只见物理路径 /private/var/...，
+  // 路径断言（如附件行）两侧须同源，否则干净 clone 上确定性假失败。
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), `wp2-bus-${label}-`)))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   return dir
 }

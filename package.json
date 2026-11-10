@@ -55,6 +55,7 @@
   "files": [
     "lib",
     "skills",
+    "!skills/trim-cli",
     "expert-lessons",
     "expert-methods",
     "agent.cordis.yml",

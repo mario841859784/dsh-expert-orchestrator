@@ -163,8 +163,20 @@ function nasNpmPath(installed) {
   }
   const got = verify()
   if (got !== latest) die(1, `升级后校验失败：实装 ${got} ≠ ${latest}。输出：${r.stdout?.trim()}`)
+  normalizeNasPerms()
   log(`✓ NAS 实装 ${got}（依赖级安装，pnpm-lock 已随动）。`)
   return maybeRestart()
+}
+
+/** 权限归一（必须，升级/file: 安装后都要跑）：dsh web 以 fnOS 应用用户 Harness 运行，
+ *  而本脚本经 ssh 以普通用户跑 pnpm——重建的 node_modules 全部带属主 restrictive 模式
+ *  （ssh umask 077 → 700），Harness 用户读不了任何 manifest → 全部 profile bundle skip
+ *  + dsh-app-boot scandir EACCES 崩溃（2.13.9 发版夜实证）。属主 chown 回 Harness 需
+ *  root 不可得，以 chmod a+rX 恢复可读性。 */
+function normalizeNasPerms() {
+  log('归一 node_modules 权限（宿主以应用用户 Harness 读取）…')
+  const r = ssh(`chmod -R u+rwX,go+rX ${NAS_PROFILE}/node_modules ${NAS_PROFILE}/package.json ${NAS_PROFILE}/pnpm-lock.yaml 2>&1 | tail -1`)
+  if (r.status !== 0) die(1, `chmod 归一失败：${r.stderr?.trim()}`)
 }
 
 /** 备用路径：工作区 ff-only pull → profile 改 file: 直连。 */
@@ -184,6 +196,7 @@ function nasFile() {
   const got = nasInstalledVersion()
   const wsVer = sshOut(`grep -m1 '"version"' ${NAS_WS}/package.json | sed 's/.*: *"\\(.*\\)".*/\\1/'`)
   if (got !== wsVer) die(1, `file: 安装后校验失败：实装 ${got} ≠ 工作区 ${wsVer}。输出：${r.stdout?.trim()}`)
+  normalizeNasPerms()
   log(`✓ NAS 已 file: 直连工作区（${wsVer} @ ${sshOut(`git -C ${NAS_WS} log --oneline -1`)}）。`)
   return maybeRestart()
 }

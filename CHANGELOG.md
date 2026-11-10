@@ -2,6 +2,15 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.7] — 2026-11-10
+
+### Fixed
+
+- **『来源名/原名』消歧语法死路——报错承诺的语法接入解析链 + 失败如实归因（近 14 天 259 次 expert 工具调用审计，`lib/tools.js` + `skills/expert-orchestration/SKILL.md`）**: `resolveExpert` 解析链在 ① name 精确命中后新增 **② source/name 通道**（仅 query 含 `/` 且 ① 未中时激活，含 `/` 的合法原生名由 ① 先手接住不被误拆；name 按原生 name 或来源内相对 file 路径归一匹配——后者兼容旧报错清单的 `source/file` 形态整串回填；容忍斜杠两侧空格与尾部 `.md`，审计实录三形态 `bundled-core/code-reviewer`、`bundled-core/code-reviewer.md`、`bundled-core / devops-engineer.md` 全命中）。根因：SKILL.md §6 与四处报错文案长期承诺『来源名+原名』消歧语法，但解析链无对应通道，模型照提示重试必败（审计 10 次浪费：11-07 连败 6 次、11-04 连败 4 次、11-01/11-03 各 1 轮，全靠猜中文显示名恢复；NAS 部署 merged roster 未重建、awesome 副本无 shadowed 标记，同名跨源歧义现实可达）。配套如实化：歧义清单改可召唤形式 `source/name（title）` + 尾注「可直接作为 expert 参数召唤」；`source/name` 失败归因三类分述（来源不存在或未启用 / 来源中无此名 / 指向去重遮蔽副本——第三类直接列出该名可召唤代表的 source/name）；list_experts conflict 标注改「跨源重名，用『来源名/原名』召唤指定来源」、shadowed 行附该名可召唤代表（`rep` 字段）；summon_expert/summon_experts 的 expert 参数 description 补语法；SKILL.md §6 四处与实现对齐——「非代表成员仍可被显式点名召唤」勘误为**不可召唤 + 报错指路代表**（协议承诺与工具面脱节的如实收口），解析链表述补消歧通道。不含 `/` 或 name 通道命中时行为逐字节一致（回归硬门）。
+- **roster-aliases 空格变体回退（同一错误 10-26/11-03/11-10 三犯，`lib/tools.js`）**: 别名通道在逐字键（字节兼容）未中后新增**空格不敏感回退**——键与 query 各自 norm 后压掉全部空白比对，**唯一**命中才采信、多键压空同形放弃（宁拒勿猜）。修「DevOps自动化工程师」（键「DevOps 自动化工程师」含空格，模型自然书写无空格）类变体。此前未沉淀进经验池的根因是解析面缺陷而非纪律缺失，经验池不补条目。roster-aliases.json 数据零改动（SKILL.md §6 的 28 条统计不变）。
+
+**测试指引**：新增 7 用例（`test/tools.selftest.mjs`：parseSourceName 审计三形态、source/name 通道命中/回填/大小写、含 `/` 原生名不被误拆、跨源同名消歧、aliasLoose 碰撞放弃、别名空格回退逐字优先、E2E 歧义清单可召唤形式/三类归因/shadowed 指路/missing 逐字节）；T6 shadowed 条目断言同步 `rep` 字段。全量 `npm test` 0 fail。版本三处 bump 2.13.7（`package.json` / `dsh.plugin.json` / `lib/index.js`）。
+
 ## [2.13.6] — 2026-11-10
 
 ### Fixed

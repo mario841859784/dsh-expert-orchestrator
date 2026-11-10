@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { execFileSync, spawnSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
+  aliasLoose,
   autoClaimSummonedTasks,
   buildRecursionAllowList,
   buildResumePrompt,
@@ -35,6 +36,7 @@ import {
   locateAutoClaimBoard,
   neutralizePromptTemplates,
   parseBusMessages,
+  parseSourceName,
   parseTaskIds,
   parseToolGuidanceSections,
   pruneUnavailableToolSections,
@@ -281,6 +283,82 @@ test('resolveExpert: alias 指向不存在的 source/path → missing', () => {
   const broken = { aliases: { 野名: { source: 'nowhere', path: 'x.md' } } }
   assert.equal(resolveExpert([solo], broken, '野名').reason, 'missing')
   assert.equal(resolveExpert([solo], null, '孤名专家').ok, true) // aliases 缺省不炸
+})
+
+// ── 审计 2026-11-10：『来源名/原名』消歧通道 + 别名空格变体归一 ─────────────
+// 真实失败样本（NAS 14 天 259 调用）：死语法重试 10 次（bundled-core/code-reviewer
+// 等 4 形态）+ 别名空格变体 3 次（DevOps自动化工程师）。以下逐形态钉死。
+test('parseSourceName: 审计三形态全兼容 + 非形态返 null', () => {
+  assert.deepEqual(parseSourceName('bundled-core/code-reviewer'), { source: 'bundled-core', name: 'code-reviewer' })
+  assert.deepEqual(parseSourceName('bundled-core/code-reviewer.md'), { source: 'bundled-core', name: 'code-reviewer' })
+  assert.deepEqual(parseSourceName('bundled-core / devops-engineer.md'), { source: 'bundled-core', name: 'devops-engineer' })
+  assert.deepEqual(parseSourceName('zh /后端工程师'), { source: 'zh', name: '后端工程师' })
+  // 非 source/name 形态：无 '/'、首段/末段为空、仅剩 .md
+  assert.equal(parseSourceName('no-slash'), null)
+  assert.equal(parseSourceName(undefined), null)
+  assert.equal(parseSourceName('/code-reviewer'), null)
+  assert.equal(parseSourceName('bundled-core/'), null)
+  assert.equal(parseSourceName('bundled-core/.md'), null)
+  // 首个 '/' 拆分：source 不含 '/'，name 保留内部 '/'
+  assert.deepEqual(parseSourceName('src/a/b.md'), { source: 'src', name: 'a/b' })
+})
+
+test('resolveExpert: source/name 通道——审计三形态命中 + 来源内 file 路径整串回填', () => {
+  const core = { source: 'bundled-core', file: 'cr.md', name: 'code-reviewer', title: '代码审查专家', shadowed: false, disabled: false }
+  const other = { source: 'agency-agents-zh', file: 'engineering/code-reviewer.md', name: 'code-reviewer', title: null, shadowed: false, disabled: false }
+  assert.equal(resolveExpert([core, other], aliases, 'bundled-core/code-reviewer').expert, core)
+  assert.equal(resolveExpert([core, other], aliases, 'bundled-core/code-reviewer.md').expert, core)
+  assert.equal(resolveExpert([core, other], aliases, 'agency-agents-zh / code-reviewer').expert, other)
+  // 来源内相对 file 路径（去 .md）整串回填——兼容旧报错清单形态
+  assert.equal(resolveExpert([core, other], aliases, 'agency-agents-zh/engineering/code-reviewer.md').expert, other)
+  // source 归一大小写不敏感
+  assert.equal(resolveExpert([core], aliases, 'Bundled-Core/code-reviewer').expert, core)
+})
+
+test('resolveExpert: source/name 未命中 → 落后续通道（missing）；含 \'/\' 的原生名仍走 name 通道', () => {
+  // 来源不存在 / 来源中无此名 → missing（归因文案在 resolveOrThrow E2E 层断言）
+  assert.equal(resolveExpert([solo], aliases, 'nowhere/孤名专家').reason, 'missing')
+  assert.equal(resolveExpert([solo], aliases, 'bundled-core/不存在名').reason, 'missing')
+  // 含 '/' 的合法原生名由 ① name 通道先手接住，不被误拆
+  const slashed = { source: 'custom', file: 'x.md', name: 'foo/bar', title: null, shadowed: false, disabled: false }
+  assert.equal(resolveExpert([slashed], aliases, 'foo/bar').expert, slashed)
+})
+
+test('resolveExpert: source/name 多命中 → ambiguous 附候选（跨源同名，NAS 实况形态）', () => {
+  // 未去重花名册（NAS 部署 roster 无 shadowed 标记的实况）：同名跨源并存
+  const a = { source: 'bundled-core', file: 'de.md', name: 'devops-engineer', title: '运维工程师', shadowed: false, disabled: false }
+  const b = { source: 'awesome-claude-code-subagents', file: 'cat/devops-engineer.md', name: 'devops-engineer', title: null, shadowed: false, disabled: false }
+  const r = resolveExpert([a, b], aliases, 'devops-engineer')
+  assert.equal(r.reason, 'ambiguous')
+  assert.equal(r.candidates.length, 2)
+  // 各自 source/name 消歧命中
+  assert.equal(resolveExpert([a, b], aliases, 'bundled-core/devops-engineer').expert, a)
+  assert.equal(resolveExpert([a, b], aliases, 'awesome-claude-code-subagents/devops-engineer').expert, b)
+})
+
+test('aliasLoose: 空格变体唯一命中；逐字优先由 resolveExpert 保证；碰撞放弃；CJK 键', () => {
+  const t = { aliases: { 'DevOps 自动化工程师': { source: 'zh', path: 'devops.md' }, '代码审查 工程师': { source: 'zh', path: 'cr.md' } } }
+  assert.deepEqual(aliasLoose(t, 'DevOps自动化工程师'), { source: 'zh', path: 'devops.md' })
+  assert.deepEqual(aliasLoose(t, 'DevOps  自动化工程师 '), { source: 'zh', path: 'devops.md' }) // 多空白同形
+  assert.deepEqual(aliasLoose(t, '代码审查工程师'), { source: 'zh', path: 'cr.md' }) // CJK 键内空格
+  // 大小写不敏感（norm 语义）
+  assert.deepEqual(aliasLoose(t, 'devops自动化工程师'), { source: 'zh', path: 'devops.md' })
+  // 碰撞（两键压空后同形）→ null 宁拒勿猜
+  const dup = { aliases: { 'A 专家': { source: 'x', path: '1.md' }, 'A专家': { source: 'x', path: '2.md' } } }
+  assert.equal(aliasLoose(dup, 'A 专家'), null)
+  assert.equal(aliasLoose(null, 'x'), null)
+  assert.equal(aliasLoose(t, ''), null)
+})
+
+test('resolveExpert: 别名空格变体回退——逐字键优先，无空格书写经回退命中（审计 DevOps自动化工程师 实况）', () => {
+  const zh = { source: 'agency-agents-zh', file: 'engineering/engineering-devops-automator.md', name: 'DevOps 自动化师', title: null, shadowed: false, disabled: false }
+  const aliasTable = { aliases: { 'DevOps 自动化工程师': { source: 'agency-agents-zh', path: 'engineering/engineering-devops-automator.md' } } }
+  // 逐字（含空格）走原键——行为字节兼容
+  assert.equal(resolveExpert([zh], aliasTable, 'DevOps 自动化工程师').expert, zh)
+  // 无空格自然书写走回退——审计修复主用例
+  assert.equal(resolveExpert([zh], aliasTable, 'DevOps自动化工程师').expert, zh)
+  // 别名值指向的 source/path 在候选中不存在 → 仍 missing（与逐字命中同语义）
+  assert.equal(resolveExpert([solo], aliasTable, 'DevOps自动化工程师').reason, 'missing')
 })
 
 // ── T2（gh-issues-1-2 追问）：档案键/groups members 别名反查器 ───────────────
@@ -571,7 +649,8 @@ test('T6 list_experts: bySource 展开补 conflict/shadowed 标注，compact 与
     const zhGroup = zh.sources.find((g) => g.source === 'zh')
     assert.equal(zhGroup.experts.length, 1)
     assert.equal(zhGroup.experts[0].conflict, true)
-    assert.deepEqual(zhGroup.shadowed, [{ name: '同名专家', title: null, file: 'a2.md' }])
+    // shadowed 条目带代表指路（rep=同名可召唤代表的 name，取不到为 null）
+    assert.deepEqual(zhGroup.shadowed, [{ name: '同名专家', title: null, file: 'a2.md', rep: '同名专家' }])
     // bySource：无重名者不打 conflict；无遮蔽者无 shadowed 字段
     const core = await t.execute({ bySource: 'bundled-core' })
     const coreGroup = core.sources.find((g) => g.source === 'bundled-core')
@@ -5170,6 +5249,46 @@ test('WP-6a 集成 零回归守卫: 空沙箱 HOME+无项目层时 summon/list �
   await assert.rejects(() => summon.execute({ expert: '不存在专家', task: 'x' }, { agent: {} }), /专家不存在：不存在专家/)
   // list total 只含花名册候选
   assert.equal((await list.execute({})).total, 1)
+})
+
+test('审计 2026-11-10 E2E: 歧义清单给可召唤形式；source/name 三类失败如实归因；shadowed 指路代表', async (t) => {
+  const dst = mkdtempSync(join(tmpdir(), 'audit-summon-'))
+  t.after(() => rmSync(dst, { recursive: true, force: true }))
+  mkdirSync(join(dst, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(dst, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({
+    core: [
+      { source: 'bundled-core', file: 'cr.md', name: 'code-reviewer', title: '代码审查专家' },
+      { source: 'bundled-core', file: 'de.md', name: 'devops-engineer', title: '运维工程师' },
+      { source: 'bundled-core', file: 'sa.md', name: 'security-auditor', title: '安全审计专家' },
+    ],
+    sources: [
+      { id: 'awesome-claude-code-subagents', files: [
+        { file: 'cat/code-reviewer.md', name: 'code-reviewer' }, // 未去重（NAS 部署实况）：同名跨源并存可召唤
+        { file: 'cat/security-auditor.md', name: 'security-auditor', shadowed: true }, // 遮蔽副本
+      ] },
+    ],
+  }))
+  const { descriptors, ctx } = makeFileLayerCtx()
+  registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'P' }), autoClaimCwd: dst })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  // ① 同名跨源歧义（审计实况）：清单给 source/name（title） 可召唤形式 + 尾注，不再给不可召唤的 file 形态
+  await assert.rejects(() => summon.execute({ expert: 'code-reviewer', task: 'x' }, { agent: {} }),
+    (e) => e.message.includes('委派名存在多个候选')
+      && e.message.includes('bundled-core/code-reviewer（代码审查专家）')
+      && e.message.includes('awesome-claude-code-subagents/code-reviewer')
+      && e.message.includes('可直接作为 expert 参数召唤')
+      && !e.message.includes('cr.md'))
+  // ② 歧义后按清单 source/name 消歧直接命中对应来源（审计死语法 10 次浪费 → 一次成功）
+  await summon.execute({ expert: 'awesome-claude-code-subagents/code-reviewer', task: 'x' }, { agent: {} })
+  // ③ source/name 指向 shadowed 非代表副本 → 报错指路该名可召唤代表
+  await assert.rejects(() => summon.execute({ expert: 'awesome-claude-code-subagents/security-auditor', task: 'x' }, { agent: {} }),
+    (e) => e.message.includes('非代表副本') && e.message.includes('该名的可召唤代表：bundled-core/security-auditor'))
+  // ④ source/name 未命中（来源不存在）→ 归因式报错（区分来源不存在/来源中无此名）
+  await assert.rejects(() => summon.execute({ expert: 'nowhere/foo', task: 'x' }, { agent: {} }),
+    (e) => e.message.includes('专家不存在：nowhere/foo') && e.message.includes('「nowhere」不存在或未启用'))
+  // ⑤ 无 '/' 的普通 missing 文案逐字节保留（既有断言面零漂移）
+  await assert.rejects(() => summon.execute({ expert: '不存在专家', task: 'x' }, { agent: {} }),
+    /专家不存在：不存在专家；可先调用 list_experts 浏览花名册（惯用名见 roster-aliases\.json）/)
 })
 
 // ── T13 回炉（评审 m1791474603733373 部分同意：M1 + q1 裁决 + m2/m4/测试缺口）──

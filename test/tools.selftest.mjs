@@ -6284,6 +6284,60 @@ test('T15 #19 档案 model 在未声明 agentOptions 能力的 provider 上降�
   assert.ok(!('agentOptions' in specs[0]), '缺能力 provider 不得传 agentOptions（宿主 assertCapabilities 会拒收）')
 })
 
+// ── 2.13.8（issue#1 追问）：summon 调用态 model 参数（显式 > 档案链）────────
+test('2.13.8 调用态 model：显式参数压过档案链；无档案时 model-only 合成；未传/空串零变化', async (t) => {
+  guardProfilesEnv(t)
+  // ① 档案 model-A + summon model=model-B → 参数最具体，B 生效
+  const f = makeProfileFixture(t, 'summon-model-override')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  f.writeProfiles({ 测试专家: { model: 'model-A' } })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  await summon.execute({ expert: '测试专家', task: '完成任务书', model: 'model-B' }, { agent: {} })
+  assert.equal(specs[0].agentOptions?.model, 'model-B')
+  // ② 无档案 + 调用态 → model-only 合成缝（profile=null 分支）生效
+  rmSync(f.projectPath)
+  await summon.execute({ expert: '测试专家', task: '完成任务书', model: 'model-C' }, { agent: {} })
+  assert.equal(specs[1].agentOptions?.model, 'model-C')
+  assert.equal(specs[1].agentOptions?.reasoningEffort, undefined)
+  // ③ 空串/空白/非串 → 视同未传（零键，回到档案链=无档案行为）
+  await summon.execute({ expert: '测试专家', task: '完成任务书', model: '   ' }, { agent: {} })
+  await summon.execute({ expert: '测试专家', task: '完成任务书', model: 42 }, { agent: {} })
+  await summon.execute({ expert: '测试专家', task: '完成任务书' }, { agent: {} })
+  for (const s of specs.slice(2)) assert.ok(!('agentOptions' in s), '未传/无效 model 不得携带 agentOptions')
+  // ④ 调用态与档案同值 → 合成不发生但预检仍拿到同值（逐字节等价路径）
+  f.writeProfiles({ 测试专家: { model: 'model-D' } })
+  await summon.execute({ expert: '测试专家', task: '完成任务书', model: 'model-D' }, { agent: {} })
+  assert.equal(specs[5].agentOptions?.model, 'model-D')
+})
+
+test('2.13.8 调用态 model：缺 agentOptions 能力降级不阻断（与档案 model 同语义）', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'summon-model-oldgen')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: {} })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  const summon = descriptors.find((d) => d.name === 'summon_expert')
+  const r = await summon.execute({ expert: '测试专家', task: '完成任务书', model: 'model-X' }, { agent: {} })
+  assert.equal(r.answer, 'ok') // summon 照常（降级不阻断）
+  assert.ok(!('agentOptions' in specs[0]), '缺能力 provider 不得传 agentOptions')
+})
+
+test('2.13.8 summon_experts 逐项 model：两项各用各的模型，缺省项零键', async (t) => {
+  guardProfilesEnv(t)
+  const f = makeProfileFixture(t, 'summon-model-batch')
+  const { descriptors, specs, ctx } = makeProfileSummonCtx({ capabilities: { agentOptions: true } })
+  registerExpertTools(ctx, { dst: f.dst, getExpertContentImpl: () => ({ content: 'persona 正文' }), autoClaimCwd: f.root, profilesPaths: { homePath: f.homePath, projectPath: f.projectPath } })
+  const batch = descriptors.find((d) => d.name === 'summon_experts')
+  await batch.execute({ experts: [
+    { expert: '测试专家', task: '任务一', model: 'model-1' },
+    { expert: '测试专家', task: '任务二' },
+    { expert: '测试专家', task: '任务三', model: '  model-3  ' },
+  ] }, { agent: {} })
+  assert.equal(specs[0].agentOptions?.model, 'model-1')
+  assert.ok(!('agentOptions' in specs[1]), '缺省 model 项零键')
+  assert.equal(specs[2].agentOptions?.model, 'model-3') // trim 归一
+})
+
 test('T15 #17 (c) 收窄剪除：档案 tools.deny 收窄后 persona 中对应 guidance 段不出现，可用工具段保留', async (t) => {
   guardProfilesEnv(t)
   const f = makeProfileFixture(t, 'prune')

@@ -2,6 +2,13 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.8] — 2026-11-10
+
+### Added
+
+- **summon 调用态 model 参数（issue#1 追问，`lib/tools.js` + `skills/expert-orchestration/SKILL.md`）**: `summon_expert` 新增可选 `model` 参数（provider 模型 id），`summon_experts` 逐项同样可选——编排 LLM 在每次 summon 现场决定模型，小队内可各用各的。生效优先级链更新为 **summon 显式参数 > 逐专家 > 领域组 > defaults > 主会话**（显式最具体，与 cwd 参数/env 覆盖 Config 的既有「显式 > 配置」口径同构）。实现走既有 modelProfile 合成缝（`:1790` 一行赋值注入：`if (summonModel) resolvedModel = summonModel`）——preflightEffort 能力预检/降级告警/agentOptions 消费三处零改动；provider 未声明 agentOptions 能力时降级告警不阻断（与档案 model 同语义）；空串/非串视同未传（行为逐字节一致）。模型名合法性归 provider 侧（不内置清单）；指定模型不可用时 summon 报错原样可见、板条目保持 running，**编排者换 `model` 重新 summon 即切换重试**——插件内不做自动 fallback（用户裁决：失败后切换 LLM 重试归 retry/continue 类插件）。设置页生效来源徽标不动（调用态参数非配置态）。SKILL.md §6 模型链条目同步。
+- **测试**（`test/tools.selftest.mjs`，复用 makeProfileSummonCtx 模式，3 用例 6 断言点）: 调用态压过档案链（model-A 档案 + model-B 参数 → B 生效）、无档案 model-only 合成、缺能力降级零键、空串/空白/非串视同未传、同值不合成路径、summon_experts 三项混合（缺省项零键 + trim 归一）。全量 `npm test` 0 fail。版本三处 bump 2.13.8（`package.json` / `dsh.plugin.json` / `lib/index.js`）。
+
 ## [2.13.7] — 2026-11-10
 
 ### Fixed

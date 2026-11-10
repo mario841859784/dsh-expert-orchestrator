@@ -164,6 +164,19 @@ dsh plugin --profile web add /绝对路径/dsh-expert-orchestrator
 
 存量迁移提示：若此前在 `agent.cordis.yml` 中手工加过 `expert-orchestrator-deploy` 条目，升级前应先迁移到宿主层 `cordis.patch.yml`，否则 VERSION 变更刷新会用出厂版覆盖该条目、静默断掉本地链路。
 
+### 发版同步脚本（维护者）
+
+发版（commit/push/tag/npm publish）完成后，用 `scripts/sync-deploy.mjs` 把新包拉到两端（不入 npm 包，维护者本机运行）：
+
+```sh
+node scripts/sync-deploy.mjs status   # 三端版本对账：本地工作区 / Mac desktop / NAS web profile（只读）
+node scripts/sync-deploy.mjs mac      # Mac：git fetch + 与 origin/main 对比 + 未提交改动警告（desktop 经 link: 直跑工作树）
+node scripts/sync-deploy.mjs nas      # NAS：profile 依赖升级到 npm latest（依赖级安装，镜像异常自动走代理 fallback）
+node scripts/sync-deploy.mjs nas --file   # 备用：NAS 工作区 git pull 后 profile 改 file: 直连（等价 dev 形态）
+```
+
+前置条件：本机到 NAS 的 SSH 免密（专用 key，`DSH_SYNC_NAS_SSH`/`DSH_SYNC_NAS_KEY` 等 env 可覆盖缺省目标，见脚本头注释）。NAS 升级为依赖级 `pnpm install`（绝不手工拷 `node_modules`——会被 pnpm 对账回滚）；NAS 的 dsh web 宿主属 fnOS 应用用户 Harness，脚本无 kill 权限，升级落盘后需到 fnOS 应用中心重启 Harness 应用生效（`--restart` 仅显式提示此指引）。
+
 ## 🚀 使用
 
 1. 安装并重启 DSH，会话选择「专家编排模式」预设（或设为默认）。

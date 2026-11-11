@@ -4,26 +4,42 @@
 // d) 创建成功任务 JSON 含 created_by 且 replay 复现该字段、事件流 type=create args 携带 created_by；
 // e) 代理 draft claim 被拒、approve 后走通既有流程（reject 终态路径同验）；
 // f) 本文件全部用例通过（npm test 收口）。
+// T15 增补：受限免审批创建 --auto-ready（Q2 显式参数；Q3 ⑥ open-cap 前置恒生效不依赖执法
+//    开关）——a-T15) 缺省路径与基线 T15_BASELINE 双版本逐字节+事件 args 键集；b-T15) 前置
+//    ⑥⑦⑧ 全过直达 ready（单事件 args 含 auto_ready+open_count、checkpoint 免审证据注记、
+//    claim/done E2E）；c-T15) 三前置任一不过具名拒零写零事件（agent_create_open_cap/
+//    agent_create_parent_closed/agent_create_dep_cross_owner）+hint 指路 draft 回退可用；
+//    d-T15) --kind review 同传仍拒（review 永不免审）+误用面（缺代理身份/与 --draft 互斥）。
 // 全部用例跑在 tmp 隔离目录（mkdtemp），不触碰本仓任务板。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
 const TASKBOARD = fileURLToPath(new URL('../skills/expert-orchestration/tools/taskboard.py', import.meta.url))
+const REPO_ROOT = fileURLToPath(new URL('../', import.meta.url))
 const BOARD_REL = join('.expert-taskboards', 'default.json')
 const EVENTS_REL = BOARD_REL + '.events.jsonl'
 
-/** 执行 taskboard.py（cwd 隔离到临时目录）；stdout 单行 JSON 时解析为 json 字段。 */
-const runTb = (cwd, args) => {
-  const r = spawnSync('python3', [TASKBOARD, ...args], { cwd, encoding: 'utf-8' })
+/** 执行 taskboard.py（cwd 隔离到临时目录）；stdout 单行 JSON 时解析为 json 字段。
+ * opts.extraEnv 逐键注入环境（T15 cap 阈值覆盖等）；opts.tb 覆盖脚本路径（双版本基线回归）。 */
+const runTb = (cwd, args, { extraEnv = {}, omitEnv = [], tb = TASKBOARD } = {}) => {
+  const env = { ...process.env }
+  for (const k of omitEnv) delete env[k]
+  Object.assign(env, extraEnv)
+  const r = spawnSync('python3', [tb, ...args], { cwd, encoding: 'utf-8', env })
   let json = null
   try { json = JSON.parse((r.stdout ?? '').trim()) } catch { /* 多行人类可读输出不解析 */ }
   return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', json }
 }
+
+// 时间戳归一（双版本逐字节比对用）：created/updated 毫秒值、checkpoint time/ts、人类面 [日期时间]
+const norm = (s) => s.replace(/"(created|updated)": \d+/g, '"$1": T')
+  .replace(/"(time|ts)": "[^"]*"/g, '"$1": "T"')
+  .replace(/\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/g, '[T]')
 
 const makeBoardDir = (t, label) => {
   const dir = mkdtempSync(join(tmpdir(), `t2-agent-create-${label}-`))
@@ -266,4 +282,138 @@ test('T6-I2 自建自领：显式 --owner ≠ --created-by → agent_owner_misma
   const claimed = runTb(dir, ['claim', 'T4', 'be'])
   assert.equal(claimed.code, 0)
   assert.equal(boardOf(dir).tasks.T4.owner, 'be')
+})
+
+// ── T15) 受限免审批创建 --auto-ready（Q2 显式参数；Q3 open-cap 前置恒生效不依赖执法开关）──
+
+const T15_BASELINE = '57bb21c' // T20 交付版（T15 动工前固定基线，HEAD 推进后仍钉此 commit）
+
+test('T15-a 缺省逐字节：不带 --auto-ready 的 lead/代理 draft 脚本与基线 T15_BASELINE 双版本一致（stdout+exit+事件 args 键集）', (t) => {
+  const head = spawnSync('git', ['show', `${T15_BASELINE}:skills/expert-orchestration/tools/taskboard.py`],
+    { cwd: REPO_ROOT, encoding: 'utf-8' })
+  assert.equal(head.status, 0, `git show ${T15_BASELINE} 基线可读`)
+  const headPy = join(mkdtempSync(join(tmpdir(), 't15-head-')), 'taskboard_head.py')
+  writeFileSync(headPy, head.stdout)
+  t.after(() => rmSync(headPy, { force: true }))
+  const script = [
+    ['create', '父任务', '--owner', '甲', '--scope', 'src'],
+    ['create', '草稿', '--created-by', '甲', '--of', 'T1', '--scope', 'src', '--draft'],
+    ['approve', 'T2'],
+    ['claim', 'T1', '甲'],
+    ['--json', 'show', 'T1'],
+  ]
+  const dirCur = makeBoardDir(t, 't15a-cur')
+  const dirOld = makeBoardDir(t, 't15a-old')
+  const rc = script.map((args) => runTb(dirCur, args))
+  const ro = script.map((args) => runTb(dirOld, args, { tb: headPy }))
+  for (let i = 0; i < script.length; i++) {
+    assert.equal(norm(rc[i].stdout), norm(ro[i].stdout), `逐字节一致：${script[i].join(' ')}`)
+    assert.equal(rc[i].code, ro[i].code, `exit code 一致：${script[i].join(' ')}`)
+  }
+  // 事件 args 键集逐事件一致（缺省路径事件形状不因 T15 改动）
+  const kc = eventsOf(dirCur).map((e) => Object.keys(e.args).sort().join(','))
+  const ko = eventsOf(dirOld).map((e) => Object.keys(e.args).sort().join(','))
+  assert.deepEqual(kc, ko)
+})
+
+test('T15-b 前置全过直达 ready：单事件 type=create args 含 auto_ready=true+open_count 免审证据；checkpoint 注记可审计；claim/done 全链 E2E', (t) => {
+  const dir = makeBoardDir(t, 't15-ready')
+  const py = (args, opts) => runTb(dir, args, opts)
+  py(['create', '父任务', '--owner', '甲', '--scope', 'src'])
+  py(['claim', 'T1', '甲'])
+  const rev = boardOf(dir).revision
+  const evN = eventsOf(dir).length
+  const r = py(['create', '免审任务', '--created-by', '甲', '--of', 'T1', '--scope', 'src', '--auto-ready'])
+  assert.equal(r.code, 0)
+  const t2 = py(['--json', 'show', 'T2']).json.data.task
+  assert.equal(t2.status, 'ready', '⑥⑦⑧ 全过直达 ready（跳过 draft 待批面）')
+  assert.equal(t2.created_by, '甲')
+  assert.equal(boardOf(dir).revision, rev + 1, '单事件单写：revision 恰 +1')
+  assert.equal(eventsOf(dir).length, evN + 1, '事件零新增 type：仍单条 create')
+  const evt = eventsOf(dir).at(-1)
+  assert.equal(evt.type, 'create')
+  assert.equal(evt.args.auto_ready, true)
+  assert.equal(evt.args.open_count, 1, '免审证据：判定时 created_by 名下 open 计数（T1 running）')
+  assert.match(t2.checkpoints.at(-1).note, /免审批创建（--auto-ready）/)
+  assert.match(t2.checkpoints.at(-1).note, /open_count=1（创建后 2 ≤ cap=2）/)
+  assert.match(t2.checkpoints.at(-1).note, /父 T1 状态 running/)
+  // E2E：CAS claim → progress → done（既有链零改动，免审任务与常规任务同生命周期）
+  const c = py(['claim', 'T2', '乙', '--expected-revision', String(boardOf(dir).revision)])
+  assert.equal(c.code, 0, 'CAS claim 走通')
+  assert.equal(py(['--json', 'show', 'T2']).json.data.task.status, 'running')
+  py(['progress', 'T2', '推进'])
+  py(['done', 'T2', '收口'])
+  assert.equal(py(['--json', 'show', 'T2']).json.data.task.status, 'done')
+})
+
+test('T15-c 前置任一不过具名拒零写零事件：⑥ agent_create_open_cap（cap 恒生效，仅设阈值 env 不设执法开关）/ ⑦ agent_create_parent_closed / ⑧ agent_create_dep_cross_owner；hint 均指路 draft 回退且回退路径可用', (t) => {
+  // ⑥：cap=1（仅 DSH_EXPERT_PEER_OPEN_CAP=1，无 DSH_EXPERT_ANTISTORM_ENFORCE——Q3 恒生效实证）
+  const dir = makeBoardDir(t, 't15-cap')
+  const py = (args, extraEnv = {}) => runTb(dir, args, { extraEnv })
+  py(['create', '父任务', '--owner', '甲', '--scope', 'src'])
+  py(['claim', 'T1', '甲'])
+  const rev = boardOf(dir).revision
+  const evN = eventsOf(dir).length
+  let r = py(['--json', 'create', '超限', '--created-by', '甲', '--of', 'T1', '--scope', 'src', '--auto-ready'],
+    { DSH_EXPERT_PEER_OPEN_CAP: '1' })
+  assert.equal(r.json.error, 'agent_create_open_cap')
+  assert.equal(r.json.open_count, 1)
+  assert.equal(r.json.cap, 1)
+  assert.match(r.json.hint, /去掉 --auto-ready/)
+  assert.equal(boardOf(dir).revision, rev, '零写')
+  assert.equal(eventsOf(dir).length, evN, '零事件')
+  // ⑦：父任务终态（done）→ 免审链不可挂靠
+  const dir2 = makeBoardDir(t, 't15-closed')
+  const py2 = (args) => runTb(dir2, args)
+  py2(['create', '父任务', '--owner', '甲', '--scope', 'src'])
+  py2(['claim', 'T1', '甲'])
+  py2(['done', 'T1', '收口'])
+  const rev2 = boardOf(dir2).revision
+  const evN2 = eventsOf(dir2).length
+  r = py2(['--json', 'create', '挂终态', '--created-by', '甲', '--of', 'T1', '--scope', 'src', '--auto-ready'])
+  assert.equal(r.json.error, 'agent_create_parent_closed')
+  assert.equal(r.json.parent_status, 'done')
+  assert.match(r.json.hint, /去掉 --auto-ready/)
+  assert.equal(boardOf(dir2).revision, rev2)
+  assert.equal(eventsOf(dir2).length, evN2)
+  // ⑧：dep 跨 owner（T2 他人 pending）→ 具名拒；同参去掉 --auto-ready 加 --draft 回退成功
+  const dir3 = makeBoardDir(t, 't15-cross')
+  const py3 = (args) => runTb(dir3, args)
+  py3(['create', '父任务', '--owner', '甲', '--scope', 'src'])
+  py3(['claim', 'T1', '甲'])
+  py3(['create', '他人任务', '--owner', '乙'])
+  const rev3 = boardOf(dir3).revision
+  const evN3 = eventsOf(dir3).length
+  r = py3(['--json', 'create', '跨依赖', '--created-by', '甲', '--of', 'T1', '--scope', 'src',
+           '--dep', 'T2', '--auto-ready'])
+  assert.equal(r.json.error, 'agent_create_dep_cross_owner')
+  assert.deepEqual(r.json.dep, ['T2'])
+  assert.match(r.json.hint, /去掉 --auto-ready/)
+  assert.equal(boardOf(dir3).revision, rev3)
+  assert.equal(eventsOf(dir3).length, evN3)
+  const fb = py3(['create', '回draft', '--created-by', '甲', '--of', 'T1', '--scope', 'src',
+                  '--dep', 'T2', '--draft'])
+  assert.equal(fb.code, 0, 'hint 指路的 draft 回退路径可用')
+  assert.equal(py3(['--json', 'show', 'T3']).json.data.task.status, 'draft')
+})
+
+test('T15-d --kind review+--auto-ready 同传仍 agent_create_kind_rejected（review 永不免审）；误用面：--auto-ready 缺代理身份 / 与 --draft 同传 → 误用拒绝', (t) => {
+  const dir = makeBoardDir(t, 't15-review')
+  const py = (args) => runTb(dir, args)
+  py(['create', '父任务', '--owner', '甲', '--scope', 'src'])
+  py(['claim', 'T1', '甲'])
+  const rev = boardOf(dir).revision
+  const evN = eventsOf(dir).length
+  let r = py(['--json', 'create', '评审', '--created-by', '甲', '--of', 'T1', '--scope', 'src',
+              '--kind', 'review', '--auto-ready'])
+  assert.equal(r.json.error, 'agent_create_kind_rejected', 'review 永不免审（①-⑤ 链 ④ 先于免审前置）')
+  r = py(['--json', 'create', 'lead误用', '--auto-ready'])
+  assert.equal(r.json.error, 'command_failed')
+  assert.match(r.json.message, /--auto-ready 仅支持代理自建路径/)
+  r = py(['--json', 'create', '互斥', '--created-by', '甲', '--of', 'T1', '--scope', 'src',
+          '--draft', '--auto-ready'])
+  assert.equal(r.json.error, 'command_failed')
+  assert.match(r.json.message, /互斥/)
+  assert.equal(boardOf(dir).revision, rev, '三条拒绝路径零写')
+  assert.equal(eventsOf(dir).length, evN, '三条拒绝路径零事件')
 })

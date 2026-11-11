@@ -1127,6 +1127,14 @@ def cmd_create(a, data, path):
                          hint='--created-by 与 --of 必须成对出现且均为非空白值（代理 scoped 自建任务）；'
                               '空串/纯空白视同缺参；lead 派发两者均不携带，行为不变')
     agent_create = created_by is not None
+    # T15：--auto-ready 仅支持代理自建路径（lead 派发缺省创建本就 pending/依赖满足即 ready，
+    # 无审批面可跳过）；与 --draft 互斥（前者免审直达 ready，后者进待批面，语义相反）。
+    auto_ready = bool(getattr(a, 'auto_ready', False))
+    if auto_ready and not agent_create:
+        sys.exit('错误：--auto-ready 仅支持代理自建路径（须成对携带 --created-by/--of）；'
+                 'lead 派发创建缺省即 pending/自动提升 ready，无审批面可跳过')
+    if auto_ready and a.draft:
+        sys.exit('错误：--draft 与 --auto-ready 互斥（前者进入待批面，后者免审直达 ready）')
     if agent_create:
         # ① 认领关系核实：--of 任务须存在于本板且其 owner == --created-by
         parent = data['tasks'].get(of_id)
@@ -1149,8 +1157,10 @@ def cmd_create(a, data, path):
             raise BoardError('scope_out_of_violation', of=of_id, scope=out_of,
                              parent_scope=parent_scope,
                              hint='代理创建任务的 write_scopes 逐项须落在 --of 任务的 scope 内')
-        # ③ 代理创建强制 draft：不接受 --draft 之外的显式状态（缺 --draft 即非 draft 意图，拒绝）
-        if not a.draft:
+        # ③ 代理创建强制 draft：不接受 --draft 之外的显式状态（缺 --draft 即非 draft 意图，拒绝）；
+        # T15：--auto-ready 显式声明免审意图（⑥⑦⑧ 前置全过后直达 ready）时豁免本条——
+        # 免审面本身即显式声明，仍缺 scope/挂错父任务等 ①②④⑤ 不豁免
+        if not a.draft and not auto_ready:
             raise BoardError('agent_create_requires_draft',
                              hint='代理创建强制 status=draft：须携带 --draft 进入待批面（approve/reject 既有语义）')
         # ④ kind 允许面=缺省 kind（follow-up 语义）：--kind 与代理创建同传具名拒绝（Q5 裁决）
@@ -1166,13 +1176,46 @@ def cmd_create(a, data, path):
     for d in deps:
         if d not in data['tasks']:
             sys.exit(f"错误：依赖任务 {d} 不存在")
+    # ── T15 受限免审批创建（--auto-ready，Q2 显式参数裁决）：⑥⑦⑧ 前置全过 → 直达 ready；
+    # 任一不过具名拒（零写零事件），hint 指路去掉 --auto-ready 回 draft 待批旧路径。
+    # Q3 裁决：⑥ open 上限前置恒生效，不依赖 T13 执法开关 DSH_EXPERT_ANTISTORM_ENFORCE
+    # （阈值仍读 DSH_EXPERT_PEER_OPEN_CAP，缺省 2；非法值宁拒勿猜不回落）。
+    # 判定先于任何变更与 save：本块在 tid 分配/任务写入/事件落账之前执行，拒绝路径全板零变更。
+    auto_ready_ev = None
+    if agent_create and auto_ready:
+        # ⑥ created_by open 计数 < cap（open-counts 同口径 _OPEN_STATUSES；本任务创建后即归属
+        # created_by 名下 open，故按 pre+1 与上限比较）
+        cap = _env_positive_int(_PEER_OPEN_CAP_ENV, _OPEN_CAP_DEFAULT)
+        open_pre = len(_count_open_tasks(data, created_by))
+        if open_pre + 1 > cap:
+            raise BoardError('agent_create_open_cap', created_by=created_by,
+                             open_count=open_pre, cap=cap,
+                             hint='created_by 名下 open 任务数+本次创建将超过上限（探针：taskboard.py '
+                                  'open-counts <created_by> 核查）；先收口在途任务，或去掉 --auto-ready '
+                                  '回 draft 待批路径（approve 面另有 T13 执法兜底）')
+        # ⑦ --of 父任务须 open（draft/pending/ready/running）：终态=完成面，免审链不可挂靠
+        parent_status = parent.get('status')
+        if parent_status not in _OPEN_STATUSES:
+            raise BoardError('agent_create_parent_closed', of=of_id, parent_status=parent_status,
+                             hint='--of 父任务已终态，免审批链不可挂靠终态父任务；去掉 --auto-ready '
+                                  '回 draft 待批路径，由 lead 审批后另行规划')
+        # ⑧ dep 全部为本人名下任务：跨 owner 依赖=借他人任务做闸门，涉及他人任务面，须走审批面裁决
+        cross = [d for d in deps if (data['tasks'][d].get('owner') or '') != created_by]
+        if cross:
+            raise BoardError('agent_create_dep_cross_owner', created_by=created_by, dep=cross,
+                             hint='--auto-ready 要求全部依赖任务为 created_by 本人名下（跨 owner 依赖'
+                                  '涉及他人任务闸门，须走 draft 审批面裁决）；去掉 --auto-ready 回 draft '
+                                  '待批路径')
+        auto_ready_ev = {'open_pre': open_pre, 'cap': cap, 'parent_status': parent_status}
     scope = [s.strip().rstrip('/') for s in (a.scope or '').split(',') if s.strip()]
     tid = f"T{data['seq'] + 1}"
     ensure_acyclic(data['tasks'], tid, deps)  # 全图环检测（写入前）
     data['seq'] += 1
     data['tasks'][tid] = {
         'id': tid, 'title': a.title, 'owner': a.owner or '', 'dep': deps,
-        'desc': a.desc or '', 'status': 'draft' if a.draft else 'pending', 'created': now_ms(),
+        'desc': a.desc or '',
+        'status': 'ready' if auto_ready_ev else ('draft' if a.draft else 'pending'),
+        'created': now_ms(),
         'updated': now_ms(), 'summary': '', 'fail': '',
     }
     if scope:
@@ -1185,6 +1228,19 @@ def cmd_create(a, data, path):
         data['tasks'][tid]['created_by'] = created_by  # M1：单键字符串字段（lead 派发不落此字段）
     if tags:
         data['tasks'][tid]['tags'] = tags  # T8 能力标签（缺省不落 tags 字段=输出逐字节不变）
+    if auto_ready_ev:
+        # T15：免审证据 checkpoint 注记可审计（注记非契约，如实声明口径）
+        data['tasks'][tid].setdefault('checkpoints', []).append({
+            'time': now_ms(),
+            'note': f"免审批创建（--auto-ready）：M1 链①-⑤+⑥⑦⑧全过；created_by={created_by} "
+                    f"open_count={auto_ready_ev['open_pre']}（创建后 {auto_ready_ev['open_pre'] + 1} ≤ "
+                    f"cap={auto_ready_ev['cap']}）；父 {of_id} 状态 {auto_ready_ev['parent_status']}；"
+                    f"dep 全部本人名下（{' '.join(deps) if deps else '无依赖'}）——免审证据可审计",
+        })
+        if _EVT_CTX.get('armed'):
+            # T15：单事件 type=create 不变，args 增免审证据（open_count=前置判定时 pre 计数）
+            _EVT_CTX['args']['auto_ready'] = True
+            _EVT_CTX['args']['open_count'] = auto_ready_ev['open_pre']
     promoted = refresh(data)
     save(path, data)
     show(data['tasks'][tid])
@@ -3128,6 +3184,13 @@ def main():
     p.add_argument('--scope', help='关联域（逗号分隔路径前缀，如 src,docs）；hook 第三查与验证回执的依据')
     p.add_argument('--draft', action='store_true',
                    help='创建为 PM 规划草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；缺省行为不变')
+    p.add_argument('--auto-ready', action='store_true',
+                   help='T15 受限免审批创建（仅代理自建，须成对携带 --created-by/--of）：M1 链①-⑤+⑥⑦⑧'
+                        '全过则直达 ready（单事件 type=create 不变，args 增 auto_ready+open_count 免审证据，'
+                        'checkpoint 注记免审证据可审计）；⑥ created_by open 计数超上限（DSH_EXPERT_PEER_OPEN_CAP'
+                        '，恒生效不依赖执法开关）⑦ --of 父任务终态 ⑧ dep 跨 owner，任一命中即具名拒'
+                        '（零写零事件，hint 指路去掉本参回 draft 待批旧路径）；与 --draft 互斥；'
+                        '--kind review 同传仍拒（review 永不免审）')
     p.add_argument('--kind', help='任务种类（缺省不带 kind 字段，行为不变）：review=评审任务，完成须显式 '
                                   '--verdict pass|needs_revision，失败自动生成 repair 并重排下游依赖')
     p.add_argument('--quorum-m', type=int, nargs='?', const=DEFAULT_REVIEW_QUORUM_M, default=None,

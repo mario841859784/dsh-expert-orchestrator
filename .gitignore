@@ -18,3 +18,6 @@ skills/trim-cli/scripts/
 
 # python3 字节码缓存（taskboard.py/bus.py 被子进程调用时产生）
 skills/expert-orchestration/tools/__pycache__/
+
+# ZCode 会话本地运行态（可视化草稿/任务卡等），不入库
+.zcode/

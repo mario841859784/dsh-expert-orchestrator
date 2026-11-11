@@ -227,6 +227,9 @@ REVIEW_ROUND_LIMIT = 2       # m 票评审轮次上限：fail 生效（=needs_re
 # --findings 长度上限（v2.7 T19 回炉，建议③）：码点数，超限硬拒（零事件零落盘）而非静默截断——
 # 截断会丢评审要点且 repair desc 以 findings 为据；口径与断点恢复 prompt 预算（lib RESUME_PROMPT_MAX_CHARS）对齐。
 FINDINGS_MAX_CHARS = 4000
+# --by 声明长度上限（方向 4 审计面）：身份声明是名字不是文档，200 码点封顶；
+# 超限硬拒（零事件零落盘）而非静默截断——截断会让审计面留半个签名（比没有更糟）。
+APPROVAL_BY_MAX_CHARS = 200
 
 # ── #16 per-(任务,专家) 工具调用硬预算（v2.8 M8-2 / WP-7 ①，T27）─────────────
 # 事件溯源计数（验收 a）：计数唯一事实源=事件流 <板>.events.jsonl——模型自报（bus 消息/检查点
@@ -1602,6 +1605,9 @@ def cmd_approve(a, data, path):
     if cb:
         _check_open_cap(cb, data)
     by = (getattr(a, 'by', None) or '').strip()
+    if len(by) > APPROVAL_BY_MAX_CHARS:
+        sys.exit(f"错误：--by 长 {len(by)} 码点，超过上限 {APPROVAL_BY_MAX_CHARS}"
+                 "（身份声明是名字不是文档）；超限硬拒不静默截断（零事件零落盘）")
     if by:
         ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
         t.setdefault('checkpoints', []).append(
@@ -1782,6 +1788,9 @@ def cmd_reject(a, data, path):
     if t['status'] != 'draft':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 draft 可否决")
     by = (getattr(a, 'by', None) or '').strip()
+    if len(by) > APPROVAL_BY_MAX_CHARS:
+        sys.exit(f"错误：--by 长 {len(by)} 码点，超过上限 {APPROVAL_BY_MAX_CHARS}"
+                 "（身份声明是名字不是文档）；超限硬拒不静默截断（零事件零落盘）")
     if by:
         ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
         t.setdefault('checkpoints', []).append(
@@ -3390,10 +3399,10 @@ def main():
                         'checkpoint/事件 args previous_owner；反回摆 steal_ping_pong 拒；无主候选不在本语义内')
     add_write_args(p)
     p.set_defaults(fn=cmd_claim_idle)
-    p = sub.add_parser('approve'); p.add_argument('id'); p.add_argument('--by', help='批准人声明（方向 4 审计面，板面自报防误用不防伪造；协议纪律：批准者≠草案创建代理本人，代理转达的批准不可信）'); add_write_args(p)
+    p = sub.add_parser('approve'); p.add_argument('id'); p.add_argument('--by', help='批准人声明（方向 4 审计面，板面自报防误用不防伪造；上限 200 码点超限硬拒；协议纪律：批准者≠草案创建代理本人，代理转达的批准不可信）'); add_write_args(p)
     p.set_defaults(fn=cmd_approve,
                    help='PM 规划草案批准：draft -> ready（依赖未满足先回 pending 走自动提升）；批准前 claim 被拒')
-    p = sub.add_parser('reject'); p.add_argument('id'); p.add_argument('--by', help='否决人声明（方向 4 审计面，同 approve --by 口径）'); add_write_args(p)
+    p = sub.add_parser('reject'); p.add_argument('id'); p.add_argument('--by', help='否决人声明（方向 4 审计面，同 approve --by 口径，上限 200 码点）'); add_write_args(p)
     p.set_defaults(fn=cmd_reject,
                    help='PM 规划草案否决：draft -> rejected 终态（退出批准面不滞留；不可 claim/approve）')
     p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); p.add_argument('--verdict', help='review 任务完成结论（review 任务必填）：pass=评审通过正常完成；needs_revision=须携带 --findings，自动生成 repair+下游 DAG 重排，原任务回 ready 待复审'); p.add_argument('--findings', help='评审发现清单（needs_revision 必填，供 repair 任务引用）'); p.add_argument('--repair-owner', help='自动生成 repair 任务的 owner（缺省为空，由编排者分配）'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_done)

@@ -120,22 +120,47 @@ test('方向5-mcp 未知 method -32601；--board 透传（DSH_TASKBOARD_MCP_BOAR
   assert.ok(Object.keys(JSON.parse(readFileSync(board, 'utf-8')).tasks).length === 1, '写入落在 --board 指定板')
 })
 
-test('方向5-mcp list_experts：merged roster 缺失时 bundled-core 兜底', (t) => {
+test('方向5-mcp list_experts：deployed roster（真 schema）真断言 + bundled-core 兜底', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'd5-mcp-roster-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const { out } = drive(dir, [rpc(1, 'tools/call', { name: 'list_experts', arguments: {} })])
+  // ① 兜底：DSH_TASKBOARD_MCP_SKILL_DIR 指向无 roster 的 fixture 技能目录
+  const bareDir = join(dir, 'skill-bare')
+  mkdirSync(join(bareDir, 'experts'), { recursive: true })
+  writeFileSync(join(bareDir, 'experts', 'fallback.md'), '---\nname: 兜底专家\n---\n正文')
+  const { out } = drive(dir, [rpc(1, 'tools/call', { name: 'list_experts', arguments: {} })], { DSH_TASKBOARD_MCP_SKILL_DIR: bareDir })
   const text = respOf(out, 1).result.content[0].text
-  assert.ok(text.includes('bundled-core'), text)
-  assert.ok(text.includes('backend-engineer') || text.includes('后端'), `bundled 兜底列出内置专家：${text.slice(0, 200)}`)
-  // deployed roster：fixture 合并花名册生效 + disabled 标注
-  const mergedDir = join(SKILL_DIR, 'expert-sources', 'merged')
-  const deployed = existsSync(join(mergedDir, 'roster.json'))
-  if (!deployed) return // 仓库形态无 merged roster（部署面生成）——兜底分支已验证
-  const { out: out2 } = drive(dir, [rpc(2, 'tools/call', { name: 'list_experts', arguments: {} })])
-  assert.ok(respOf(out2, 2).result.content[0].text.includes('deployed merged roster'))
+  assert.ok(text.includes('未部署') && text.includes('bundled-core 兜底'), text)
+  assert.ok(text.includes('兜底专家'), `bundled 兜底扫描 fixture experts/：${text}`)
+  // ② deployed merged roster（真实 schema：core[] + sources[].files[]，与 lib/tools.js
+  //    rosterCandidates 逐字段同口径）——经 DSH_TASKBOARD_MCP_SKILL_DIR 注入做 CI 真断言：
+  //    disabled/shadowed 标注与来源补全必须在列。
+  const deployedDir = join(dir, 'skill-deployed')
+  mkdirSync(join(deployedDir, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(deployedDir, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({
+    core: [{ source: 'bundled-core', file: 'a.md', name: '甲' }],
+    sources: [{ id: 'custom', files: [
+      { file: 'b.md', name: '乙', disabled: true },
+      { file: 'c.md', name: '丙', shadowed: true },
+      { file: 'd.md', title: '丁（无名只有title）' },
+    ] }],
+  }))
+  const { out: out2 } = drive(dir, [rpc(2, 'tools/call', { name: 'list_experts', arguments: {} })], { DSH_TASKBOARD_MCP_SKILL_DIR: deployedDir })
+  const text2 = respOf(out2, 2).result.content[0].text
+  assert.ok(text2.includes('deployed merged roster'), text2)
+  assert.ok(text2.includes('[bundled-core] 甲'), text2)
+  assert.ok(text2.includes('[custom] 乙（已停用）'), text2)
+  assert.ok(text2.includes('[custom] 丙（shadowed）'), text2)
+  assert.ok(text2.includes('[custom] 丁（无名只有title）'), 'files 缺 source 补所属来源 id', text2)
+  // ③ 损坏 roster：如实报损坏 + 兜底（绝不静默当空板）
+  const corruptDir = join(dir, 'skill-corrupt')
+  mkdirSync(join(corruptDir, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(corruptDir, 'expert-sources', 'merged', 'roster.json'), '{broken json')
+  const { out: out3 } = drive(dir, [rpc(3, 'tools/call', { name: 'list_experts', arguments: {} })], { DSH_TASKBOARD_MCP_SKILL_DIR: corruptDir })
+  const text3 = respOf(out3, 3).result.content[0].text
+  assert.ok(text3.includes('读取失败') && text3.includes('bundled-core 兜底'), text3)
 })
 
-test('方向5-card AgentCard：bundled 兜底 11 skills、必备字段、--out 落盘', (t) => {
+test('方向5-card AgentCard：bundled 兜底 11 skills、必备字段、--out 落盘、version=package.json、deployed 源真断言', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'd5-card-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const outPath = join(dir, 'agent-card.json')
@@ -145,23 +170,43 @@ test('方向5-card AgentCard：bundled 兜底 11 skills、必备字段、--out �
   const card = JSON.parse(readFileSync(outPath, 'utf-8'))
   assert.equal(card.name, 'dsh-expert-orchestrator')
   assert.ok(card.description && card.protocolVersion && card.capabilities)
+  // version=package.json 单一事实源（② 评审项断言：不硬编码）
+  const pkgVersion = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf-8')).version
+  assert.equal(card.version, pkgVersion, `card.version 须跟随 package.json（=${pkgVersion}）`)
   assert.ok(Array.isArray(card.skills) && card.skills.length >= 11, `bundled 兜底 ≥11 skills：${card.skills.length}`)
   for (const s of card.skills) {
     assert.ok(s.id && s.name && s.description && Array.isArray(s.tags), 'AgentSkill 必备字段')
     assert.ok(s.tags.includes('expert'))
   }
   assert.equal(card['dsh:rosterSource'], 'bundled-core-fallback')
-  // stdout 模式 + 自定义 roster fixture（deployed 源 + disabled 过滤）
-  const rosterPath = join(dir, 'roster.json')
-  writeFileSync(rosterPath, JSON.stringify({ experts: [
-    { source: 'bundled-core', file: 'a.md', name: '甲' },
-    { source: 'custom', file: 'b.md', name: '乙', disabled: true },
-  ] }))
-  // 生成器读固定路径（SKILL_DIR 下 merged roster）——fixture 经 --skill-dir 不可行（生成器无该参数），
-  // stdout 模式断言不依赖仓库内是否有 deployed roster：两态输出均为合法卡。
-  const r2 = spawnSync('node', [CARD], { encoding: 'utf-8' })
+  // deployed merged roster（真 schema）经 --skill-dir 注入 → CI 真断言：disabled/shadowed
+  // 过滤、来源补全、rosterSource 如实切换（④ 评审项：此前该分支无真断言）。
+  const deployedDir = join(dir, 'skill-deployed')
+  mkdirSync(join(deployedDir, 'expert-sources', 'merged'), { recursive: true })
+  writeFileSync(join(deployedDir, 'expert-sources', 'merged', 'roster.json'), JSON.stringify({
+    core: [{ source: 'bundled-core', file: 'a.md', name: '甲' }],
+    sources: [{ id: 'custom', files: [
+      { file: 'b.md', name: '乙', disabled: true },
+      { file: 'c.md', name: '丙', shadowed: true },
+    ] }],
+  }))
+  const deployedOut = join(dir, 'agent-card-deployed.json')
+  const r2 = spawnSync('node', [CARD, '--skill-dir', deployedDir, '--out', deployedOut], { encoding: 'utf-8' })
   assert.equal(r2.status, 0, r2.stderr)
-  const card2 = JSON.parse(r2.stdout)
-  assert.ok(card2.skills.length >= 1)
-  assert.ok(['deployed-merged', 'bundled-core-fallback'].includes(card2['dsh:rosterSource']), '花名册源如实标注')
+  const card2 = JSON.parse(readFileSync(deployedOut, 'utf-8'))
+  assert.equal(card2['dsh:rosterSource'], 'deployed-merged', 'deployed roster 源如实切换')
+  assert.deepEqual(card2.skills.map((s) => s.name), ['甲'], 'disabled/shadowed 过滤，仅甲入卡')
+  assert.ok(card2.skills[0].tags.includes('custom') === false && card2.skills[0].tags.includes('bundled-core'), card2.skills[0].tags)
+  // 损坏 roster → 如实回落 bundled 兜底（不静默当空卡）；fixture 技能目录自带 experts/
+  // 一位兜底专家，验证兜底扫描链路本身工作。
+  const corruptDir = join(dir, 'skill-corrupt')
+  mkdirSync(join(corruptDir, 'expert-sources', 'merged'), { recursive: true })
+  mkdirSync(join(corruptDir, 'experts'), { recursive: true })
+  writeFileSync(join(corruptDir, 'experts', 'fallback.md'), '---\nname: 兜底专家\n---\n正文')
+  writeFileSync(join(corruptDir, 'expert-sources', 'merged', 'roster.json'), '{broken json')
+  const r3 = spawnSync('node', [CARD, '--skill-dir', corruptDir], { encoding: 'utf-8' })
+  assert.equal(r3.status, 0, r3.stderr)
+  const card3 = JSON.parse(r3.stdout)
+  assert.equal(card3['dsh:rosterSource'], 'bundled-core-fallback', '损坏 roster 如实回落兜底')
+  assert.deepEqual(card3.skills.map((s) => s.name), ['兜底专家'], '兜底扫描 fixture experts/ 生效')
 })

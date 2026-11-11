@@ -280,12 +280,19 @@ test('方向2 summon_experts render 成本累计行：开启附【成本】会�
   // 关闭：render 与既有逐字节一致（仅召唤结果行）
   const off = renderFn({ experts: [{ expert: '甲', task: 'a' }] }, value)[0].text
   assert.ok(!off.includes('【成本】'), off)
-  // 开启：先产生一次召唤记账（execute），render 出会话累计行
-  process.env.DSH_EXPERT_TOKEN_BUDGET = '1000'
+  // 开启：先产生一次召唤记账（execute），render 出会话累计行（数字断言：次数/成败/估算下界/预算额；
+  // env 单位=千 token，'0.01' → 10 tokens → formatTokenScale='10 tok'）
+  process.env.DSH_EXPERT_TOKEN_BUDGET = '0.01'
   await batch.execute({ experts: [{ expert: '甲', task: '记账任务' }] }, { agent: {} })
   const on = renderFn({ experts: [{ expert: '甲', task: 'a' }] }, value)[0].text
   assert.ok(on.includes('【成本】'), on)
-  assert.ok(on.includes('会话累计') && on.includes('1 次召唤'), on)
+  assert.ok(on.includes('会话累计：1 次召唤（成功 1/失败 0）'), `次数与成败断言：${on}`)
+  const m = on.match(/估算输入 ~([0-9.]+)(K| tok)/)
+  assert.ok(m, `估算数字在列：${on}`)
+  const sumTokens = m[2] === 'K' ? Number(m[1]) * 1000 : Number(m[1])
+  const floor = estimateTokens('记账任务') + estimateTokens('ok0')
+  assert.ok(sumTokens >= floor, `估算 ≥ 任务书+回包下界（${sumTokens} ≥ ${floor}，origin-chain 标记行只增不减）：${on}`)
+  assert.ok(on.includes('预算 10 tok'), `预算额断言（DSH_EXPERT_TOKEN_BUDGET='0.01' → 10 tokens）：${on}`)
 })
 
 // ── messages 双语完整性 ──────────────────────────────────────────────────────

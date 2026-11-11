@@ -23,7 +23,9 @@ import sys
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 TASKBOARD = os.path.join(TOOLS_DIR, 'taskboard.py')
-SKILL_DIR = os.path.dirname(TOOLS_DIR)
+# 技能目录根（花名册/内置专家解析锚点）：DSH_TASKBOARD_MCP_SKILL_DIR 可指向其他部署副本
+# （自测/对账注入），缺省=本脚本所在技能目录——与 --board 注入同一「测试可控、部署零配置」口径。
+SKILL_DIR = os.environ.get('DSH_TASKBOARD_MCP_SKILL_DIR', '').strip() or os.path.dirname(TOOLS_DIR)
 ROSTER = os.path.join(SKILL_DIR, 'expert-sources', 'merged', 'roster.json')
 EXPERTS_DIR = os.path.join(SKILL_DIR, 'experts')
 
@@ -162,23 +164,51 @@ def roster_fallback():
     return out
 
 
+def deployed_roster_experts():
+    """deployed merged roster 解析：真实 schema 与 lib/tools.js rosterCandidates 逐字段
+    同口径——{ core: [{source?,file,name?,title?,shadowed?,disabled?}...],
+    sources: [{id, files: [...]}...] }（core 缺 source 补 bundled-core、files 缺 source
+    补所属来源 id）。文件缺失/损坏/形状非法 → None（调用方回落 bundled 兜底）。"""
+    if not os.path.isfile(ROSTER):
+        return None
+    try:
+        with open(ROSTER, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    out = []
+    for e in raw.get('core') if isinstance(raw.get('core'), list) else []:
+        if not isinstance(e, dict) or not isinstance(e.get('file'), str):
+            continue
+        out.append({'source': e.get('source') or 'bundled-core', 'name': e.get('name'), 'title': e.get('title'),
+                    'disabled': bool(e.get('disabled')), 'shadowed': bool(e.get('shadowed'))})
+    for s in raw.get('sources') if isinstance(raw.get('sources'), list) else []:
+        if not isinstance(s, dict):
+            continue
+        for e in s.get('files') if isinstance(s.get('files'), list) else []:
+            if not isinstance(e, dict) or not isinstance(e.get('file'), str):
+                continue
+            out.append({'source': e.get('source') or s.get('id') or 'unknown', 'name': e.get('name'), 'title': e.get('title'),
+                        'disabled': bool(e.get('disabled')), 'shadowed': bool(e.get('shadowed'))})
+    return out
+
+
+def _fmt_expert_row(e):
+    label = e.get('name') or e.get('title') or '（无名条目）'
+    marks = ('（已停用）' if e.get('disabled') else '') + ('（shadowed）' if e.get('shadowed') else '')
+    return f"- [{e.get('source', '?')}] {label}{marks}"
+
+
 def list_experts_text():
+    deployed = deployed_roster_experts()
+    if deployed is not None:
+        lines = [f'专家花名册（{len(deployed)} 位；deployed merged roster）：']
+        lines.extend(_fmt_expert_row(e) for e in deployed)
+        return '\n'.join(lines)
     if os.path.isfile(ROSTER):
-        try:
-            with open(ROSTER, 'r', encoding='utf-8') as f:
-                roster = json.load(f)
-            experts = roster.get('experts') if isinstance(roster, dict) else None
-            if not isinstance(experts, list):
-                experts = roster if isinstance(roster, list) else []
-            lines = [f'专家花名册（{len(experts)} 位；deployed merged roster）：']
-            for e in experts:
-                if not isinstance(e, dict):
-                    continue
-                marks = ('（已停用）' if e.get('disabled') else '') + ('（shadowed）' if e.get('shadowed') else '')
-                lines.append(f"- [{e.get('source', '?')}] {e.get('name') or e.get('title') or e.get('file', '?')}{marks}")
-            return '\n'.join(lines)
-        except (json.JSONDecodeError, OSError) as err:
-            return f'merged roster 读取失败（{err}），以下为 bundled-core 兜底：\n' + _fmt_fallback()
+        return f'merged roster 读取失败（{ROSTER} 损坏或形状非法），以下为 bundled-core 兜底：\n' + _fmt_fallback()
     return 'expert-sources/merged/roster.json 未部署（设置页完成来源下载后出现）。当前 bundled-core 兜底花名册：\n' + _fmt_fallback()
 
 

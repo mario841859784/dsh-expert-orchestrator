@@ -7,17 +7,39 @@
 // 注册表/发现面消费；实际 A2A HTTP transport（message/send 等）留后续（如实声明）。
 //
 // 用法：node scripts/gen-agent-card.mjs [--out <path>] [--url <https://host>] [--skill-dir <dir>]
-// - 花名册源：deployed merged roster（expert-sources/merged/roster.json）优先，
+// - 花名册源：deployed merged roster（<skill-dir>/expert-sources/merged/roster.json，真实
+//   schema=core[] + sources[].files[]，与 lib/tools.js rosterCandidates 同口径）优先，
 //   bundled experts/ frontmatter 兜底（与 MCP list_experts 同一兜底口径）；
+//   --skill-dir 可指向其他部署副本（自测/对账用），缺省=本仓技能目录；
+// - version 取 package.json（单一事实源，不硬编码——发版三点 bump 后卡自动跟随）；
 // - url 缺省为空串占位（卡只描述能力，不宣称已有 A2A transport 端点——如实边界）。
 import { readFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+const args = process.argv.slice(2)
+const argOf = (flag) => {
+  const i = args.indexOf(flag)
+  return i >= 0 && args[i + 1] ? args[i + 1] : undefined
+}
+const outPath = argOf('--out')
+const url = (argOf('--url') ?? '').trim()
+const skillDirArg = argOf('--skill-dir')
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SKILL_DIR = join(ROOT, 'skills', 'expert-orchestration')
+const SKILL_DIR = skillDirArg ? resolve(skillDirArg) : join(ROOT, 'skills', 'expert-orchestration')
 const ROSTER = join(SKILL_DIR, 'expert-sources', 'merged', 'roster.json')
 const EXPERTS_DIR = join(SKILL_DIR, 'experts')
+
+/** card version：package.json 单一事实源（读取失败 → 'unknown' 如实占位，不猜）。 */
+const PLUGIN_VERSION = (() => {
+  try {
+    const v = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf-8'))?.version
+    return typeof v === 'string' && v.trim() ? v.trim() : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
 
 /** bundled experts frontmatter 兜底（name:/title: 行扫描，与 mcp_taskboard.py 同口径）。 */
 function bundledExperts() {
@@ -41,25 +63,42 @@ function bundledExperts() {
   return out
 }
 
-function loadExperts() {
-  if (existsSync(ROSTER)) {
-    try {
-      const raw = JSON.parse(readFileSync(ROSTER, 'utf-8'))
-      const experts = Array.isArray(raw?.experts) ? raw.experts : (Array.isArray(raw) ? raw : [])
-      if (experts.length > 0) return { experts, deployed: true }
-    } catch { /* 损坏 → 兜底 */ }
+/** merged roster 解析（真实 schema 与 lib/tools.js rosterCandidates 逐字段同口径）：
+ *  { core: [{source?,file,name?,title?,shadowed?,disabled?}...],
+ *    sources: [{id, files: [{source?,file,...}...]}...] }——core 缺 source 补
+ *  bundled-core、files 缺 source 补所属来源 id。返回 null=文件缺失/损坏/形状非法
+ *  （回落 bundled 兜底）。 */
+function deployedRoster() {
+  if (!existsSync(ROSTER)) return null
+  let raw
+  try {
+    raw = JSON.parse(readFileSync(ROSTER, 'utf-8'))
+  } catch {
+    return null
   }
+  if (!raw || typeof raw !== 'object') return null
+  const out = []
+  for (const e of Array.isArray(raw.core) ? raw.core : []) {
+    if (!e || typeof e.file !== 'string') continue
+    out.push({ source: e.source ?? 'bundled-core', file: e.file, name: e.name ?? null, title: e.title ?? null, disabled: !!e.disabled, shadowed: !!e.shadowed })
+  }
+  for (const s of Array.isArray(raw.sources) ? raw.sources : []) {
+    if (!s || typeof s !== 'object') continue
+    for (const e of Array.isArray(s.files) ? s.files : []) {
+      if (!e || typeof e.file !== 'string') continue
+      out.push({ source: e.source ?? s.id ?? 'unknown', file: e.file, name: e.name ?? null, title: e.title ?? null, disabled: !!e.disabled, shadowed: !!e.shadowed })
+    }
+  }
+  return out
+}
+
+function loadExperts() {
+  const deployed = deployedRoster()
+  if (deployed !== null) return { experts: deployed, deployed: true }
   return { experts: bundledExperts(), deployed: false }
 }
 
-const args = process.argv.slice(2)
-const argOf = (flag) => {
-  const i = args.indexOf(flag)
-  return i >= 0 && args[i + 1] ? args[i + 1] : undefined
-}
-const outPath = argOf('--out')
-const url = (argOf('--url') ?? '').trim()
-
+const outPathResolved = outPath // 命名区分：--out 与 --skill-dir 已在顶部解析
 const { experts, deployed } = loadExperts()
 const skills = experts
   .filter((e) => e && typeof e === 'object' && !e.disabled && !e.shadowed)
@@ -74,7 +113,7 @@ const card = {
   name: 'dsh-expert-orchestrator',
   description: '专家编排节点：分诊 → PM 规划 → 专家委派 → 依赖 DAG 任务板 → 分级交付门禁。任务板与专家花名册经 MCP（tools/mcp_taskboard.py，缺省只读）导出；本卡为 A2A 发现面（card-first，A2A HTTP transport 未部署）。',
   url,
-  version: '2.13.10',
+  version: PLUGIN_VERSION,
   protocolVersion: '0.3.0',
   capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
   defaultInputModes: ['text/plain'],
@@ -84,9 +123,9 @@ const card = {
 }
 
 const json = JSON.stringify(card, null, 2)
-if (outPath) {
-  writeFileSync(outPath, json + '\n')
-  console.error(`AgentCard 写入 ${outPath}（${skills.length} skills，花名册源=${deployed ? 'deployed-merged' : 'bundled-core-fallback'}）`)
+if (outPathResolved) {
+  writeFileSync(outPathResolved, json + '\n')
+  console.error(`AgentCard 写入 ${outPathResolved}（${skills.length} skills，version=${PLUGIN_VERSION}，花名册源=${deployed ? 'deployed-merged' : 'bundled-core-fallback'}）`)
 } else {
   process.stdout.write(json + '\n')
 }

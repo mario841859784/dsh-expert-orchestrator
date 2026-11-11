@@ -111,3 +111,27 @@ test('方向4-c --by 空白归一：纯空白视同未声明（零注记零 args
   const approveEvents = eventsOf(dir).filter((e) => e.type === 'approve')
   assert.deepEqual(approveEvents[0].args, {}, '空白声明 args 形状与旧版一致')
 })
+
+test('方向4-d --by 长度上限 200 码点：201 硬拒零落盘（approve/reject 同口径），边界 200 放行', (t) => {
+  const dir = makeBoardDir(t, 'cap')
+  runTb(dir, ['create', '草案A', '--draft'])
+  // 超限：硬拒（退出码非 0 + stderr 具名提示），任务保持 draft，零事件零落盘
+  const over = runTb(dir, ['approve', 'T1', '--by', '长'.repeat(201)])
+  assert.notEqual(over.code, 0, '超限硬拒')
+  assert.ok(over.stderr.includes('超过上限 200') && over.stderr.includes('码点'), over.stderr)
+  assert.equal(taskById(dir, 'T1').status, 'draft', '拒绝先于任何状态变更')
+  const evCount = eventsOf(dir).filter((e) => e.type === 'approve').length
+  assert.equal(evCount, 0, '零事件')
+  assert.equal('checkpoints' in taskById(dir, 'T1'), false, '零落盘（无注记）')
+  // reject 同口径
+  runTb(dir, ['create', '草案B', '--draft'])
+  const overR = runTb(dir, ['reject', 'T2', '--by', '名'.repeat(201)])
+  assert.notEqual(overR.code, 0)
+  assert.ok(overR.stderr.includes('超过上限 200'), overR.stderr)
+  assert.equal(taskById(dir, 'T2').status, 'draft', 'reject 超限同样零落盘')
+  // 边界 200 码点：放行照常落审计面
+  const ok = runTb(dir, ['approve', 'T1', '--by', '长'.repeat(200)])
+  assert.equal(ok.code, 0)
+  assert.ok(taskById(dir, 'T1').status !== 'draft', '边界值放行')
+  assert.ok((taskById(dir, 'T1').checkpoints ?? []).some((c) => c.note.includes('批准人声明')), '审计注记照常')
+})

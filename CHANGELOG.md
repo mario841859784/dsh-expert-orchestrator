@@ -43,6 +43,16 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 - **SKILL.md §9 新增「MCP/A2A 导出面」段**（调用方式 + 读/写面开关 + 信任边界 + 单向导出边界）；**测试**: `test/protocol-export.selftest.mjs` 新增 6 用例（initialize/版本回显/通知零回包/只读面 7 工具+writes_disabled 具名拒/写面开启 create→claim→progress→done 全链真写+show 读回/-32601+--board 透传/roster 兜底/AgentCard 字段与落盘）；全量 `npm test` 604+6=610 tests 零回归（607 pass）。
 - **调研报告**: `docs/research/protocol-interop-mcp-a2a/00-protocol-interop.md` 落盘（MCP 2025-06 授权模型与 2025-11 Tasks 勘误、A2A AgentCard 字段与生命周期、任务系统 MCP 化产品对照、card-first/读优先/不导出 summon 等落地启示，全部 URL+证据强度标注）；遗留：A2A HTTP transport、MCP 写面鉴权升级（方向 4 身份三层中的密码学层）留后续。
 
+### Fixed（评审补齐 2026-11-12，用户五点清单逐条落地）
+
+- **gen-agent-card.mjs roster 解析纠错（评审清单④连带发现，比清单更深一档）**: 原实现按不存在的 `experts[]` 形状解析 merged roster.json——真实 schema 为 `core[] + sources[].files[]`（与 lib/tools.js rosterCandidates 逐字段同口径）→ **有部署花名册时会静默回落 bundled 兜底**（错误解析被「CI 无真断言」漏网）。现按真 schema 解析（core 补 bundled-core、files 补所属来源 id、disabled/shadowed 过滤），损坏/形状非法如实回落兜底不静默当空卡。
+- **gen-agent-card.mjs 幽灵参数实装（清单①）**: 头注声明的 `--skill-dir <dir>` 此前未实现——现真实现（指向其他部署副本做自测/对账），并同步实装 MCP 侧 `DSH_TASKBOARD_MCP_SKILL_DIR` env 注入（与 `DSH_TASKBOARD_MCP_BOARD` 同一「测试可控、部署零配置」口径）。
+- **card version 硬编码改单一事实源（清单②）**: `version: '2.13.10'` 字面量 → 读 package.json（发版三点 bump 后卡自动跟随；读取失败 'unknown' 如实占位不猜）。
+- **merged-roster CI 真断言（清单④）**: test/protocol-export.selftest.mjs 此前 deployed 分支为死分支（仓库无 merged roster 直接 return）——现经 `--skill-dir`/`DSH_TASKBOARD_MCP_SKILL_DIR` 注入 fixture roster（真 schema 含 disabled/shadowed/缺 name 仅有 title 条目）对 gen-agent-card 与 MCP list_experts 做三态真断言（deployed 解析+标注 / bundled 兜底 / 损坏如实回落）。
+- **approve/reject `--by` 长度上限（清单③）**: 新增 `APPROVAL_BY_MAX_CHARS = 200` 码点——身份声明是名字不是文档，超限硬拒不静默截断（截断会留半个签名；零事件零落盘，拒绝先于任何状态变更）；边界 200 放行；parser help 与 SKILL.md §9 同步。
+- **batchSummary 数字断言（清单⑤）**: test/orchestration-economics.selftest.mjs 成本累计行此前只断言行存在——现断言精确数字面：`会话累计：1 次召唤（成功 1/失败 0）`、估算值 ≥ 任务书+回包估算下界（origin-chain 标记只增不减）、预算额（env '0.01' → 10 tokens → `预算 10 tok`）。
+- **测试**: 全量 `npm test` 610→611 tests（+1 上限用例）零回归；mutation gate 31/31（REGISTRY 行号同步）。
+
 ## [2.13.10] — 2026-11-11
 
 ### Added

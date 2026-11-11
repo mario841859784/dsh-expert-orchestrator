@@ -2,9 +2,11 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
-## [未发布] — 开发分支 dev/orchestration-economics-345（方向 2 编排经济学 + 方向 3 循环检测与人工升级 + 方向 4 代理身份与信任链 + 方向 5 协议对接）
+## [未发布]
 
-> 依据 `docs/research/orchestration-economics/00-overview.md` §4 统一落地清单（方向 2）、`docs/research/loop-detection-escalation/00-loop-detection.md`（方向 3 调研）、`docs/research/agent-identity-trust/00-identity-trust.md`（方向 4 调研）、`docs/research/protocol-interop-mcp-a2a/00-protocol-interop.md`（方向 5 调研）；方向 2 设计映射与诚实边界见 `docs/internal/direction2-orchestration-economics.md`。本节发布前不 bump 版本、不 npm publish。
+## [2.14.0] — 2026-11-12
+
+> 依据 `docs/research/orchestration-economics/00-overview.md` §4 统一落地清单（方向 2）、`docs/research/loop-detection-escalation/00-loop-detection.md`（方向 3 调研）、`docs/research/agent-identity-trust/00-identity-trust.md`（方向 4 调研）、`docs/research/protocol-interop-mcp-a2a/00-protocol-interop.md`（方向 5 调研）；方向 2 设计映射与诚实边界见 `docs/internal/direction2-orchestration-economics.md`。
 
 ### Added
 

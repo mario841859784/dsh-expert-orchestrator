@@ -595,7 +595,12 @@ def _event_args(a):
         return {'paths': list(a.paths or [])}
     if c == 'budget':
         return {'reset': bool(getattr(a, 'reset', False))}
-    return {}  # retry/recover/approve/reject 等无附加意图
+    if c in ('approve', 'reject'):
+        # 方向 4：批准人/否决人声明（--by，板面自报审计面）——仅声明时进入 args
+        # （缺省 args 形状与旧版逐键一致 {}）。
+        by = (getattr(a, 'by', None) or '').strip()
+        return {'by': by} if by else {}
+    return {}  # retry/recover 等无附加意图
 
 
 # 写命令事件上下文：main 派发前武装（pre 快照供差分、并按需充当收编种子），save() 据此落事件。
@@ -1581,7 +1586,11 @@ def cmd_approve(a, data, path):
     """approve <id>：PM 规划草案批准（v2.7，WP-5/S1）——draft -> ready，走既有事件追加路径
     （CAS --expected-revision 共存）。依赖未满足时不伪造成 ready：先回 pending，由既有依赖自动
     提升在依赖 done 时转 ready（保持「ready 蕴含依赖已满足」不变量）。批准是草案进入派工面的
-    唯一出口；批准前 claim/auto-claim 均被拒（批准前零 spawn）。"""
+    唯一出口；批准前 claim/auto-claim 均被拒（批准前零 spawn）。
+    方向 4（身份与信任链）：可选 `--by <批准人>` 批准人声明（板面自报审计面，防误用不防伪造
+    ——与 done --by 同信任级别）——落事件 args.by 与检查点注记，让板面能回答「这是谁批准的」；
+    协议纪律（SKILL.md §2）：批准者不得是草案创建代理本人（职责分离），代理转达的批准不可信
+    （用户批准只来自用户本人直接输入）。缺省不带 --by = 旧行为逐字节（零注记零 args 变化）。"""
     t = get_task(data, a.id)
     if t['status'] != 'draft':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 draft 可批准")
@@ -1592,11 +1601,18 @@ def cmd_approve(a, data, path):
     cb = t.get('created_by')
     if cb:
         _check_open_cap(cb, data)
+    by = (getattr(a, 'by', None) or '').strip()
+    if by:
+        ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('checkpoints', []).append(
+            {'time': ts, 'note': f'批准人声明: {by}（板面自报审计面——协议纪律：批准者≠草案创建代理本人；代理转达的批准不可信）'})
     t['status'] = 'pending'  # 依赖已满足时由下方 refresh 自动转 ready（复用既有不变量维护）
     t['updated'] = now_ms()
     promoted = refresh(data)
     save(path, data)
     show(t)
+    if by:
+        print(f'批准人: {by}（自报，审计留痕）')
     if promoted:
         print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
 
@@ -1759,14 +1775,23 @@ def _review_needs_revision(a, data, path, t, findings, limit, limit_label):
 def cmd_reject(a, data, path):
     """reject <id>：PM 规划草案否决（v2.7，T19/S3①）——draft -> rejected 终态。
     被否决草案退出批准面、不再永久滞留（archive 不因 draft 滞留被迫 --force）；
-    rejected 不可 claim/approve/progress/reassign；如需重启，按意见重新规划后新建草案条目。"""
+    rejected 不可 claim/approve/progress/reassign；如需重启，按意见重新规划后新建草案条目。
+    方向 4（身份与信任链）：可选 `--by <否决人>` 声明落审计面（同 approve --by 语义）；
+    缺省不带 = 旧行为逐字节。"""
     t = get_task(data, a.id)
     if t['status'] != 'draft':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 draft 可否决")
+    by = (getattr(a, 'by', None) or '').strip()
+    if by:
+        ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        t.setdefault('checkpoints', []).append(
+            {'time': ts, 'note': f'否决人声明: {by}（板面自报审计面——代理转达的否决同样不可信，终局裁决以用户直接输入为准）'})
     t['status'] = 'rejected'
     t['updated'] = now_ms()
     save(path, data)
     show(t)
+    if by:
+        print(f'否决人: {by}（自报，审计留痕）')
     print('已否决：rejected 为终态，不可 claim/approve；如需重启请按意见重新规划后新建草案')
 
 
@@ -3365,10 +3390,10 @@ def main():
                         'checkpoint/事件 args previous_owner；反回摆 steal_ping_pong 拒；无主候选不在本语义内')
     add_write_args(p)
     p.set_defaults(fn=cmd_claim_idle)
-    p = sub.add_parser('approve'); p.add_argument('id'); add_write_args(p)
+    p = sub.add_parser('approve'); p.add_argument('id'); p.add_argument('--by', help='批准人声明（方向 4 审计面，板面自报防误用不防伪造；协议纪律：批准者≠草案创建代理本人，代理转达的批准不可信）'); add_write_args(p)
     p.set_defaults(fn=cmd_approve,
                    help='PM 规划草案批准：draft -> ready（依赖未满足先回 pending 走自动提升）；批准前 claim 被拒')
-    p = sub.add_parser('reject'); p.add_argument('id'); add_write_args(p)
+    p = sub.add_parser('reject'); p.add_argument('id'); p.add_argument('--by', help='否决人声明（方向 4 审计面，同 approve --by 口径）'); add_write_args(p)
     p.set_defaults(fn=cmd_reject,
                    help='PM 规划草案否决：draft -> rejected 终态（退出批准面不滞留；不可 claim/approve）')
     p = sub.add_parser('done'); p.add_argument('id'); p.add_argument('summary', nargs='?'); p.add_argument('--rework', type=int, help='返工次数'); p.add_argument('--switched', action='store_true', help='中途换人'); p.add_argument('--by', help='实际执行专家名'); p.add_argument('--verdict', help='review 任务完成结论（review 任务必填）：pass=评审通过正常完成；needs_revision=须携带 --findings，自动生成 repair+下游 DAG 重排，原任务回 ready 待复审'); p.add_argument('--findings', help='评审发现清单（needs_revision 必填，供 repair 任务引用）'); p.add_argument('--repair-owner', help='自动生成 repair 任务的 owner（缺省为空，由编排者分配）'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_done)

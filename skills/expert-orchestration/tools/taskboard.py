@@ -70,6 +70,14 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
   attempt 代际：claim --attempt <id> 建立派工代际；reassign <id> <新attempt> 转派先撤销旧代际（记入 attempt_revoked），
     且拒绝复活任何已撤销代际；done/fail/progress 带 --attempt 时按代际校验（fail closed：任务无开放代际时
     返回 {"error":"no_attempt",...}），旧/已撤销代际返回 {"error":"stale_attempt",...} 且不落盘；不带 --attempt 行为与旧版一致。
+  reassign 代际能力化（T7）：reassign <id> auto 由工具生成不可猜 token（at-<16hex>，show/--json 回显，供抄入下游任务书，
+    绝不复用已撤销代际与当前代际）；reassign <id> auto --attempt <当前代际> 为 peer 互派通道——持有证明按 check_attempt
+    口径校验当前开放代际（no_attempt/stale_attempt 具名拒绝、零写零事件），且限任务当前 owner==自己（R1 投影：token 只随
+    任务书下发给当前 owner，持当前开放代际即视作 owner 本人；CLI 无鉴权，防误用非防伪造）。持有证明与自报新 attempt_id
+    混用返回 {"error":"attempt_source_conflict",...}（peer 持有证明时新 token 必须由工具生成）；任务无 owner 时 peer 通道
+    返回 {"error":"not_task_owner",...}（无主任务的派发权在编排者通道）。'auto' 自本版起为 reassign 保留触发词；
+    不带 --attempt 且不自报 'auto' 的旧用法逐字节不变；生成模式事件 args 携带 generated=true 与 proof_attempt（有持有
+    证明时）留痕，token 也是合法 attempt_id——八命令既有 --attempt 校验零改动复用。
   查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（逐板标注损坏）外
     所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback。
   环检测：create --dep 与 set_dependencies 写入前做全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 且不落盘。
@@ -1137,6 +1145,8 @@ def last_checkpoint(t):
 def cmd_show(a, data, _):
     t = get_task(data, a.id)
     show(t)
+    if t.get('attempt_id'):  # T7：代际回显供抄入下游任务书；无代际任务输出零变化（show(t) 八命令共用展示不加行，保逐字节兼容）
+        print(f"  当前代际: {t['attempt_id']}")
     if t['desc']:
         print(f"  完成标准: {t['desc']}")
     if t.get('kind'):
@@ -2196,7 +2206,12 @@ def cmd_recover(a, data, path):
 def cmd_reassign(a, data, path):
     """转派：先拒绝复活任何已撤销代际，再撤销旧 attempt（记入 attempt_revoked），建立新代际；
     旧代际的 done/fail/progress 随后被拒。draft/rejected/escalated 不可转派（草案未进派工面、
-    终态不可再动——escalated 须用户显式 retry 解除升级后重新走 claim/reassign）。"""
+    终态不可再动——escalated 须用户显式 retry 解除升级后重新走 claim/reassign）。
+    代际能力化（T7）：新 attempt_id 传保留字 'auto' 时由工具生成不可猜 token（at-<16hex>）；
+    --attempt <当前代际> 为 peer 互派持有证明——按 check_attempt 口径校验当前开放代际，且限任务
+    当前 owner==自己（R1 投影：token 只随任务书下发给当前 owner，持当前开放代际即视作 owner 本人；
+    CLI 无鉴权，防误用非防伪造）；持有证明与自报新 attempt_id 混用拒绝（attempt_source_conflict，
+    peer 通道新 token 必须工具生成——宁拒勿错）。不带 --attempt 且不自报 'auto' 时与旧版逐字节一致。"""
     t = get_task(data, a.id)
     if t['status'] == 'draft':
         sys.exit(f"错误：{a.id} 为 PM 规划草案（draft），未经 approve 批准不可转派")
@@ -2204,15 +2219,39 @@ def cmd_reassign(a, data, path):
         sys.exit(f"错误：{a.id} 已否决（rejected 终态），不可转派")
     if t['status'] == 'escalated':
         sys.exit(f"错误：{a.id} 已升级（escalated），等待用户处置，不可转派；用户显式 retry 可解除升级")
-    revoked = t.get('attempt_revoked') or []
-    if a.attempt_id in revoked:
-        raise BoardError('stale_attempt', attempt=a.attempt_id, current=t.get('attempt_id'),
-                         revoked=revoked,
-                         hint='该 attempt 已被撤销，不能经 reassign 复活；请使用全新的 attempt_id')
+    proof = getattr(a, 'attempt', None)
+    generated = a.attempt_id == 'auto'  # 保留触发词：工具生成不可猜 token（T7）
+    if proof is not None and not generated:
+        raise BoardError('attempt_source_conflict', attempt=proof, proposed=a.attempt_id,
+                         hint='peer 互派须用工具生成的新 token：reassign <id> auto --attempt <当前代际>；'
+                              '自报新 attempt_id 只属于编排者通道（不带 --attempt）')
+    if proof is not None:
+        check_attempt(a, t)  # 持有证明：当前开放代际校验（no_attempt/stale_attempt 具名拒绝、零写零事件）
+        if not t.get('owner'):
+            raise BoardError('not_task_owner', owner=t.get('owner'),
+                             hint='peer 互派通道要求任务当前有 owner（owner==自己的板面投影：持有证明即 owner 身份，'
+                                  'R1 防误用非防伪造）；无主任务的派发权在编排者通道（不带 --attempt）')
     old = t.get('attempt_id')
-    if old and old != a.attempt_id:
+    revoked = t.get('attempt_revoked') or []
+    if generated:
+        token = 'at-' + uuid.uuid4().hex[:16]  # at-<16hex>：不可猜（T7 任务书口径）
+        while token in revoked or token == old:  # token 不可猜，绝不撞已撤销代际/当前代际
+            token = 'at-' + uuid.uuid4().hex
+        new_id = token
+        if _EVT_CTX.get('armed'):  # 事件 args 留痕生成方式（仅生成模式改写，旧通道 args 形状不变）
+            _EVT_CTX['args']['attempt_id'] = new_id
+            _EVT_CTX['args']['generated'] = True
+            if proof is not None:
+                _EVT_CTX['args']['proof_attempt'] = proof
+    else:
+        if a.attempt_id in revoked:
+            raise BoardError('stale_attempt', attempt=a.attempt_id, current=old,
+                             revoked=revoked,
+                             hint='该 attempt 已被撤销，不能经 reassign 复活；请使用全新的 attempt_id')
+        new_id = a.attempt_id
+    if old and old != new_id:
         t.setdefault('attempt_revoked', []).append(old)
-    t['attempt_id'] = a.attempt_id
+    t['attempt_id'] = new_id
     _reset_nudges(t)  # 新代际=新起点：旧代积攒的未响应 nudge 不带入
     t.pop('heartbeat_at', None)
     if a.owner:
@@ -2220,7 +2259,7 @@ def cmd_reassign(a, data, path):
     t['updated'] = now_ms()
     save(path, data)
     show(t)
-    print(f"旧 attempt {old or '（无）'} 已撤销，当前代际 {a.attempt_id}")
+    print(f"旧 attempt {old or '（无）'} 已撤销，当前代际 {new_id}")
 
 
 def cmd_set_dependencies(a, data, path):
@@ -2809,7 +2848,12 @@ def main():
     p = sub.add_parser('status'); p.set_defaults(fn=cmd_status)
     p = sub.add_parser('boards'); p.set_defaults(fn=cmd_boards)
     p = sub.add_parser('archive'); p.add_argument('--force', action='store_true'); p.set_defaults(fn=cmd_archive)
-    p = sub.add_parser('reassign'); p.add_argument('id'); p.add_argument('attempt_id', help='新派工代际 attempt_id（编排者生成）'); p.add_argument('--owner'); add_write_args(p); p.set_defaults(fn=cmd_reassign)
+    p = sub.add_parser('reassign', help='转派：撤销旧代际建立新代际；attempt_id 传保留字 auto 由工具生成不可猜 token（at-<16hex>）；peer 互派用 --attempt 携带持有证明')
+    p.add_argument('id')
+    p.add_argument('attempt_id', help='新派工代际 attempt_id（编排者生成）；保留字 auto=工具生成 token，show/--json 回显；与 --attempt 持有证明混用自报值将拒绝（attempt_source_conflict）')
+    p.add_argument('--attempt', default=None,
+                   help='peer 互派持有证明：须等于任务当前开放代际（no_attempt/stale_attempt 口径）且任务须有 owner（owner==自己）；与自报新 attempt_id 混用拒绝；缺省=编排者通道（与旧版一致）')
+    p.add_argument('--owner'); add_write_args(p); p.set_defaults(fn=cmd_reassign)
     p = sub.add_parser('set_dependencies'); p.add_argument('id'); p.add_argument('--dep', required=True, help='逗号分隔的依赖任务ID（整体替换）'); add_write_args(p); p.set_defaults(fn=cmd_set_dependencies)
     p = sub.add_parser('verify'); p.add_argument('id'); p.add_argument('files', nargs='*', help='文件范围清单；缺省=重算既有回执输出 fresh/stale'); add_write_args(p); p.set_defaults(fn=cmd_verify)
     p = sub.add_parser('own', help='工件归属门禁（#22）：登记任务工件归属；与其他开放任务冲突时具名拒绝 artifact_owned')

@@ -2295,7 +2295,7 @@ def cmd_reassign(a, data, path):
     if generated:
         token = 'at-' + uuid.uuid4().hex[:16]  # at-<16hex>：不可猜（T7 任务书口径）
         while token in revoked or token == old:  # token 不可猜，绝不撞已撤销代际/当前代际
-            token = 'at-' + uuid.uuid4().hex
+            token = 'at-' + uuid.uuid4().hex[:16]  # T12 评审🟢2：重试分支同为 at-<16hex>，防撞口径不变
         new_id = token
         if _EVT_CTX.get('armed'):  # 事件 args 留痕生成方式（仅生成模式改写，旧通道 args 形状不变）
             _EVT_CTX['args']['attempt_id'] = new_id
@@ -3021,8 +3021,10 @@ def main():
             # ── T9（阶段二-T3）反风暴只读查询：无锁快照（沿 budget T38-1 降锁先例）──
             # load(repair=False) 零写零 stderr（不重建视图、不自愈事件流——无锁进程绝不与持锁
             # 写命令竞争 os.replace/O_APPEND）；不武装事件、绝不 save——查询面零写零事件。
-            # 结果=事件流某一完整前缀的折叠（快照级一致性）；--expected-revision 仍校验
-            # （对快照 revision，仅乐观提示）。人读/--json 形态与锁内路径一致。
+            # 结果=事件流某一完整前缀的折叠（快照级一致性）。T12 评审🟢3：open-counts parser
+            # 未注册 --expected-revision（只读查询面无 add_write_args，与 metrics/status 读命令同口径），
+            # 下方 check_revision 经 getattr 缺省 None 透传为不校验；budget 路径有该参数故校验生效。
+            # 人读/--json 形态与锁内路径一致。
             data = load(path, repair=False)
             check_revision(a, data)
             _emit(a, data, path, json_mode)

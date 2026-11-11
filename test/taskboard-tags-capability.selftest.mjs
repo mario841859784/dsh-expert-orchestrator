@@ -1,5 +1,5 @@
 // test/taskboard-tags-capability.selftest.mjs — T8 能力标签自测（node:test，零依赖）。
-// 覆盖验收 a–d：a) 不带 --tags 的 create/claim/claim_idle 与 HEAD（T7 已交付版）逐字节一致
+// 覆盖验收 a–d：a) 不带 --tags 的 create/claim/claim_idle 与固定基线 ca91bda（T7 已交付版）逐字节一致
 //    （双版本同输入回归实测 + 事件 args 键集一致）；b) tag_mismatch 拒绝面：claim 无声明/
 //    无交集具名拒绝零写零事件、claim_idle 逐候选跳过（skipped.reason=tag_mismatch）、
 //    全跳过仍走 claim_idle_noop；c) 事件 args 携带 tags/claimant tags 留档（未声明形状不变），
@@ -40,10 +40,11 @@ const eventsOf = (dir) => readFileSync(join(dir, EVENTS_REL), 'utf-8').trim().sp
 
 // ── a) 缺省兼容：不带 --tags 双版本（HEAD vs 当前）同输入逐字节回归 ──────────
 test('T8-a 缺省兼容：create/claim/claim_idle 不带 --tags 与 HEAD 逐字节一致；事件 args 键集一致', (t) => {
-  // HEAD 基线副本（T7 交付版）落 tmp，双版本跑同一不含 --tags 的命令脚本
-  const head = spawnSync('git', ['show', 'HEAD:skills/expert-orchestration/tools/taskboard.py'],
+  // 固定基线副本（T7 交付版 commit ca91bda）落 tmp，双版本跑同一不含 --tags 的命令脚本。
+  // T12 评审🟡1：原用 `git show HEAD:`，HEAD 落 T8/T9 后 HEAD blob==工作树文件，退化为恒真空转，故钉固定 commit。
+  const head = spawnSync('git', ['show', 'ca91bda:skills/expert-orchestration/tools/taskboard.py'],
     { cwd: REPO_ROOT, encoding: 'utf-8' })
-  assert.equal(head.status, 0, 'git show HEAD 基线可读')
+  assert.equal(head.status, 0, 'git show ca91bda 基线可读')
   const headPy = join(mkdtempSync(join(tmpdir(), 't8-head-')), 'taskboard_head.py')
   writeFileSync(headPy, head.stdout)
   t.after(() => rmSync(headPy, { force: true }))

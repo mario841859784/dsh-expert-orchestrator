@@ -47,12 +47,15 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
   重要-1：旧票跨轮残留会伪造共识——旧同向票+新一轮少量同向票假生效——或伪造僵局）。m 票任务拒单方
   done --verdict needs_revision（vote_required 具名拒绝）——fail 只能经投票生效，防单方绕过陪审团。
 依赖：create 时 --dep T1,T2 声明；引用不存在的任务会报错。
-代理 scoped 自建任务（M1）：create --created-by <专家名> --of <任务id> 二者必须成对出现（只给其一
-  具名拒绝 created_by_of_pair_required）；校验链按序——①--of 任务须存在于本板且 owner == --created-by
-  （认领关系核实，否则 not_task_owner）；②新任务 scope 逐项 ⊆ --of 任务 scope（复用 _scope_match 语义，
+代理 scoped 自建任务（M1）：create --created-by <专家名> --of <任务id> 二者必须成对出现（只给其一或给
+  空串/纯空白——入口 strip 归一后视同缺参——一律具名拒绝 created_by_of_pair_required）；校验链按序——
+  ①--of 任务须存在于本板且 owner == --created-by
+  （认领关系核实，否则 not_task_owner）；②新任务 scope 必须显式非空（否则 agent_create_requires_scope，
+  不继承父 scope）且逐项 ⊆ --of 任务 scope（复用 _scope_match 语义，
   否则 scope_out_of_violation）；③强制 status=draft（缺 --draft 即拒绝 agent_create_requires_draft）；
   ④kind 允许面=缺省 kind（follow-up 语义），--kind 同传具名拒绝 agent_create_kind_rejected（Q5 裁决）；
-  ⑤代理 draft 进入既有待批面（approve/reject/claim 拒绝语义零改动）。任务 JSON 落单键字符串字段
+  ⑤owner 一致性：显式 --owner 必须等于 --created-by（自建自领，否则 agent_owner_mismatch）；
+  ⑥代理 draft 进入既有待批面（approve/reject/claim 拒绝语义零改动）。任务 JSON 落单键字符串字段
   created_by（事件流 type=create 的 args 携带 created_by/of 留档）；lead 派发（不带新参数）不落此字段，
   输出与旧版逐字节一致。
 检查点：progress <id> "<说明>" 向任务追加带时间戳的检查点记录（新字段 checkpoints，旧板无此字段兼容）；长任务/多阶段委派每完成一个阶段记一次，专家失败重试前编排者先读取它组装续跑任务书，禁止无检查点直接从头重跑。
@@ -528,9 +531,10 @@ def _event_args(a):
             args['quorum_m'] = a.quorum_m  # m 票声明随事件留档（未声明=单评审员路径，args 形状与旧版一致）
         if getattr(a, 'created_by', None) is not None:
             # M1 代理 scoped 自建任务：事件流 type=create 携带 created_by（of 一并留档供审计回指）；
-            # lead 派发（不带新参数）args 形状与旧版逐键一致
-            args['created_by'] = a.created_by
-            args['of'] = a.of
+            # T6/B1：与入口归一同式 strip——留档值与任务落盘字段一致；lead 派发（不带新参数）
+            # args 形状与旧版逐键一致（成功写事件仅产生于归一后非空值的代理创建）
+            args['created_by'] = a.created_by.strip()
+            args['of'] = (a.of or '').strip()
         return args
     if c == 'claim':
         return {'owner': a.owner, 'attempt': a.attempt}
@@ -1040,12 +1044,18 @@ def cmd_create(a, data, path):
         if a.quorum_m < 1:
             sys.exit('错误：--quorum-m 须为 ≥1 的整数（裸声明即默认陪审团 m=3；m=1 单评审员路径无需声明）')
     # ── 代理 scoped 自建任务（M1）：校验链按序执行，任一不过具名拒绝零事件零落盘 ──
+    # T6/B1：入口归一——--created-by 与 --of 同式 strip()，空串/纯空白视作缺参（None）；
+    # 成对性校验在归一后进行：只给其一、或给空串/空白，一律同一具名成对错误拒绝（杜绝
+    # --created-by "" 以 ''=='' 恒过无主父任务认领核实、且空串经 UI 归一伪装 lead 草稿）。
     created_by = getattr(a, 'created_by', None)
     of_id = getattr(a, 'of', None)
-    if (created_by is None) != (of_id is None):
+    raw_provided = created_by is not None or of_id is not None
+    created_by = created_by.strip() or None if created_by is not None else None
+    of_id = of_id.strip() or None if of_id is not None else None
+    if raw_provided and (created_by is None or of_id is None):
         raise BoardError('created_by_of_pair_required',
-                         hint='--created-by 与 --of 必须成对出现（代理 scoped 自建任务）；'
-                              'lead 派发两者均不携带，行为不变')
+                         hint='--created-by 与 --of 必须成对出现且均为非空白值（代理 scoped 自建任务）；'
+                              '空串/纯空白视同缺参；lead 派发两者均不携带，行为不变')
     agent_create = created_by is not None
     if agent_create:
         # ① 认领关系核实：--of 任务须存在于本板且其 owner == --created-by
@@ -1058,6 +1068,12 @@ def cmd_create(a, data, path):
         # ② scope 越权：新任务 scope 逐项 ⊆ --of 任务 scope（复用 _scope_match 语义）
         parent_scope = parent.get('scope') or []
         agent_scope = [s.strip().rstrip('/') for s in (a.scope or '').split(',') if s.strip()]
+        if not agent_scope:
+            # T6/I1：拒绝空/缺 scope——无 scope 任务 approve 后被 commit 引用时门禁第三查对范围
+            # fail-open（跳过范围检查），「无 scope」比越权 scope 更宽；不继承父 scope，保持显式性
+            raise BoardError('agent_create_requires_scope', of=of_id,
+                             hint='代理创建必须显式携带非空 --scope（逗号分隔，逐项须落在 --of 任务 scope 内；'
+                                  '不继承父 scope）')
         out_of = [s for s in agent_scope if not _scope_match(s, parent_scope)]
         if out_of:
             raise BoardError('scope_out_of_violation', of=of_id, scope=out_of,
@@ -1071,6 +1087,11 @@ def cmd_create(a, data, path):
         if a.kind:
             raise BoardError('agent_create_kind_rejected', kind=a.kind,
                              hint='代理创建仅允许缺省 kind（follow-up 语义）；--kind review 与代理创建互斥')
+        # ⑤ owner 一致性（T6/I2）：代理创建强制自建自领——显式 --owner 必须等于 --created-by，
+        # 杜绝预派他人任务绕过认领竞争语义；--owner 缺省/空串不落 owner（claim 时再定，行为不变）
+        if a.owner and a.owner != created_by:
+            raise BoardError('agent_owner_mismatch', owner=a.owner, created_by=created_by,
+                             hint='代理创建强制 owner == created-by（自建自领）；给他人派任务请走 lead 派发路径')
     deps = [d.strip() for d in (a.dep or '').split(',') if d.strip()]
     for d in deps:
         if d not in data['tasks']:

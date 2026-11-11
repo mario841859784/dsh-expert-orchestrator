@@ -164,3 +164,106 @@ test('T2-json 错误信封：代理创建具名拒绝在 --json 模式为 {"ok":
   assert.equal(r.json.error, 'created_by_of_pair_required')
   assert.ok(!existsSync(join(dir, BOARD_REL)) || !('T1' in boardOf(dir).tasks)) // 零落盘
 })
+
+// ── T6/B1 回归：--created-by 空串/纯空白绕过校验链①（''!='' 恒过无主父任务）——入口归一 ──
+test('T6-B1 入口归一：空串/纯空白视同缺参 → created_by_of_pair_required（含无主父任务旁路实证拒绝 + 双空串不走 lead 路径 + 零落盘零事件）', (t) => {
+  const dir = makeBoardDir(t, 'b1')
+  // 无主父任务（owner=''）：评审 B1 的原始旁路形态——旧代码 --created-by "" --of T1 以 ''!=''=False 恒过
+  assert.equal(runTb(dir, ['create', '无主父']).code, 0)
+  const before = readFileSync(join(dir, BOARD_REL))
+  const evBefore = readFileSync(join(dir, EVENTS_REL), 'utf-8')
+  // 空串 + --of：不再落入校验链①，成对性归一后具名拒绝
+  const empty = runTb(dir, ['--json', 'create', '子', '--created-by', '', '--of', 'T1', '--scope', 'a', '--draft'])
+  assert.equal(empty.code, 1)
+  assert.equal(empty.json.error, 'created_by_of_pair_required')
+  // 归一边界：纯空白串视同空（空格/Tab 混排）
+  for (const blank of ['   ', '\t', ' \t ']) {
+    const rej = runTb(dir, ['--json', 'create', '子', '--created-by', blank, '--of', 'T1', '--scope', 'a', '--draft'])
+    assert.equal(rej.code, 1, JSON.stringify(blank))
+    assert.equal(rej.json.error, 'created_by_of_pair_required', JSON.stringify(blank))
+  }
+  // 只给其一但给的也是空白 → 同一具名成对错误（不得静默按缺参走 lead 路径）
+  for (const args of [['create', '子', '--created-by', '  '], ['create', '子', '--of', '\t']]) {
+    const one = runTb(dir, ['--json', ...args])
+    assert.equal(one.code, 1, args.join(' '))
+    assert.equal(one.json.error, 'created_by_of_pair_required', args.join(' '))
+  }
+  // 双空串/双空白：不得归一成双缺参后冒充 lead 派发成功创建（同样成对错误拒绝）
+  for (const args of [['--created-by', '', '--of', ''], ['--created-by', ' ', '--of', '\t']]) {
+    const both = runTb(dir, ['--json', 'create', '子', ...args, '--draft'])
+    assert.equal(both.code, 1, args.join(' '))
+    assert.equal(both.json.error, 'created_by_of_pair_required', args.join(' '))
+  }
+  // 零落盘零事件（板文件与事件流字节级不变；上述拒绝无任何写入）
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before)
+  assert.equal(readFileSync(join(dir, EVENTS_REL), 'utf-8'), evBefore)
+  // 归一正向边界：空白包夹的合法名 ' be ' 归一为 'be'，与 owner 精确匹配后可创建
+  assert.equal(runTb(dir, ['create', '有主父', '--owner', 'be', '--scope', 'a']).code, 0)
+  const ok = runTb(dir, ['create', '子', '--created-by', ' be ', '--of', 'T2', '--scope', 'a', '--draft'])
+  assert.equal(ok.code, 0)
+  const task = boardOf(dir).tasks.T3
+  assert.equal(task.created_by, 'be') // 落盘为归一后值（非 ' be '）
+  const createEvents = eventsOf(dir).filter((e) => e.type === 'create')
+  assert.equal(createEvents.at(-1).args.created_by, 'be') // 事件流留档与落盘字段一致
+  assert.equal(createEvents.at(-1).args.of, 'T2')
+})
+
+// ── T6/I1 回归：代理创建空/缺 scope 穿过链② → approve 后 commit 门禁第三查 fail-open ──
+test('T6-I1 scope 必填：不带 --scope / 空串 / 纯空白逗号串 → agent_create_requires_scope（不继承父 scope，零落盘）', (t) => {
+  const dir = makeBoardDir(t, 'i1')
+  assert.equal(runTb(dir, ['create', '父', '--owner', 'be', '--scope', 'a']).code, 0)
+  const before = readFileSync(join(dir, BOARD_REL))
+  const evBefore = readFileSync(join(dir, EVENTS_REL), 'utf-8')
+  // 缺 --scope：旧代码 agent_scope 空列表 out_of 恒空空泛穿链②
+  const noScope = runTb(dir, ['--json', 'create', '子', '--created-by', 'be', '--of', 'T1', '--draft'])
+  assert.equal(noScope.code, 1)
+  assert.equal(noScope.json.error, 'agent_create_requires_scope')
+  assert.equal(noScope.json.of, 'T1')
+  // 空串 / 纯空白逗号串（归一后等价空列表）同样拒绝
+  for (const scope of ['', '   ', ' , , ', ',']) {
+    const rej = runTb(dir, ['--json', 'create', '子', '--created-by', 'be', '--of', 'T1', '--scope', scope, '--draft'])
+    assert.equal(rej.code, 1, JSON.stringify(scope))
+    assert.equal(rej.json.error, 'agent_create_requires_scope', JSON.stringify(scope))
+  }
+  // 不继承父 scope：拒绝而非默认落父 scope（显式性裁定）
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before)
+  assert.equal(readFileSync(join(dir, EVENTS_REL), 'utf-8'), evBefore) // 零落盘零事件
+  // 显式非空 scope 且 ⊆ 父 scope → 照常创建（链②原有语义不变）
+  const ok = runTb(dir, ['create', '子', '--created-by', 'be', '--of', 'T1', '--scope', 'a', '--draft'])
+  assert.equal(ok.code, 0)
+  assert.deepEqual(boardOf(dir).tasks.T2.scope, ['a'])
+})
+
+// ── T6/I2 回归：--owner 与 --created-by 无一致性校验 → 预派他人任务 ──
+test('T6-I2 自建自领：显式 --owner ≠ --created-by → agent_owner_mismatch（含纯空白 owner）；--owner 空或缺省行为不变；--owner == created-by 允许', (t) => {
+  const dir = makeBoardDir(t, 'i2')
+  assert.equal(runTb(dir, ['create', '父', '--owner', 'be', '--scope', 'a']).code, 0)
+  const before = readFileSync(join(dir, BOARD_REL))
+  // 预派他人：旧代码产出 owner=别人/created_by=be 的任务（评审 I2 实证形态）
+  const foreign = runTb(dir, ['--json', 'create', '子', '--created-by', 'be', '--of', 'T1', '--scope', 'a', '--draft', '--owner', '别人'])
+  assert.equal(foreign.code, 1)
+  assert.equal(foreign.json.error, 'agent_owner_mismatch')
+  assert.equal(foreign.json.owner, '别人')
+  assert.equal(foreign.json.created_by, 'be')
+  // 归一边界：纯空白 owner ≠ created-by，同样拒绝
+  const blank = runTb(dir, ['--json', 'create', '子', '--created-by', 'be', '--of', 'T1', '--scope', 'a', '--draft', '--owner', '  '])
+  assert.equal(blank.code, 1)
+  assert.equal(blank.json.error, 'agent_owner_mismatch')
+  assert.deepEqual(readFileSync(join(dir, BOARD_REL)), before) // 零落盘
+  // --owner 缺省：行为不变（owner 不落、claim 时再定）
+  assert.equal(runTb(dir, ['create', '子1', '--created-by', 'be', '--of', 'T1', '--scope', 'a', '--draft']).code, 0)
+  assert.equal(boardOf(dir).tasks.T2.owner, '')
+  assert.equal(boardOf(dir).tasks.T2.created_by, 'be')
+  // --owner 空串：为空（ruling「a.owner 为空或 == created_by」）→ 允许，owner 不落
+  assert.equal(runTb(dir, ['create', '子2', '--created-by', 'be', '--of', 'T1', '--scope', 'a', '--draft', '--owner', '']).code, 0)
+  assert.equal(boardOf(dir).tasks.T3.owner, '')
+  // --owner == created-by：自建自领允许，owner 落 created-by 本身
+  assert.equal(runTb(dir, ['create', '子3', '--created-by', 'be', '--of', 'T1', '--scope', 'a', '--draft', '--owner', 'be']).code, 0)
+  assert.equal(boardOf(dir).tasks.T4.owner, 'be')
+  assert.equal(boardOf(dir).tasks.T4.created_by, 'be')
+  // approve → claim（自建自领后归属展示一致）
+  assert.equal(runTb(dir, ['approve', 'T4']).code, 0)
+  const claimed = runTb(dir, ['claim', 'T4', 'be'])
+  assert.equal(claimed.code, 0)
+  assert.equal(boardOf(dir).tasks.T4.owner, 'be')
+})

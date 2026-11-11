@@ -30,6 +30,7 @@ const tb = new Function(
   source.slice(beginIndex + BEGIN.length, endIndex)
     + '\n;return { TB_STATUS_LANES, TB_LANE_ORDER, resolveBoard: tbResolveBoard, parseBoard: tbParseBoard,'
     + ' groupByStatus: tbGroupByStatus, computeDepBadges: tbComputeDepBadges, countRunning: tbCountRunning, diffCount: tbDiffCount,'
+    + ' isAgentCreated: tbIsAgentCreated, isAgentDraft: tbIsAgentDraft,'
     + ' tbInitialDoneFold: tbInitialDoneFold,'
     + ' isBoardEntry: tbIsBoardEntry, entryFromChat: tbEntryFromChat, listBoards: tbListBoards, pickBoard: tbPickBoard,'
     + ' boardSwitchPatch: tbBoardSwitchPatch,'
@@ -41,7 +42,7 @@ const tb = new Function(
 function makeTask(overrides) {
   return {
     id: 'T1', title: '任务一', status: 'ready', owner: null, dep: [], desc: '',
-    created: null, updated: null, summary: '', fail: '', scope: [], ...overrides,
+    created: null, updated: null, summary: '', fail: '', scope: [], created_by: null, ...overrides,
   }
 }
 
@@ -136,6 +137,35 @@ test('parseBoard: 未知 status 保留原值并标注 statusKnown=false', () => 
   assert.equal(parsed.board.tasks.T9.statusKnown, false)
 })
 
+// ---------- T3 created_by 来源字段（M1 契约：单键字符串；lead 派发缺省） ----------
+
+test('parseBoard: created_by 字符串保留、非字符串/空串归一 null、缺省=null（lead 派发语义）', () => {
+  const parsed = tb.parseBoard(JSON.stringify({
+    tasks: {
+      A: { id: 'A', title: 'x', status: 'draft', created_by: 'frontend-engineer' },
+      B: { id: 'B', title: 'x', status: 'draft', created_by: 42 },
+      C: { id: 'C', title: 'x', status: 'draft', created_by: '' },
+      D: { id: 'D', title: 'x', status: 'ready' },
+    },
+  }))
+  assert.equal(parsed.ok, true)
+  assert.equal(parsed.board.tasks.A.created_by, 'frontend-engineer')
+  assert.equal(parsed.board.tasks.B.created_by, null) // 非字符串 → null
+  assert.equal(parsed.board.tasks.C.created_by, null) // 空串 → null
+  assert.equal(parsed.board.tasks.D.created_by, null) // 缺省 → null（lead 派发不落该字段）
+})
+
+test('isAgentCreated/isAgentDraft: created_by 非空判定（缺省/非字符串/null 均非代理创建）', () => {
+  assert.equal(tb.isAgentCreated(makeTask({ created_by: 'backend-engineer' })), true)
+  assert.equal(tb.isAgentCreated(makeTask({})), false) // 缺省 null
+  assert.equal(tb.isAgentCreated(makeTask({ created_by: '' })), false)
+  assert.equal(tb.isAgentCreated(makeTask({ created_by: 7 })), false)
+  assert.equal(tb.isAgentCreated(null), false)
+  assert.equal(tb.isAgentDraft(makeTask({ status: 'draft', created_by: 'backend-engineer' })), true)
+  assert.equal(tb.isAgentDraft(makeTask({ status: 'ready', created_by: 'backend-engineer' })), false) // 非 draft
+  assert.equal(tb.isAgentDraft(makeTask({ status: 'draft' })), false) // lead 草稿
+})
+
 // ---------- groupByStatus 八状态映射 ----------
 
 test('groupByStatus: 八个已知状态落四泳道', () => {
@@ -174,6 +204,15 @@ test('groupByStatus: 组内 updated 降序，缺失排后并按 id 稳定', () =
   assert.deepEqual(lanes.running.map(t0 => t0.id), ['TB', 'TA', 'TD', 'TC'])
 })
 
+test('groupByStatus: 代理待批草稿（draft+created_by）提升「需要注意」，lead 草稿留「待处理」', () => {
+  const lanes = tb.groupByStatus({
+    TA: makeTask({ id: 'TA', status: 'draft', statusKnown: true, created_by: 'frontend-engineer' }),
+    TB: makeTask({ id: 'TB', status: 'draft', statusKnown: true }),
+  })
+  assert.deepEqual(lanes.attention.map(t0 => t0.id), ['TA']) // 代理草稿 → 注意泳道（验收 b 泳道呈现）
+  assert.deepEqual(lanes.todo.map(t0 => t0.id), ['TB']) // lead 草稿 → 原位
+  assert.equal(lanes.attention[0].statusKnown, true) // draft 是已知状态——仅路由提升，不算未知状态
+})
 // ---------- computeDepBadges：阻塞 / 未知 id / 环防御 ----------
 
 test('computeDepBadges: dep 指向 status≠done 为阻塞，指向 done 不阻塞', () => {
@@ -632,6 +671,58 @@ test('T3 接线: 选择页/下拉/播报 aria 面齐备（spec §12.2/§12.3/§1
     assert.ok(source.includes(`"tb.boards.${key}"`), `locale 缺 tb.boards.${key}`)
   }
   assert.ok(source.includes('"tb.aria.boardSwitched"') && source.includes('"tb.aria.boardMissing"'), 'aria 新词条应齐备')
+})
+
+// ---------- T3 created-by 来源徽章与代理待批草稿（UI 接线静态锚点 + i18n 双语齐备） ----------
+
+test('T3 接线: 来源徽章仅在 created_by 非空时渲染，lead 派发零渲染（验收 a）', () => {
+  // 判定唯一经 tbIsAgentCreated（纯函数区，lead 缺省=null 恒 false）
+  assert.ok(source.includes('var agentCreated = tbIsAgentCreated(task);'), 'renderCard 应经 tbIsAgentCreated 判定')
+  assert.ok(source.includes('var agentDraft = tbIsAgentDraft(task);'), 'renderCard 应经 tbIsAgentDraft 判定')
+  const fn = source.slice(source.indexOf('function renderCard'), source.indexOf('function renderLane'))
+  assert.ok(fn.includes('var createdByBadge = agentCreated ? React.createElement'), 'created_by 非空才构造来源徽章')
+  assert.ok(fn.includes('t("tb.badge.agentCreated")'), '来源徽章应走 i18n 词条')
+  // lead 派发（agentCreated=false）→ 徽章元素为 null，badges.push 不执行
+  assert.ok(fn.includes('if (createdByBadge) badges.push(createdByBadge);'), 'lead 派发不得渲染来源徽章')
+})
+
+test('T3 接线: 代理待批草稿——attention 泳道 + 待批徽章 + data-pending 卡级显著标记（验收 b）', () => {
+  const fn = source.slice(source.indexOf('function renderCard'), source.indexOf('function renderLane'))
+  assert.ok(fn.includes('var pendingBadge = agentDraft ? React.createElement'), '代理草稿才构造待批徽章')
+  assert.ok(fn.includes('t("tb.badge.pendingApprove")'), '待批徽章应走 i18n 词条')
+  assert.ok(fn.includes('"data-pending": agentDraft ? "" : undefined'), '卡根应有 data-pending 标记')
+  // 泳道路由：draft+created_by → attention（纯函数已断言）；此处钉死接线消费 tbIsAgentDraft
+  assert.ok(source.includes('if (tbIsAgentDraft(task)) {'), 'groupByStatus 应消费 tbIsAgentDraft 提升路由')
+})
+
+test('T3 样式: 待批徽章与卡级高亮走 business token，非 lead 草稿弱化规则可被覆盖（同特异性后行胜）', () => {
+  const css = cssRegion()
+  assert.ok(css.includes('.eso-tb-badge-agent{'), '来源徽章样式应存在')
+  assert.ok(css.includes('.eso-tb-badge-pending{'), '待批徽章样式应存在')
+  assert.ok(css.includes('.eso-tb-card[data-pending]{'), '待批卡级边框样式应存在')
+  // 标题提升规则必须排在 draft 弱化规则之后（同特异性后行胜，否则「显著呈现」失效）；
+  // 源码为 JS 字符串字面量（data-status=\"draft\" 带转义引号），故按行内容定位而非整串匹配
+  const lines = css.split('\n')
+  const draftAt = lines.findIndex((line) => line.includes('.eso-tb-card[data-status=') && line.includes('draft') && line.includes('card-title'))
+  const pendingAt = lines.findIndex((line) => line.includes('.eso-tb-card[data-pending]') && line.includes('card-title'))
+  assert.ok(draftAt >= 0, 'draft 标题弱化规则应存在')
+  assert.ok(pendingAt > draftAt, '待批标题提升应后于 draft 弱化规则')
+})
+
+test('T3 i18n: 新词条 zh/en 双语各恰声明一次，无缺译', () => {
+  const zhStart = source.indexOf('var zh = {')
+  const enStart = source.indexOf('var en = {')
+  const enEnd = source.indexOf('\n\t\t};', enStart)
+  assert.ok(zhStart >= 0 && enStart > zhStart && enEnd > enStart, 'zh/en 词库定位失败')
+  const zhDict = source.slice(zhStart, enStart)
+  const enDict = source.slice(enStart, enEnd)
+  for (const key of ['tb.badge.agentCreated', 'tb.badge.pendingApprove', 'tb.aria.agentCreated']) {
+    // 每 key 双语各恰声明一次：带冒号的 key 声明全源码恰 2 处（zh 1 + en 1）
+    assert.equal(source.split(`"${key}":`).length - 1, 2, `${key} 应 zh/en 各恰声明一次`)
+    assert.ok(zhDict.includes(`"${key}"`) && enDict.includes(`"${key}"`), `${key} 双语词库均应包含`)
+  }
+  assert.ok(zhDict.includes('代理创建') && zhDict.includes('待批'), 'zh 文案应存在')
+  assert.ok(enDict.includes('Agent-created') && enDict.includes('Awaiting approval'), 'en 文案应存在')
 })
 
 // ---------- T4 回归补强：tbPickBoard 裁决面边界（spec §12.4 R1：cached 指向已删板 / 双消失） ----------

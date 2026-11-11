@@ -35,6 +35,6 @@ trap 'rm -f "$TMP"' EXIT
     printf '> 以下阶段三新增四能力纪律为强约束，逐字执行：\n>\n'
     _extract_rules "$SKILL" | sed 's/^/> /'
 } > "$TMP"
-[ "$(grep -c '^[4-7]\. ' "$TMP")" -eq 4 ] || { echo "错误：未从 SKILL.md 提取到完整规则行 4-7（预期 4 条）" >&2; exit 1; }
+[ "$(grep -c '^> [4-7]\. ' "$TMP")" -eq 4 ] || { echo "错误：未从 SKILL.md 提取到完整规则行 4-7（预期 4 条）" >&2; exit 1; }
 sed "/^persona：/r $TMP" "$A" > "$OUT"
 echo "B 臂已生成：$OUT（规则行源自 $SKILL 逐字提取，4 条）"

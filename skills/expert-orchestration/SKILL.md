@@ -97,13 +97,22 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 **代理互派（peer reassign，capability token）**：代理把手头任务转派给另一位专家时，必须走工具生成通道并满足**双条件**：① **持当前代际**——`reassign <id> auto --attempt <当前派工代际>`，持有证明按 check_attempt 口径校验当前开放代际（无开放代际拒 `no_attempt`、旧/已撤销代际拒 `stale_attempt`）；② **任务当前 owner==自己**（无主任务拒 `not_task_owner`——无主任务的派发权在编排者通道）。新代际 token 必须由工具生成：`auto` 为保留触发词，工具生成不可猜 `at-<16hex>` token（绝不复用已撤销代际与当前代际），`show`/`--json` 回显后**逐字抄入下游任务书**随任务下发；持有证明与自报新 attempt_id 混用一律拒绝（`attempt_source_conflict`——peer 通道新 token 必须工具生成，宁拒勿错）。不带 `--attempt` 且不自报 `auto` 的编排者通道行为不变。
 
-**反风暴三条纪律（Q4 冻结值；本阶段工具写面执法不做（Q7 裁决），三条均为协议纪律，核查探针=open-counts / show / 事件流）**——以下三条规则行为可逐字引用、可探针验证的规范行：
+**反风暴三条纪律（Q4 冻结值；写面执法已实现但缺省关闭——T13，env DSH_EXPERT_ANTISTORM_ENFORCE，见下方规则 7；核查探针=open-counts / show / 事件流）**——以下三条规则行为可逐字引用、可探针验证的规范行：
 
 1. **open 上限**：`任一代理名下 open 任务（draft/pending/ready/running）总数 ≤ 2（env DSH_EXPERT_PEER_OPEN_CAP 可调，缺省 2）`——编排者在 approve 代理自建草案、或代理 peer 互派前，先执行 `taskboard.py open-counts <专家名>` 核查；计数超限即不批准/不派转并上报。draft 计入（待批草案占人）、终态不计入；open-counts 为只读无锁快照（零写零事件，owner 以板面自报为准，防误用不防伪造）。
 2. **委派环**：`互派任务书必须逐字携带收到的 origin-chain 标记行；不得把任务派回该任务链上任一前代 owner`——前者沿用 §5 env 传递段既有复制约定（summon 派发入口解析：链上出现重复对即拒绝，如 A→B→A），后者为编排者/代理板面纪律（违规即纠正并记 summary；板面自动检测留后续阶段）。
 3. **escalation 上限**：`同一任务第 2 次进入 escalated 时强制上报用户处置（限额 1，env DSH_EXPERT_ESCALATION_LIMIT 可调，缺省 1）`——达到限额后编排者不得再走自动 repair/重派/废弃重建等绕行路径；探针：`show` 检查点轨迹中 escalated 记录次数 + `status` 的「已升级待用户处置」行。
 
 上述三条规则行的到达率与既有五段式任务书合规率为对照实验预注册判定项（档案 `docs/internal/experiments/2026-11-11-antistorm-ab/`，先写后跑；实验不达标则本节回退）。
+
+**阶段三新增四能力纪律（T13/T14/T15/T16 工具面；规则行与 taskboard.py 实现逐条对齐）**——以下四条规则行为可逐字引用、可探针验证的规范行：
+
+4. **免审批创建（--auto-ready）**：`--auto-ready 免审前置=M1 链①-⑤全过+⑥ created_by 名下 open 计数+1 ≤ cap（DSH_EXPERT_PEER_OPEN_CAP 可调，缺省 2，恒生效不依赖执法开关）+⑦ --of 父任务须 open（draft/pending/ready/running）+⑧ 全部 dep 依赖任务 owner==--created-by 且 status==done`——超限拒 `agent_create_open_cap`、父任务终态拒 `agent_create_parent_closed`、dep 跨 owner 拒 `agent_create_dep_cross_owner`、dep 未全 done 拒 `agent_create_dep_open`（⑧' 加严裁定：ready 蕴含依赖已满足，未完成依赖不可免审直达 ready）；豁免边界：仅代理自建路径可用（须成对 --created-by/--of）、与 --draft 互斥、--kind review 同传永不免审（agent_create_kind_rejected）；任一判定不过零写零事件，去掉 --auto-ready 回 draft 待批旧路径；免审证据落 checkpoint 注记与事件 args（auto_ready+open_count）可审计。
+5. **work-stealing 让渡（claim_idle --steal）**：`窃取前先 open-counts/show 自查并满足双侧空闲闸：本人名下无 running（拒 steal_owner_active side=claimant）、被窃任务 owner 名下无 running（拒 steal_owner_active side=owner）；不得窃回上一手：候选任务 stolen_from==本人即拒（steal_ping_pong）`——被窃方经 show/事件流（args steal:true+previous_owner）发现让渡留痕 stolen_from=上一手 owner 后不得反向窃回；--steal 只动他人 ready+owner 空闲任务，不触碰无主候选、不建代际；不带 --steal 的空闲续领语义逐字节不变。
+6. **attempt 绑 owner（R1 如实声明）**：`DSH_EXPERT_ATTEMPT_BIND_OWNER 非空时开启（缺省关闭=旧行为逐字节）：代际建立（claim --attempt/reassign 双通道）落 attempt_owner=落定 owner；attempt_owner_mismatch 仅对持证明通道生效（done --by/vote --by/reassign）；fail/progress/own/heartbeat 无身份参数恒不校验；claim --attempt 为合法接管面（翻新绑定非绕过）`——attempt_owner 为板面自报口径（防误用不防伪造），编排者/代理不得谎报绑定状态。
+7. **写面反风暴执法**：`DSH_EXPERT_ANTISTORM_ENFORCE 非空时开启（缺省关闭=纯协议纪律）：approve 代理草案/claim/claim_idle/peer reassign 四点核查认领方 open 计数，超限具名拒 open_cap_exceeded；escalation 上限落档 escalation_count（用户 retry 不清零），reassign 双通道与 done needs_revision 路径达限拒 escalation_limit_exceeded（直升 escalated，不再生成 repair）`——上限 env（DSH_EXPERT_PEER_OPEN_CAP/DSH_EXPERT_ESCALATION_LIMIT）非法值宁拒勿猜；关闭时/旧板行为逐字节不变。
+
+上述第 4-7 条规则行（新增四能力协议纪律）的到达率与既有五段式任务书合规率为对照实验预注册判定项（档案 `docs/internal/experiments/2026-11-11-autoapprove-steal-ab/`，先写后跑；实验不达标则本块回退）。
 
 ## 4. 交付门禁（强制触发，顺序执行）
 
@@ -207,12 +216,12 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 
 **任务板 taskboard.py**（多步骤大型任务必用；**每个项目一个独立板**：`--board .expert-taskboards/<项目slug>.json`，不同项目严禁混用一个板；项目交付收口后立即 `archive` 归档）。**任务板权威定义（v2.7 事件溯源化）**：状态权威 = append-only JSONL 事件流 `<板文件>.events.jsonl`，JSON 板文件只是**折叠视图**缓存（对外只增 event_seq/event_state_hash 簿记，既有字段零删改，list/status/show 输出结构不变）——视图被手改/损坏 → stderr 报警并按事件流权威重建覆盖（stdout 零污染）；**事件流被清空而视图含簿记、视图含未知顶层键、事件链 hash 断链或末事件 state_hash 对账失配 → `{"error":"unrecoverable","unrecoverable":true,...}`**（绝不静默返回空数据，绝不裸 traceback——如实报告编排者，禁止当作空板重建）。崩溃恢复自动进行（残尾截断/缺行尾换行自愈 + stderr 告警，已落账事件不回滚）；`replay` 可显式重放重建视图（幂等，崩溃演练/人工核对用）；旧 v2.6 板首次写命令自动收编为事件流（数据零丢失，revision 延续）。**A2 残余风险注记：「剥簿记+清日志」（簿记字段与事件流同时剥除）是原理性残余**——数据侧无从证明曾有过板，**备份是最后兜底：定期备份 `.expert-taskboards/`（建议连同 `.expert-bus/` 一并备份）**：
 
-    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）；大型任务规划期加 --draft 创建 PM 草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；评审/验收类子任务加 --kind review（完成须 --verdict 分叉，见第 4 节 review kind 段），多评审员评审再加 --quorum-m [N]（裸声明即默认 3，Q3=3A）声明 m 票陪审团（见第 4 节 m 票段）；能力标签加 --tags "a,b"（v2.13.10 T8：逗号分隔、逐项 strip 去空、保序去重；显式给参解析为空即拒绝；缺省不落 tags 字段；tags 与 scope/M1 校验正交不参与执法，仅作 claim 侧声明匹配，见下）
+    python3 <技能目录>/tools/taskboard.py create "标题" --owner 执行专家 --dep T1,T2 --desc "完成标准"  # 可加 --scope "src,docs" 声明关联域（hook 第三查与验证回执依据）；大型任务规划期加 --draft 创建 PM 草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；评审/验收类子任务加 --kind review（完成须 --verdict 分叉，见第 4 节 review kind 段），多评审员评审再加 --quorum-m [N]（裸声明即默认 3，Q3=3A）声明 m 票陪审团（见第 4 节 m 票段）；能力标签加 --tags "a,b"（v2.13.10 T8：逗号分隔、逐项 strip 去空、保序去重；显式给参解析为空即拒绝；缺省不落 tags 字段；tags 与 scope/M1 校验正交不参与执法，仅作 claim 侧声明匹配，见下）；代理 scoped 自建任务（§3.2 M1 链）加 --created-by <专家名> --of <任务id> --scope <非空scope> --draft；受限免审批创建再加 --auto-ready（T15：M1 链+⑥⑦⑧⑧' 前置全过直达 ready 免 approve——⑥ open 计数上限恒生效 agent_create_open_cap、⑦ 父任务非 open 态 agent_create_parent_closed、⑧⑧' dep 须全部本人名下且全 done：agent_create_dep_cross_owner/agent_create_dep_open；与 --draft 互斥、--kind review 同传永不免审，任一不过零写零事件回 draft 待批旧路径）
     python3 <技能目录>/tools/taskboard.py approve T3   # PM 草案批准（v2.7，第 2 节三段式第 2 段）：draft -> ready（依赖未满足先回 pending，依赖 done 时自动提升）；批准前 claim/auto-claim 均被拒（批准前零 spawn 工具级执法）；支持 --expected-revision CAS
     python3 <技能目录>/tools/taskboard.py reject T3    # PM 草案否决（v2.7）：draft -> rejected 终态——退出批准面不永久滞留（archive 不再被其阻塞）；rejected 不可 claim/approve/progress/reassign；需重启时按意见重新规划后新建草案
     python3 <技能目录>/tools/taskboard.py status | list | show T3 | deps T3   # 末行输出 revision=N（除 boards/archive 外所有命令；写前先读）
     python3 <技能目录>/tools/taskboard.py claim T3 执行专家      # ready -> running；任务带 tags 时须 --tags "a,b" 声明且与任务 tags 有交集，否则 {"error":"tag_mismatch",...} 具名拒绝（零写零事件；任务无 tags 不受影响）
-    python3 <技能目录>/tools/taskboard.py claim_idle 编排者 T3 [T4...]  # 原子空闲续领（v2.9 M1 T39-①）：单锁内「板上无 running 判定+批量认领」一次完成——空闲闸 board_not_idle（零写零事件）、候选全跳过 claim_idle_noop、候选复判非 ready/已有 owner/不存在逐个跳过；候选带 tags 时须 --tags 声明匹配（v2.13.10 T8：不匹配候选逐个 skipped（reason:'tag_mismatch'），不带 --tags 时带 tags 候选一律跳过，过滤先于空闲闸复判）；事件 type=claim、不建派工代际；--expected-revision CAS 共存；#16 预算门逐候选同 claim 语义（两段式章延后：interrupt 拒绝整轮零认领、alarm/wrap-up 章在全部门通过后统一随 claim 事件落账，v2.9 T11）
+    python3 <技能目录>/tools/taskboard.py claim_idle 编排者 T3 [T4...]  # 原子空闲续领（v2.9 M1 T39-①）：单锁内「板上无 running 判定+批量认领」一次完成——空闲闸 board_not_idle（零写零事件）、候选全跳过 claim_idle_noop、候选复判非 ready/已有 owner/不存在逐个跳过；候选带 tags 时须 --tags 声明匹配（v2.13.10 T8：不匹配候选逐个 skipped（reason:'tag_mismatch'），不带 --tags 时带 tags 候选一律跳过，过滤先于空闲闸复判）；事件 type=claim、不建派工代际；--expected-revision CAS 共存；#16 预算门逐候选同 claim 语义（两段式章延后：interrupt 拒绝整轮零认领、alarm/wrap-up 章在全部门通过后统一随 claim 事件落账，v2.9 T11）；--steal（T16 work-stealing，§3.2 规则 5）：认领面扩到他人 ready+owner 空闲任务——双侧空闲闸（claimant/被窃 owner 名下均无 running，拒 steal_owner_active）+反回摆（候选 stolen_from==本人拒，steal_ping_pong）+让渡留痕（stolen_from 字段+checkpoint「让渡」注记+事件 args steal:true/previous_owner）；不带 --steal 语义逐字节不变
     # 派工即回写（v2.6 auto-claim）：summon_expert/summon_experts 在派发入口（专家 run 前）自动对任务书显式引用的 T<数字>（≤8 个，超取前 8 并提示截断；命令引述与路径形态不解析）执行上述 claim（owner=被召唤专家名；owner 已有/非 ready/非唯一板跳过）——专家拿到任务书时条目已 running，无需手工重复认领；专家失败/召唤失败条目保持 running 不回滚，由编排者按板处置（reassign/fail/recover）；DSH_EXPERT_AUTOCLAIM=0 或空串整体关闭；认领/跳过/失败（taskboard 超时与板不可读分别提示）均以【auto-claim】提示行附在 summon 结果/错误尾部
     # idle-edge 自动续领（v2.8 M8-2 #20；默认关闭，DSH_EXPERT_IDLE_RECLAIM=1 显式开启）：本会话最后一位在途专家成功收尾时（summon 空闲边沿）lib 侧自动扫描——板上无 running 任务且存在 ready 无 owner 条目时以 owner=编排者 调 taskboard.py 原子 claim_idle 自动领取（单锁内「无 running 判定+认领」一次完成，见上条；list 快照仅作 fail-open 预筛）（领取≠派工：不自动召唤专家，派工仍由编排者执行；owner 同步实际执行者用 reassign；非 ready/已有 owner 不动；上限 8；#16 预算门同受约束——计数跨 reclaim 累计达 interrupt 续领被拒，--reset 放行；【自动续领】提示行附 summon 结果尾部）
     python3 <技能目录>/tools/taskboard.py done T3 "结果摘要"     # 依赖它的任务自动转 ready
@@ -245,6 +254,8 @@ v2.8 M8-2 运行时门禁开关速查（详见 §3/§5/§6 对应段；沿 DSH_E
     DSH_EXPERT_CWD_LOCK=1           # per-cwd 写锁开启（阻断型门禁默认关闭 opt-in：同 cwd 异名专家并发写当场拒绝而非排队；readOnly: true 声明只读跳过）
     DSH_EXPERT_IDLE_RECLAIM=1       # idle-edge 自动续领开启（默认关闭 opt-in：空闲边沿自动领取 ready 无 owner 任务，owner=编排者；领取≠派工，§3）
     DSH_EXPERT_EFFORT=0|空          # effort 预检整体关闭（档案 effort 字段本次派发不生效、零告警；缺省开启）
+    DSH_EXPERT_ANTISTORM_ENFORCE=1  # 写面反风暴执法开启（T13，缺省关闭=纯协议纪律）：approve 代理草案/claim/claim_idle/peer reassign 四点 open 计数超限具名拒 open_cap_exceeded+escalation 上限落档 escalation_count 达限拒 escalation_limit_exceeded（§3.2 规则 7）
+    DSH_EXPERT_ATTEMPT_BIND_OWNER=1 # attempt owner 绑定开启（T14，缺省关闭=旧行为逐字节）：代际建立落 attempt_owner，持证明通道（done --by/vote --by/reassign）校验 attempt_owner_mismatch（§3.2 规则 6）
 
 并发正确性与失败语义（所有写命令均可选 `--expected-revision <N>`；不传新参数时行为与旧版完全一致）：
     python3 <技能目录>/tools/taskboard.py create "标题" --expected-revision 3   # CAS 乐观锁：写命令带 --expected-revision，与当前 revision 不符返回 {"error":"stale_revision",...} 并拒绝落盘；重读后携带最新 revision 重试

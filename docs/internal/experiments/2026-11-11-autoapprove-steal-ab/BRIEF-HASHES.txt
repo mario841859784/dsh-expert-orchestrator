@@ -2,3 +2,8 @@ e7368d0cc788cfccce26d8b997e9cc3398f22d88232ca9d0a7f0fedb89f2c261  AB-AU-01-A.md
 3e0d4f9dc0065431bb6cb7df90bcbaf5b019e1301edfe6f342e09bbce65265ed  AB-AU-02-A.md
 d77ffd095c02ae8776f2cdfca2bfd6b33f8d19ba830c32bfaaab00f9c1164ca6  AB-AU-03-A.md
 # B 臂 hash：随 T17 协议改版 commit 由 build-b-arm.sh 程序化生成后追加（首跑前不得手改）
+5abad3d984804ae7540d223ba9bcf724cbed5b285368500df1189799c16cded3  docs/internal/experiments/2026-11-11-autoapprove-steal-ab/AB-AU-01-B.md
+2fa18172d39b57a2a6fcfe9db9a2383bc7cee538c8542830e8dfb7ad5464b079  docs/internal/experiments/2026-11-11-autoapprove-steal-ab/AB-AU-02-B.md
+24ecca03b0abf07ef4ea8e4d843d017e9a63a4d396f5240ae0e84b6b3ceee93e  docs/internal/experiments/2026-11-11-autoapprove-steal-ab/AB-AU-03-B.md
+87c2bfcc6e39092d2f34f6ad4035af1f37a013574d7ed7b1e879477696fc987d  docs/internal/experiments/2026-11-11-autoapprove-steal-ab/PROBE-STRINGS.txt
+# PROBE-STRINGS.txt=探针串冻结（build-b-arm.sh --probes 产物，grep -F 判定用）

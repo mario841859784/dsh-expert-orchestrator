@@ -3258,10 +3258,12 @@ def main():
     p.add_argument('--draft', action='store_true',
                    help='创建为 PM 规划草案（draft 状态：待批准、不可 claim、不参与依赖自动提升）；缺省行为不变')
     p.add_argument('--auto-ready', action='store_true',
-                   help='T15 受限免审批创建（仅代理自建，须成对携带 --created-by/--of）：M1 链①-⑤+⑥⑦⑧'
+                   help='T15 受限免审批创建（仅代理自建，须成对携带 --created-by/--of）：M1 链①-⑤+⑥⑦⑧⑧\''
                         '全过则直达 ready（单事件 type=create 不变，args 增 auto_ready+open_count 免审证据，'
                         'checkpoint 注记免审证据可审计）；⑥ created_by open 计数超上限（DSH_EXPERT_PEER_OPEN_CAP'
-                        '，恒生效不依赖执法开关）⑦ --of 父任务终态 ⑧ dep 跨 owner，任一命中即具名拒'
+                        '，恒生效不依赖执法开关，agent_create_open_cap）⑦ --of 父任务非 open 态'
+                        '（agent_create_parent_closed）⑧ dep 跨 owner（agent_create_dep_cross_owner）'
+                        '⑧\' dep 未全 done（agent_create_dep_open），任一命中即具名拒'
                         '（零写零事件，hint 指路去掉本参回 draft 待批旧路径）；与 --draft 互斥；'
                         '--kind review 同传仍拒（review 永不免审）')
     p.add_argument('--kind', help='任务种类（缺省不带 kind 字段，行为不变）：review=评审任务，完成须显式 '

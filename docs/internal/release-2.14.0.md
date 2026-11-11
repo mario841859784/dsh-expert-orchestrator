@@ -28,4 +28,5 @@ grep 复核：`grep -rn '2\.13\.10' --include='*.js' --include='*.json' --includ
 - 2.13.10 → 2.14.0 改动仅版本字符串与文档，理论零回归，实测与基线持平（58a18d4 记录 611/608/0/3=609+1——口径差异：本机 skip=2 为宿主模块缺失，历史记录含 mutation-gate skip，无 fail 项，零回归成立）。
 
 ## push / publish 步骤
-- 编排者执行，结果待附（本任务红线：不 push、不 npm publish、不 git commit）。
+- 编排者收口执行（2026-11-12）：任务板 T17 误建无 scope 关闭、改 T18（scope=package.json,dsh.plugin.json,lib,CHANGELOG.md,docs）承载；提交 da22f79 过门禁（T18 id + 6 文件均在 scope 并集），push origin main 成功（7fe39f3..da22f79）；npm publish 成功（sha512-Rl8nrDJlCa7/M…，66 files，tag latest），registry CDN 轮询 ~2min 后 `npm view` 实证 version=2.14.0。
+- 终态对账：本地 main=da22f79=origin/main；npm latest=2.14.0=本地 package.json。

@@ -2,6 +2,19 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [未发布] — 开发分支 dev/orchestration-economics-345（方向 2 编排经济学）
+
+> 依据 `docs/research/orchestration-economics/00-overview.md` §4 统一落地清单；设计映射与诚实边界见 `docs/internal/direction2-orchestration-economics.md`。本节发布前不 bump 版本、不 npm publish。
+
+### Added
+
+- **成本记账与预算熔断提示（清单 #8，`lib/cost.js` 新模块 + `lib/tools.js` 接线）**: 会话级召唤记账（registerExpertTools 每实例一份，纯内存封顶 500 条，零 I/O）——summon_expert/summon_experts 每次派发记录（专家/模型/任务书+回包 CJK 感知 token 估算）；`DSH_EXPERT_TOKEN_BUDGET`（千 token，正数，支持小数）显式开启后，累计估算达阈值时 summon 结果尾部附【成本】熔断建议行（提示级不阻断，沿振荡告警先例），批量召唤结果尾部另附会话累计行；开关关闭/'0'/空串时输出与既有逐字节一致，非法值 fail-open 禁用+stderr 告警。**如实声明**：宿主结算观察面（createSettlementWatcher）无 usage 字段，真实 prompt_cache_hit/miss_tokens 当前 seam 不可采集——估算为字符启发式（CJK ≈0.75 token/字、其他 ≈0.25 token/字符，标注「估算」非计量值），只用于规模对账与熔断提示；真实 usage 接入点留痕于 lib/cost.js 头注（结算面出现 usage 时在 runExpertOneShot/runExpertContinuable 消费缝替换估算值）。
+- **模型路由三档偏好（清单 #5/#11，`lib/expert-profiles.js` + `lib/tools.js`）**: 档案 `defaults` 新增 `modelByPref`（`{"quality","balanced","cost"}` 三档，值=provider 模型 id）+ env `DSH_EXPERT_ROUTE_PREF` 旋钮——激活后**仅当专家无逐专家/组级 model**（显式配置优先于偏好旋钮）且档位有声明时按档取模型，缺档位回落 `defaults.model`；非法 env 值/非法档位逐个告警丢弃（fail-open），写侧 `validateExpertProfileDocument` 对「modelByPref 声明未存活」显式拒绝（读容错/写严格不对称沿既有裁定）。偏好为纯规则查表（零训练零依赖，路由层轻量）；级联降档重试（quality→balanced→cost 手动换 model）与简单任务快路径为 SKILL.md 协议规则（插件内不做自动 fallback，沿 2.13.8 裁决）。设置页 UI 暂不提供 modelByPref 编辑（JSON 直接编辑支持）。
+- **批量预热 stagger + 写型扇出建议（清单 #2/#6，`lib/tools.js` summon_experts）**: ① `stagger: true` 参数（opt-in）——首项串行完成缓存写入后再并行其余（整批从 N 次并发 write 压成 1 次 write + N-1 次 read，hermes-agent 预热门控模式；共享前缀主要来自同专家重复条目与宿主基础设施前缀，异质专家 persona 各异收益有限——如实声明）；结果序与部分成功语义不变。② 同一批含 ≥2 个非 readOnly（写型）条目时 render 文本附【分流建议】提示行（读型/写型分流第一判断：写型串行单代理、读型才扇出；非阻断建议，返回值结构不变）。
+- **SKILL.md 协议面（清单 #3/#4/#7/#9）**: ① §1 新增「派工规模纪律（effort 分级预算硬编码）」四档——琐碎禁派子代理/简单 1 专家（调用上限 ≤10）/中等 2–4 并行（各 10–15）/复杂 ≤8 明确分工，加专家须异构视角拒绝同质扩编、复杂任务固定独立评审做中心校验；② §3 新增「读型/写型分流（派工第一判断）」「模型路由三档偏好+级联降档」「批量预热 stagger」三条纪律；③ §5 任务书模板新增「预算」变量行（调用预算下发，TALE 思路；固定五段未动，前缀缓存敏感）与「结构化回传约定」（结论/依据/置信度高中低/产物路径四要素）；④ §9 开关速查表新增 `DSH_EXPERT_ROUTE_PREF`/`DSH_EXPERT_TOKEN_BUDGET` 两行。**合入纪律**：协议文本行为改动按 §8 实验纪律在合入主干前跑对照实验（本分支内暂免，收口时补）。
+- **测试**: `test/orchestration-economics.selftest.mjs` 新增 15 用例（估算口径/封顶/fail-open/提示行双语、pref 优先级四层/写侧严格/stagger 派发序/分流建议与成本行 render 面/开关零变化真链路断言）；全量 `npm test` 580+15=595 tests 零回归（577→592 pass）。
+- **设计文档**: `docs/internal/direction2-orchestration-economics.md` 落盘清单 12 条 → 落地映射（库内实现/协议纪律/seam 不可达如实声明三分），含行为零变化纪律与诚实边界四条。
+
 ## [2.13.10] — 2026-11-11
 
 ### Added

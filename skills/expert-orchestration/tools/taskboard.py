@@ -844,11 +844,15 @@ _UNSET = object()  # T14：显式「未传 caller」标记（区别于显式传 
 
 
 def check_attempt(a, t, caller=_UNSET):
-    """attempt 代际校验（汇报路径 done/fail/progress/own/vote；reassign 持证明通道）：
+    """attempt 代际校验（带 --attempt 的 fail-closed 门，供各写命令单点复用）：
     不带 --attempt 不校验（向后兼容，行为与旧版一致）；带 --attempt 时 fail closed——
     任务无开放代际 → no_attempt；attempt 已撤销 → stale_attempt（revoked）；非当前代际 → stale_attempt。
     T14 代际 owner 绑定（env DSH_EXPERT_ATTEMPT_BIND_OWNER 缺省关闭）：字段 attempt_owner 存在且
-    调用方声明身份（--by/--owner）不符 → attempt_owner_mismatch；未声明身份不可核不拒（R1）。"""
+    调用方声明身份不符 → attempt_owner_mismatch。绑定校验的有效覆盖=done --by/vote --by/reassign
+    持证明通道（这些路径有身份可核）；fail/progress/own/heartbeat 解析器无身份参数（caller 恒
+    None）→ 绑定校验对这些命令恒 no-op——未声明身份不可核不拒（R1），非「自动获得执法」。
+    claim --attempt 是合法接管面：绑定随落定 owner 翻新并在事件 args 显式留痕 attempt_owner_prev
+    （T20🟡1 对称化），与汇报面 mismatch 拒的区别是接管语义而非绕过。"""
     att = getattr(a, 'attempt', None)
     if att is None:
         return
@@ -1284,8 +1288,12 @@ def cmd_claim(a, data, path):
     # open 任务总数在本次认领完成后不得超过 DSH_EXPERT_PEER_OPEN_CAP（缺省 2）；超限具名拒
     # open_cap_exceeded，判定先于任何变更与 save（零写零事件）。不带 --owner 无认领方身份
     # 可核，不执法；缺省关闭零行为变化。
-    if a.owner:
-        _check_open_cap(a.owner, data, acquiring_task_id=a.id)
+    # T20🟢4：claim 入口 owner strip（与 claim_idle/cmd_open_counts 探针同口径），纯空白视为
+    # 未声明——同一身份带空格写法不再在执法计数与落档间分裂出两个身份。
+    owner = (a.owner or '').strip() or None
+    if owner:
+        _check_open_cap(owner, data, acquiring_task_id=a.id)
+    prev_bound = t.get('attempt_owner')  # T20🟡1：旧绑定捕获（判定先于任何变更，纯读）
     if a.attempt:
         if a.attempt in (t.get('attempt_revoked') or []):
             raise BoardError('stale_attempt', attempt=a.attempt, current=t.get('attempt_id'),
@@ -1298,17 +1306,28 @@ def cmd_claim(a, data, path):
         _reset_nudges(t)  # 新代际=新起点：旧代积攒的未响应 nudge 不带入（watchdog 从头计窗）
         t.pop('heartbeat_at', None)
     t['status'] = 'running'
-    if a.owner:
-        t['owner'] = a.owner
+    if owner:
+        t['owner'] = owner
     # ── T14 代际 owner 绑定（Q2）：claim --attempt 建/续代际时落 attempt_owner=落定 owner，
     # 并随事件 args 留痕；env DSH_EXPERT_ATTEMPT_BIND_OWNER 关闭不落字段不写 args（逐字节一致）。
+    # T20🟡1 对称化：绑定已存在且本次翻新为新 owner 时非静默——事件 args 显式落
+    # attempt_owner_prev（旧绑定）留痕 + 人类面输出重绑提示行；claim 仍是合法接管面
+    # （判定与变更语义不动），与汇报面 attempt_owner_mismatch 拒的区别在接管语义而非绕过。
+    rebind_from = None
     if a.attempt and _attempt_bind_enforced():
+        if prev_bound and owner and prev_bound != owner:
+            rebind_from = prev_bound
         t['attempt_owner'] = t['owner']
         if _EVT_CTX.get('armed'):
             _EVT_CTX['args']['attempt_owner'] = t['owner']
+            if rebind_from:
+                _EVT_CTX['args']['attempt_owner_prev'] = rebind_from
     t['updated'] = now_ms()
     save(path, data)
     show(t)
+    if rebind_from:
+        print(f"（attempt_owner 重绑留痕：{rebind_from} → {t['attempt_owner']}；"
+              f"claim --attempt 为合法接管面，代际绑定随落定 owner 翻新，事件 args 已落 attempt_owner_prev）")
 
 
 class _ClaimIdleGateNS:
@@ -1353,13 +1372,24 @@ def cmd_claim_idle(a, data, path):
     # 名下 open 总数 +1，超 DSH_EXPERT_PEER_OPEN_CAP（缺省 2）的候选跳过（reason=
     # open_cap_exceeded）；因超限致整轮无一可认领时具名拒 open_cap_exceeded（零写零事件）。
     # 缺省关闭不读 env 不计数，零行为变化。
-    cap_enforced, cap_limit, cap_pre = _open_cap_state(owner, data)
+    # T20🟢3：阈值 env 解析（_open_cap_state → _env_positive_int）惰性化并后移——board_not_idle
+    # 与候选复判（不存在/状态/tags/owner）先行，env 解析推迟到首个真正需要 cap 判定的候选处，
+    # 保持「先板面后环境」直觉（env 非法与板面拒绝并存时板面拒绝先出；全是非 cap 原因跳过时
+    # claim_idle_noop 先出，env 非法不遮蔽板面结果）。计数为纯读，判定语义不变。
     running = sorted((tid for tid, t in data['tasks'].items() if t['status'] == 'running'),
                      key=lambda x: int(x[1:]))
     if running:
         raise BoardError('board_not_idle', running=running,
                          hint='板上存在开放执行（running 任务），空闲续领整轮不动；'
                               '本轮候选未做任何认领（零写零事件），下个空闲边沿重扫')
+    cap_state = None
+
+    def _cap_state():
+        nonlocal cap_state
+        if cap_state is None:
+            cap_state = _open_cap_state(owner, data)
+        return cap_state
+
     seen, candidates, skipped = set(), [], []
     for tid in a.ids:
         if tid in seen:
@@ -1375,18 +1405,24 @@ def cmd_claim_idle(a, data, path):
             skipped.append({'id': tid, 'reason': 'tag_mismatch'})
         elif t.get('owner'):
             skipped.append({'id': tid, 'reason': f'已有 owner={t["owner"]}'})
-        elif cap_enforced and cap_pre + len(candidates) >= cap_limit:
-            # T13：认领方 open 计数已达上限，再认领该候选将越限——逐候选跳过（判定先于任何变更）
-            skipped.append({'id': tid, 'reason': 'open_cap_exceeded'})
         else:
-            candidates.append(t)
+            cap_enforced, cap_limit, cap_pre = _cap_state()
+            if cap_enforced and cap_pre + len(candidates) >= cap_limit:
+                # T13：认领方 open 计数已达上限，再认领该候选将越限——逐候选跳过（判定先于任何变更）
+                skipped.append({'id': tid, 'reason': 'open_cap_exceeded'})
+            else:
+                candidates.append(t)
     if not candidates:
-        if cap_enforced and any(s['reason'] == 'open_cap_exceeded' for s in skipped):
-            raise BoardError('open_cap_exceeded', owner=owner, open_count=cap_pre, cap=cap_limit,
-                             skipped=skipped,
-                             hint='认领方名下 open 任务已达上限，整轮无一可认领（探针：taskboard.py '
-                                  'open-counts <owner> 核查；先收口/转派在途任务再续领）；'
-                                  '拒绝发生在任何变更与 save 之前（零写零事件）')
+        if any(s['reason'] == 'open_cap_exceeded' for s in skipped):
+            # T20🟢3：仅在确有 cap 跳过时才解析阈值 env（cap 跳过只在执法开启时产生）——
+            # 全为非 cap 原因跳过时 claim_idle_noop 先出，env 非法不遮蔽板面结果。
+            cap_enforced, cap_limit, cap_pre = _cap_state()
+            if cap_enforced:
+                raise BoardError('open_cap_exceeded', owner=owner, open_count=cap_pre, cap=cap_limit,
+                                 skipped=skipped,
+                                 hint='认领方名下 open 任务已达上限，整轮无一可认领（探针：taskboard.py '
+                                      'open-counts <owner> 核查；先收口/转派在途任务再续领）；'
+                                      '拒绝发生在任何变更与 save 之前（零写零事件）')
         raise BoardError('claim_idle_noop', skipped=skipped,
                          hint='候选在锁内权威状态下无一可认领（快照滞后/负向条件命中）；零写零事件')
     # 逐候选预算门，两段式章延后（v2.9 T11，T10 评审 🔴-1）：先全部候选判定、后统一落章——
@@ -2560,10 +2596,12 @@ def _antistorm_enforced():
     return bool((os.environ.get(_ANTISTORM_ENFORCE_ENV) or '').strip())
 
 
-# ── T14 代际 owner 绑定（Q2 兑现）─────────────────────────────────────────────
+# ── T14 代际 owner 绑定（Q2 兑现；T20🟡2 表述修正为实际覆盖口径）────────────────
 # 代际建立（claim --attempt / reassign 双通道）时落 attempt_owner=落定 owner，并在事件 args
-# 留痕；check_attempt 单点校验：字段存在且调用方声明身份（--by/--owner）不符 → 具名拒
-# attempt_owner_mismatch（done/fail/progress/own/vote/reassign-proof 经 check_attempt 自动获得）。
+# 留痕；check_attempt 单点校验：字段存在且调用方声明身份不符 → 具名拒 attempt_owner_mismatch。
+# 有效覆盖=done --by/vote --by/reassign 持证明通道（有身份可核的路径）；fail/progress/own/
+# heartbeat 解析器无身份参数（caller 恒 None）→ 绑定校验对这些命令恒 no-op——未声明身份
+# 不可核不拒（R1），并非这些命令「自动获得执法」。
 # env DSH_EXPERT_ATTEMPT_BIND_OWNER 缺省关闭：不落字段不校验（关闭=现状逐字节）；旧板无字段
 # 自动回退旧行为（字段缺席=不校验双保险）。R1 口径随行如实声明：绑定与申报均为板面自报
 # （CLI 无鉴权），板内一致性校验防误用非防伪造。

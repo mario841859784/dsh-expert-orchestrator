@@ -5,6 +5,9 @@
 //    事件 args 留痕（claim/reassign）、不符身份全部具名拒 attempt_owner_mismatch（零写零事件，
 //    done --by/vote --by）；c) 旧板无字段（env 关闭期建板）开启 env 不误拒（done/peer proof）；
 //    d) selftest ≥4 用例。
+// T20 增补：e) claim --attempt 接管面显式重绑留痕（开启时 stdout 提示行+事件 args
+//    attempt_owner_prev 留痕、--json 信封不被提示行污染、revision 恰+1；env 关闭同接管脚本
+//    与基线 eb756a7 双版本逐字节）；d) 静态断言含 check_attempt 签名与绑定单点 regex。
 // R1 口径如实声明：attempt_owner 绑定与 --by/--owner 申报均为板面自报（CLI 无鉴权），板内
 // 一致性校验防误用非防伪造。
 // 全部用例跑在 tmp 隔离目录（mkdtemp），不触碰本仓任务板。署名：backend-engineer
@@ -203,4 +206,61 @@ test('T14-d 源码静态断言：R1 声明、Q2 env 名、缺省关闭（不落�
   assert.match(src, /def check_attempt\(a, t, caller=_UNSET\)/)
   assert.match(src, /t\['attempt_owner'\] = t\['owner'\]/) // claim 绑定
   assert.match(src, /t\['attempt_owner'\] = a\.owner or t\['owner'\]/) // reassign 绑定
+})
+
+// ── e) T20🟡1 对称化：claim --attempt 接管面显式重绑留痕（绑定开启）；env 关闭重绑路径与基线逐字节 ──
+test('T20-e 开启：claim --attempt 续代际换人=合法接管面（语义不动）但显式留痕（stdout 提示行+事件 args attempt_owner_prev）；env 关闭同场景与基线 eb756a7 逐字节一致', (t) => {
+  const dir = makeBoardDir(t, 'e-takeover')
+  const py = (args, opts = {}) => runTb(dir, args, { extraEnv: { [BIND]: '1' }, ...opts })
+  py(['create', '任务A', '--scope', 'src'])
+  py(['claim', 'T1', '甲', '--attempt', 'gen1'])
+  py(['fail', 'T1'])
+  py(['retry', 'T1'])
+  const rev = boardOf(dir).revision
+  const evN = eventsOf(dir).length
+  // 接管：乙携带同一开放代际认领（绑定开启）→ 仍放行（接管面语义不动），但绑定翻新显式留痕
+  const r = py(['claim', 'T1', '乙', '--attempt', 'gen1'])
+  const t1 = py(['--json', 'show', 'T1']).json.data.task
+  assert.equal(t1.attempt_owner, '乙')
+  assert.equal(t1.attempt_id, 'gen1')
+  const evt = eventsOf(dir).at(-1)
+  assert.equal(evt.type, 'claim')
+  assert.equal(evt.args.attempt_owner, '乙')
+  assert.equal(evt.args.attempt_owner_prev, '甲', '重绑须在事件 args 显式留痕旧绑定（T20🟡1：无静默行为）')
+  assert.match(r.stdout, /attempt_owner 重绑留痕：甲 → 乙/, '人类面输出显式重绑提示行')
+  assert.equal(boardOf(dir).revision, rev + 1, '接管=正常一次写（revision 恰 +1）')
+  assert.equal(eventsOf(dir).length, evN + 1)
+  // --json 信封仍是唯一 stdout 载荷（提示行被 _JsonSink 吞掉，不污染机器消费面）
+  py(['fail', 'T1']); py(['retry', 'T1'])
+  const rj = py(['--json', 'claim', 'T1', '丙', '--attempt', 'gen1'])
+  assert.equal(rj.json.ok, true)
+  assert.doesNotMatch(rj.stdout, /重绑留痕/)
+  assert.equal(rj.json.data.task.attempt_owner, '丙')
+  const evt2 = eventsOf(dir).at(-1)
+  assert.equal(evt2.args.attempt_owner_prev, '乙')
+  // env 关闭：同接管脚本与基线 eb756a7 双版本逐字节（重绑路径旧行为不破：无提示行、无字段、args 键集不变）
+  const head = spawnSync('git', ['show', `${BASELINE}:skills/expert-orchestration/tools/taskboard.py`],
+    { cwd: REPO_ROOT, encoding: 'utf-8' })
+  assert.equal(head.status, 0, `git show ${BASELINE} 基线可读`)
+  const headPy = join(mkdtempSync(join(tmpdir(), 't20-head-')), 'taskboard_head.py')
+  writeFileSync(headPy, head.stdout)
+  t.after(() => rmSync(headPy, { force: true }))
+  const OPTS = { omitEnv: [BIND] }
+  const script = [
+    ['create', '任务A', '--scope', 'src'],
+    ['claim', 'T1', '甲', '--attempt', 'gen1'],
+    ['fail', 'T1'],
+    ['retry', 'T1'],
+    ['claim', 'T1', '乙', '--attempt', 'gen1'],
+    ['--json', 'show', 'T1'],
+  ]
+  const dirCur = makeBoardDir(t, 'e-cur')
+  const dirOld = makeBoardDir(t, 'e-old')
+  const rc = script.map((args) => runTb(dirCur, args, { ...OPTS }))
+  const ro = script.map((args) => runTb(dirOld, args, { ...OPTS, tb: headPy }))
+  for (let i = 0; i < script.length; i++) {
+    assert.equal(norm(rc[i].stdout), norm(ro[i].stdout), `逐字节一致：${script[i].join(' ')}`)
+    assert.equal(rc[i].code, ro[i].code, `exit code 一致：${script[i].join(' ')}`)
+  }
+  assert.equal(rc[5].json.data.task.attempt_owner, undefined, 'env 关闭重绑路径不落 attempt_owner')
 })

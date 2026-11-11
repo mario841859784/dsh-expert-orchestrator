@@ -7,6 +7,9 @@
 //    上限：needs_revision 达限拒绝 repair 绕行直升 escalated（escalation_count 落档、retry
 //    不清零）、reassign 双通道 escalation_limit_exceeded、vote 僵局落档、claim_idle 逐候选
 //    跳过与全超限具名拒、阈值 env 非法值宁拒勿猜。
+// T20 增补：T20-a 🟢3 claim_idle「先板面后环境」（env 非法不遮蔽 claim_idle_noop/
+//    board_not_idle，合法候选才触 env 报错；三条拒绝路径零写零事件）+ 🟢4 claim owner
+//    strip 与 open-counts 探针同口径。
 // R1 口径如实声明：owner/created_by 以板面自报为准（CLI 无鉴权），防误用非防伪造。
 // 全部用例跑在 tmp 隔离目录（mkdtemp），不触碰本仓任务板。署名：backend-engineer
 import test from 'node:test'
@@ -354,6 +357,39 @@ test('T13-d2 阈值 env：非法值宁拒勿猜（非整数/0）零写零事件�
   // 合法值生效：cap=3 → 甲第 3 个可领
   r = py(['--json', 'claim', 'T3', '甲'], { [CAP]: '3' })
   assert.equal(r.json.ok, true)
+})
+
+// ── T20) 评审跟进微修复：🟢3 claim_idle「先板面后环境」+ 🟢4 claim owner strip 同探针口径 ──
+test('T20-a 🟢3 claim_idle env 非法不遮蔽板面拒绝（claim_idle_noop/board_not_idle 先出，合法候选才触 env 报错）；🟢4 claim owner strip 后 open-counts 探针同口径', (t) => {
+  const dir = makeBoardDir(t, 't20-followup')
+  const py = (args, extra = {}) => runTb(dir, args, { extraEnv: { [ENFORCE]: '1', ...extra } })
+  py(['init'])
+  py(['create', 'A']); py(['create', 'B'])
+  const rev = boardOf(dir).revision
+  const evN = eventsOf(dir).length
+  // 🟢3-① 板面拒绝面 A：候选全为非 cap 原因跳过（不存在）+ CAP 非法 → claim_idle_noop 先出
+  let r = py(['--json', 'claim_idle', '乙', 'T9'], { [CAP]: 'abc' })
+  assert.equal(r.json.error, 'claim_idle_noop')
+  assert.equal(r.json.skipped[0].reason, '任务不存在')
+  // 🟢3-② 板面拒绝面 B：候选可进 cap 判定 + CAP 非法 → env 报错宁拒勿猜（不回落放行）
+  r = py(['--json', 'claim_idle', '乙', 'T2'], { [CAP]: 'abc' })
+  assert.equal(r.json.error, 'command_failed')
+  assert.match(r.json.message, /DSH_EXPERT_PEER_OPEN_CAP 须为正整数/)
+  // 零写零事件：两条拒绝路径 revision/事件流零变化
+  assert.equal(boardOf(dir).revision, rev)
+  assert.equal(eventsOf(dir).length, evN)
+  // 🟢3-③ 板面拒绝面 C：板忙（running=T1）+ CAP 非法 → board_not_idle 先出（env 错误不遮蔽）
+  py(['claim', 'T1', '甲'])
+  r = py(['--json', 'claim_idle', '乙', 'T2'], { [CAP]: 'abc' })
+  assert.equal(r.json.error, 'board_not_idle')
+  assert.deepEqual(r.json.running, ['T1'])
+  // 🟢4：claim owner strip——' 乙 ' 落档为 '乙'，与 open-counts 探针 strip 口径一致
+  py(['claim', 'T2', ' 乙 '])
+  const t2 = py(['--json', 'show', 'T2']).json.data.task
+  assert.equal(t2.owner, '乙')
+  const oc = py(['--json', 'open-counts', '乙'])
+  assert.deepEqual(oc.json.data['乙'], { count: 1, tasks: ['T2'] },
+    'claim strip 后 owner 与探针聚合键一致（不再出现空白变体 owner 分组）')
 })
 
 // ── b3) hint 与 R1 口径：具名拒 hint 均指 open-counts 探针；R1 声明在源码段注释（静态断言）──

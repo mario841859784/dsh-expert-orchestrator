@@ -1262,6 +1262,12 @@ def cmd_claim(a, data, path):
             raise BoardError('tag_mismatch', task_tags=ttags, claimant_tags=ct,
                              hint='任务带能力标签，claimant 须用 --tags 声明至少一个交集标签才可认领'
                                   '（宁拒勿猜：不声明即拒）；任务无 tags 时任何认领不受影响')
+    # ── T13 反风暴 open 上限执法（Q7）：认领方（--owner 自报身份，R1 防误用非防伪造）名下
+    # open 任务总数在本次认领完成后不得超过 DSH_EXPERT_PEER_OPEN_CAP（缺省 2）；超限具名拒
+    # open_cap_exceeded，判定先于任何变更与 save（零写零事件）。不带 --owner 无认领方身份
+    # 可核，不执法；缺省关闭零行为变化。
+    if a.owner:
+        _check_open_cap(a.owner, data, acquiring_task_id=a.id)
     if a.attempt:
         if a.attempt in (t.get('attempt_revoked') or []):
             raise BoardError('stale_attempt', attempt=a.attempt, current=t.get('attempt_id'),
@@ -1319,6 +1325,11 @@ def cmd_claim_idle(a, data, path):
     # T8 能力标签声明（宁漏勿错）：未声明 --tags 时带 tags 候选一律跳过——空闲续领由编排者
     # 发起，缺声明即无能力面证据，不猜；声明了则只放行有交集的候选。
     claimant_tags = _parse_tags(getattr(a, 'tags', None))
+    # T13 反风暴 open 上限（Q7）：认领方 open 计数逐候选判——候选均无主，每接受一个候选认领方
+    # 名下 open 总数 +1，超 DSH_EXPERT_PEER_OPEN_CAP（缺省 2）的候选跳过（reason=
+    # open_cap_exceeded）；因超限致整轮无一可认领时具名拒 open_cap_exceeded（零写零事件）。
+    # 缺省关闭不读 env 不计数，零行为变化。
+    cap_enforced, cap_limit, cap_pre = _open_cap_state(owner, data)
     running = sorted((tid for tid, t in data['tasks'].items() if t['status'] == 'running'),
                      key=lambda x: int(x[1:]))
     if running:
@@ -1340,9 +1351,18 @@ def cmd_claim_idle(a, data, path):
             skipped.append({'id': tid, 'reason': 'tag_mismatch'})
         elif t.get('owner'):
             skipped.append({'id': tid, 'reason': f'已有 owner={t["owner"]}'})
+        elif cap_enforced and cap_pre + len(candidates) >= cap_limit:
+            # T13：认领方 open 计数已达上限，再认领该候选将越限——逐候选跳过（判定先于任何变更）
+            skipped.append({'id': tid, 'reason': 'open_cap_exceeded'})
         else:
             candidates.append(t)
     if not candidates:
+        if cap_enforced and any(s['reason'] == 'open_cap_exceeded' for s in skipped):
+            raise BoardError('open_cap_exceeded', owner=owner, open_count=cap_pre, cap=cap_limit,
+                             skipped=skipped,
+                             hint='认领方名下 open 任务已达上限，整轮无一可认领（探针：taskboard.py '
+                                  'open-counts <owner> 核查；先收口/转派在途任务再续领）；'
+                                  '拒绝发生在任何变更与 save 之前（零写零事件）')
         raise BoardError('claim_idle_noop', skipped=skipped,
                          hint='候选在锁内权威状态下无一可认领（快照滞后/负向条件命中）；零写零事件')
     # 逐候选预算门，两段式章延后（v2.9 T11，T10 评审 🔴-1）：先全部候选判定、后统一落章——
@@ -1376,6 +1396,13 @@ def cmd_approve(a, data, path):
     t = get_task(data, a.id)
     if t['status'] != 'draft':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 draft 可批准")
+    # ── T13 反风暴 open 上限执法（Q7）：代理自建草案（M1 链落 created_by）批准前核查
+    # created_by 名下 open 计数（自建草案 owner==created_by 时草案自身已计入 open-counts 口径；
+    # 批准不改计数，本门语义=不把超限堆积放行进派工面）。lead 自建草案（无 created_by）
+    # 不受约束。缺省关闭零行为变化；超限具名拒 open_cap_exceeded，判定先于任何变更与 save。
+    cb = t.get('created_by')
+    if cb:
+        _check_open_cap(cb, data)
     t['status'] = 'pending'  # 依赖已满足时由下方 refresh 自动转 ready（复用既有不变量维护）
     t['updated'] = now_ms()
     promoted = refresh(data)
@@ -1456,18 +1483,38 @@ def _review_needs_revision(a, data, path, t, findings, limit, limit_label):
         t['switched'] = True
     if by and by != t['owner']:
         t.setdefault('executors', []).append({'name': by, 'time': ts})
-    if count > limit:
+    # ── T13 escalation 上限执法（Q7）：env DSH_EXPERT_ANTISTORM_ENFORCE 显式开启且该任务
+    # escalated 历史（escalation_count，retry 不清零）已达 DSH_EXPERT_ESCALATION_LIMIT
+    # （缺省 1）→ 拒绝自动 repair 绕行：不再生成 repair，直升 escalated 强制上报用户处置
+    # （bus 口径：第 2 次 escalated 前编排者必须上报用户裁决；retry 用户出口不动）。
+    # 执法关闭时 esc_over 恒 False，本门零行为变化=现状逐字节。
+    esc_enforced = _antistorm_enforced()
+    esc_count = _escalation_history(t) if esc_enforced else 0
+    esc_over = esc_enforced and esc_count >= _escalation_limit()
+    if count > limit or esc_over:
         # 超上限：不再自动生成 repair——escalated 终态，处置权交回用户
+        if esc_enforced:
+            t['escalation_count'] = esc_count + 1  # T13：escalated 历史落档（执法开启时；retry 不清零）
         t['status'] = 'escalated'
         t['updated'] = now_ms()
-        t.setdefault('checkpoints', []).append(
-            {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision，超过 {limit_label} "
-                                 f"{limit} → escalated（交回用户处置）"})
+        if esc_over and count <= limit:
+            t.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision；escalated 历史 "
+                                     f"{esc_count} 次已达上限（DSH_EXPERT_ESCALATION_LIMIT）"
+                                     "→ 拒绝自动 repair 绕行，escalated 交回用户处置"})
+        else:
+            t.setdefault('checkpoints', []).append(
+                {'time': ts, 'note': f"review: 第 {count} 次结论 needs_revision，超过 {limit_label} "
+                                     f"{limit} → escalated（交回用户处置）"})
         save(path, data)
         show(t)
         if by and by != t['owner']:
             print(f"实际执行者 {by} 已记录（owner={t['owner']}）")
-        print(f'  评审结论: needs_revision（第 {count} 次，超过 {limit_label} {limit}）→ 已升级 escalated')
+        if esc_over and count <= limit:
+            print(f'  评审结论: needs_revision（第 {count} 次）；escalated 历史 {esc_count} 次已达上限 '
+                  '→ 拒绝自动 repair 绕行，已升级 escalated')
+        else:
+            print(f'  评审结论: needs_revision（第 {count} 次，超过 {limit_label} {limit}）→ 已升级 escalated')
         print('  终态：不可 claim/done，仅用户显式指令（retry 解除升级并重置重试预算）可再动')
         return
     # 自动生成 repair 任务（等价 create 装配；无上游依赖——评审已发生，修复即可开工，refresh 后即 ready）
@@ -1709,6 +1756,8 @@ def cmd_vote(a, data, path):
         # 僵局：反向票一经出现，零反向约束使任一同向永不生效（票不可撤改，等待剩余票不改变结局）
         # ——当场 escalated 交回用户（验收 d：2 pass+1 fail → 不生效且交回用户）。
         t['status'] = 'escalated'
+        if _antistorm_enforced():  # T13：escalated 历史落档（执法开启时；retry 不清零）
+            t['escalation_count'] = _escalation_history(t) + 1
         t.setdefault('checkpoints', []).append(
             {'time': ts, 'note': f"m 票评审（m={m}）出现反向票，零反向约束使任一同向永不生效"
                                  f"（{tally}；{detail}）→ escalated 交回用户处置"})
@@ -2278,6 +2327,18 @@ def cmd_reassign(a, data, path):
         sys.exit(f"错误：{a.id} 已否决（rejected 终态），不可转派")
     if t['status'] == 'escalated':
         sys.exit(f"错误：{a.id} 已升级（escalated），等待用户处置，不可转派；用户显式 retry 可解除升级")
+    # ── T13 escalation 上限执法（Q7）：env DSH_EXPERT_ANTISTORM_ENFORCE 显式开启且该任务
+    # escalated 历史（escalation_count，用户 retry 不清零）已达 DSH_EXPERT_ESCALATION_LIMIT
+    # （缺省 1）→ reassign 双通道（peer 持证明/编排者自报）均具名拒 escalation_limit_exceeded
+    # ——编排者不得经自动重派绕行（bus 口径：达到限额后处置权归用户，用户显式 retry 解除
+    # 升级后仍须交用户裁决后续，不可自动再派）。判定先于任何变更与 save（零写零事件）；
+    # 缺省关闭零行为变化。
+    if _antistorm_enforced() and _escalation_history(t) >= _escalation_limit():
+        raise BoardError('escalation_limit_exceeded', task=a.id,
+                         escalation_count=_escalation_history(t), limit=_escalation_limit(),
+                         hint='该任务 escalated 历史已达上限（探针：show 检查点轨迹中 escalated '
+                              '记录次数 + status 的「已升级待用户处置」行）；编排者不得自动重派，'
+                              '上报用户裁决后由用户显式指令决定后续')
     proof = getattr(a, 'attempt', None)
     generated = a.attempt_id == 'auto'  # 保留触发词：工具生成不可猜 token（T7）
     if proof is not None and not generated:
@@ -2290,6 +2351,10 @@ def cmd_reassign(a, data, path):
             raise BoardError('not_task_owner', owner=t.get('owner'),
                              hint='peer 互派通道要求任务当前有 owner（owner==自己的板面投影：持有证明即 owner 身份，'
                                   'R1 防误用非防伪造）；无主任务的派发权在编排者通道（不带 --attempt）')
+        # ── T13 反风暴 open 上限执法（Q7）：peer 通道核查新 owner（--owner 指定或保持当前
+        # owner）在本次转派完成后名下 open 计数不超 DSH_EXPERT_PEER_OPEN_CAP（缺省 2）；
+        # 缺省关闭零行为变化；判定先于任何变更与 save（零写零事件）。
+        _check_open_cap(a.owner or t['owner'], data, acquiring_task_id=a.id)
     old = t.get('attempt_id')
     revoked = t.get('attempt_revoked') or []
     if generated:
@@ -2410,8 +2475,9 @@ _OPEN_STATUSES = ('draft', 'pending', 'ready', 'running')  # open 口径：draft
 def cmd_open_counts(a, data, _):
     """按 owner 聚合 open 任务计数与清单。零写零事件；main 派发走无锁快照（budget T38-1 先例，
     load(repair=False)），结果=事件流某一完整前缀的折叠（快照级一致性）。R1 口径如实声明：
-    owner 以板面自报为准，防误用不防伪造；Q7 裁决写面超限执法不做，本命令仅供编排者在
-    approve 代理草案/peer 互派前核查（协议纪律：超限不批准/不派转上报）。"""
+    owner 以板面自报为准，防误用不防伪造；Q7 裁决的写面超限执法已在 T13 经显式 env 开关
+    （DSH_EXPERT_ANTISTORM_ENFORCE，缺省关闭）落地（见下方反风暴写面执法 helper 面），本命令
+    仍是编排者核查探针（协议纪律：超限不批准/不派转上报）。"""
     only = (getattr(a, 'owner', None) or '').strip()
     groups = {}
     for t in data['tasks'].values():
@@ -2429,6 +2495,98 @@ def cmd_open_counts(a, data, _):
         return
     for o, g in sorted(payload.items()):
         print(f"{o or '（无主）'}: {g['count']} 个开放任务: {' '.join(g['tasks'])}")
+
+
+# ── 反风暴写面执法 helper（T13，Q7 兑现）────────────────────────────────────
+# 总开关 DSH_EXPERT_ANTISTORM_ENFORCE 缺省关闭：关闭时下列 helper 一律立即返回/返回关态，
+# 写路径零变化（不读阈值 env、不计数、不拒绝）=现状逐字节（双版本回归 selftest 钉死旧路径）；
+# 显式开启（任意非空值）后：
+# - open 上限（DSH_EXPERT_PEER_OPEN_CAP，缺省 2）：approve 代理自建草案（核查 created_by）、
+#   reassign peer 通道（核查新 owner）、claim/claim_idle（核查认领方，claim_idle 逐候选判）
+#   四写点按 open-counts 口径（_OPEN_STATUSES，main 统一 board_lock 锁内权威快照）执法，
+#   超限具名拒 open_cap_exceeded——判定先于任何变更与 save（零写零事件，revision/事件流零
+#   变化）；hint 统一指 taskboard.py open-counts <owner> 探针（T9 只读查询）。
+# - escalation 上限（DSH_EXPERT_ESCALATION_LIMIT，缺省 1）：任务 escalated 历史
+#   （escalation_count 字段，执法开启期间每次进入 escalated 落档、用户 retry 不清零——清零
+#   会让上限永不触发）达限后：needs_revision 不再自动生成 repair（拒绝 repair 绕行，直升
+#   escalated 强制上报用户处置）、reassign 双通道自动重派具名拒 escalation_limit_exceeded；
+#   retry 用户出口既有执法不动。
+# R1 口径如实声明：owner/created_by 以板面自报为准（CLI 无鉴权，防误用非防伪造）；
+# escalation_count 仅覆盖执法开启期间的 escalated（关闭期/旧板历史按 0 计，不回溯注记文本
+# ——注记非契约）。
+_ANTISTORM_ENFORCE_ENV = 'DSH_EXPERT_ANTISTORM_ENFORCE'
+_PEER_OPEN_CAP_ENV = 'DSH_EXPERT_PEER_OPEN_CAP'
+_ESCALATION_LIMIT_ENV = 'DSH_EXPERT_ESCALATION_LIMIT'
+_OPEN_CAP_DEFAULT = 2
+_ESCALATION_LIMIT_DEFAULT = 1
+
+
+def _antistorm_enforced():
+    """Q7：反风暴执法总开关（DSH_EXPERT_ANTISTORM_ENFORCE），缺省关闭=现状逐字节。"""
+    return bool((os.environ.get(_ANTISTORM_ENFORCE_ENV) or '').strip())
+
+
+def _env_positive_int(name, default):
+    """执法开启路径的阈值 env 解析：缺省/空白→default；非整数或 <1 → sys.exit 拒（宁拒勿猜，
+    不静默回落）；仅在执法开启路径调用（关闭时不读阈值 env，现状逐字节）。"""
+    raw = (os.environ.get(name) or '').strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        sys.exit(f"错误：{name} 须为正整数（得到 {raw!r}）")
+    if v < 1:
+        sys.exit(f"错误：{name} 须为正整数（得到 {v}）")
+    return v
+
+
+def _count_open_tasks(data, owner):
+    """owner 名下 open 任务 id 清单（_OPEN_STATUSES 口径，与 cmd_open_counts 聚合同源同序）。"""
+    return sorted(tid for tid, t in data['tasks'].items()
+                  if t['status'] in _OPEN_STATUSES and (t.get('owner') or '') == owner)
+
+
+def _open_cap_state(owner, data):
+    """open 上限执法入参三元组 (是否执法, cap, owner 名下 open 计数)：执法关闭时不读
+    DSH_EXPERT_PEER_OPEN_CAP、不计数，返回 (False, None, None)。锁内权威快照：写命令由
+    main 统一 board_lock 派发，调用点均在锁内折叠 data 上判定。"""
+    if not _antistorm_enforced():
+        return (False, None, None)
+    return (True, _env_positive_int(_PEER_OPEN_CAP_ENV, _OPEN_CAP_DEFAULT),
+            len(_count_open_tasks(data, owner)))
+
+
+def _check_open_cap(owner, data, acquiring_task_id=None):
+    """open 上限写面执法（approve/claim/reassign peer 三点共用）：执法开启时，本次写操作
+    完成后 owner 名下 open 任务总数（open-counts 同口径）超过 cap 即具名拒 open_cap_exceeded。
+    acquiring_task_id=本次写后将归属 owner 的任务：此前不在 owner 名下计数内则 post+1（认领/
+    转入）；原已归属（自认领/owner 保持不变）则计数不变。判定先于任何变更与 save（零写零
+    事件，revision/事件流零变化）。R1：owner 以板面自报为准，防误用非防伪造。"""
+    enforced, cap, pre = _open_cap_state(owner, data)
+    if not enforced:
+        return
+    post = pre
+    if acquiring_task_id is not None:
+        cur = data['tasks'].get(acquiring_task_id)
+        if cur is not None and (cur.get('owner') or '') != owner:
+            post += 1
+    if post > cap:
+        raise BoardError('open_cap_exceeded', owner=owner, open_count=pre, cap=cap, after=post,
+                         hint='owner 名下 open 任务数将超过上限（探针：taskboard.py open-counts '
+                              '<owner> 核查；先收口/转派在途任务，或经用户裁决调整 '
+                              'DSH_EXPERT_PEER_OPEN_CAP）；拒绝发生在任何变更与 save 之前（零写零事件）')
+
+
+def _escalation_history(t):
+    """任务 escalated 历史次数：唯一事实源=任务字段 escalation_count（执法开启期间每次进入
+    escalated 落档，用户 retry 不清零）；关闭期/旧板无字段按 0 计，不回溯注记文本（注记非
+    契约，如实声明）。"""
+    return int(t.get('escalation_count') or 0)
+
+
+def _escalation_limit():
+    return _env_positive_int(_ESCALATION_LIMIT_ENV, _ESCALATION_LIMIT_DEFAULT)
 
 
 

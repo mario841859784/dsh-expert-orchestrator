@@ -2,6 +2,15 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
+## [2.13.10] — Unreleased
+
+### Added
+
+- **代理 scoped 自建任务（M1，`skills/expert-orchestration/tools/taskboard.py`）**: taskboard.py `create` 新增 `--created-by <专家名>` 与 `--of <任务id>` 两个参数，二者必须成对出现（空串/纯空白经入口 strip 归一视同缺参——只给其一、或任一为空白，一律具名拒绝 `created_by_of_pair_required`）。校验链按序执行、任一不过零事件零落盘：① `--of` 任务须存在于本板且 owner == `--created-by`（认领关系核实，否则 `not_task_owner`）；② 新任务 `--scope` 须显式非空（不继承父 scope，缺省/空/纯空白逗号串 → `agent_create_requires_scope`）且逐项 ⊆ `--of` 任务 scope（复用既有 `_scope_match` 语义，越权项 → `scope_out_of_violation`）；③ 强制 status=draft——须携带 `--draft`（否则 `agent_create_requires_draft`），经既有 approve/reject 待批语义收口；④ `--kind` 与代理创建互斥（kind 允许面=缺省 kind，follow-up 语义；同传具名拒绝 `agent_create_kind_rejected`）；⑤ 显式 `--owner` 必须等于 `--created-by`（自建自领，不符 → `agent_owner_mismatch`；owner 缺省/空串不落 owner，claim 时再定，行为不变）。任务 JSON 落单键字符串字段 `created_by`（值=专家名；lead 派发不带新参数时不落此字段，输出与旧版逐字节一致）；事件流 type=create 的 args 携带 `created_by`/`of` 留档。具名错误码全集（taskboard.py 逐字 grep 实证 + 临时板 CLI 实测）：`created_by_of_pair_required` / `not_task_owner` / `agent_create_requires_scope` / `scope_out_of_violation` / `agent_create_requires_draft` / `agent_create_kind_rejected` / `agent_owner_mismatch`，共 7 个，均附 hint 字段。
+- **身份约束强度（R1，如实声明）**: `created_by` 的校验为**板内状态一致性校验**——只核实 `--created-by` 声明值与板内既存状态（`--of` 任务 owner、scope 归属、draft 待批面）的匹配，目的是防误用与防越权声明；**非密码学防伪造**——CLI 调用方可任意声明 `--created-by` 值，本机制不提供签名级身份证明，跨工具链的身份真实性由既有机制（bus 消息落款、任务板 claim 流水、事件溯源审计）另行背书。
+- **任务板 UI created-by 展示（`lib/client.js`）**: `created_by` 非空的任务卡片显示来源徽章（区别 lead 派发条目；lead 派发缺省不渲染该徽章）；代理自建待批草稿（status=draft 且 created_by 非空）在「需要注意」泳道显著呈现，并带「待批」区分标记与 `data-pending` 卡级高亮（与 lead 草稿视觉区分）；zh/en 双语词条各 3 条同步补齐。UI 仅展示不写交互——批准/拒绝仍走 CLI approve/reject 既有语义。
+- **测试**: `test/taskboard-agent-create.selftest.mjs` 9 用例覆盖校验链全分支（成对性/入口归一空串旁路/scope 必填/越权/owner 核实/draft 强制/kind 互斥/自建自领/approve 走通与 lead 路径逐字节兼容）；`test/client-taskboard.selftest.mjs` 新增 8 断言覆盖来源徽章与代理待批草稿呈现。版本三处（`package.json`/`dsh.plugin.json`/`lib/index.js`）本版不 bump，由发版流程统一处置。
+
 ## [2.13.9] — 2026-11-10
 
 ### Changed

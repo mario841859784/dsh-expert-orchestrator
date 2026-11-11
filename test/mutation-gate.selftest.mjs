@@ -9,7 +9,8 @@
 // 注入方式：pristine 源文件复制进 os.tmpdir() 临时目录后做单点字符串替换（anchor→mutant，
 // 注入前校验 anchor 恰出现 1 次），probe 以 tmp 副本为被测程序、cwd=临时目录——
 // 主树文件零污染、禁止 git 写操作的红线在测试自身内闭环。
-// 顶层另有「登记表锚点校验」子测试：pristine 源文件内 anchor 唯一、mutant≠anchor、行号存在，
+// 顶层另有「登记表锚点校验」子测试：pristine 源文件内 anchor 唯一、mutant≠anchor、登记行号
+// 与 anchor 实际起始行精确一致（T22 加严：行级 anchor 比对，取代旧「首行前 24 字符」松散比对），
 // 防止源码演化后登记表悄悄失配（失配即红，逼登记表随源码同步维护）。
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -64,85 +65,85 @@ const REGISTRY = [
     assertion: '依赖未满足的任务保持 pending（不提前 ready）',
   },
   {
-    id: 'TB-claim-ready-only', file: 'taskboard.py', line: 1332,
+    id: 'TB-claim-ready-only', file: 'taskboard.py', line: 1343,
     anchor: "    if t['status'] != 'ready':\n        sys.exit(f\"错误：{a.id} 状态为 {t['status']}，只有 ready 可认领\")",
     mutant: "    if t['status'] == 'ready':\n        sys.exit(f\"错误：{a.id} 状态为 {t['status']}，只有 ready 可认领\")",
     target: 'cmd_claim：只有 ready 可认领',
     assertion: 'ready 任务可正常认领',
   },
   {
-    id: 'TB-approve-draft-only', file: 'taskboard.py', line: 1575,
+    id: 'TB-approve-draft-only', file: 'taskboard.py', line: 1586,
     anchor: "    if t['status'] != 'draft':\n        sys.exit(f\"错误：{a.id} 状态为 {t['status']}，只有 draft 可批准\")",
     mutant: "    if t['status'] == 'draft':\n        sys.exit(f\"错误：{a.id} 状态为 {t['status']}，只有 draft 可批准\")",
     target: 'cmd_approve：只有 draft 可批准',
     assertion: 'draft 任务可正常批准',
   },
   {
-    id: 'TB-done-running-only', file: 'taskboard.py', line: 1765,
+    id: 'TB-done-running-only', file: 'taskboard.py', line: 1776,
     anchor: "    if t['status'] != 'running':\n        sys.exit(f\"错误：{a.id} 状态为 {t['status']}，只有 running 可完成\")",
     mutant: "    if t['status'] == 'running':\n        sys.exit(f\"错误：{a.id} 状态为 {t['status']}，只有 running 可完成\")",
     target: 'cmd_done：只有 running 可完成',
     assertion: 'running 任务可正常完成',
   },
   {
-    id: 'TB-verdict-whitelist', file: 'taskboard.py', line: 1602,
+    id: 'TB-verdict-whitelist', file: 'taskboard.py', line: 1613,
     anchor: "        if a.verdict not in ('pass', 'needs_revision'):", mutant: "        if False:",
     target: '_validate_done_verdict：review 结论白名单（pass|needs_revision 之外拒绝）',
     assertion: 'bogus 结论被白名单拒绝',
   },
   {
-    id: 'TB-quorum-pass-gate', file: 'taskboard.py', line: 1611,
+    id: 'TB-quorum-pass-gate', file: 'taskboard.py', line: 1629,
     anchor: "            if a.verdict == 'pass' and not (p >= t['quorum_m'] and f == 0):",
     mutant: "            if a.verdict == 'pass' and not (p >= 0 and f == 0):",
     target: '_validate_done_verdict：pass 结论须 p>=quorum_m 且 0 张 fail 票',
     assertion: 'quorum_not_met：陪审团未达标的 pass 结论被拒绝',
   },
   {
-    id: 'TB-vote-fail-effect', file: 'taskboard.py', line: 1947,
+    id: 'TB-vote-fail-effect', file: 'taskboard.py', line: 1958,
     anchor: "    if f >= m:", mutant: "    if f >= m + 1:",
     target: 'cmd_vote：fail 票数达 m 即生效（自动生成 repair）',
     assertion: 'fail 票达 m 后自动生成 repair 任务',
   },
   {
-    id: 'TB-vote-duplicate', file: 'taskboard.py', line: 1922,
+    id: 'TB-vote-duplicate', file: 'taskboard.py', line: 1933,
     anchor: "    if any(v.get('by') == by for v in votes):", mutant: "    if False:",
     target: 'cmd_vote：同一评审员重复投票必须 duplicate_vote 拒绝',
     assertion: 'duplicate_vote：重复投票被拒绝',
   },
   {
-    id: 'TB-watchdog-window', file: 'taskboard.py', line: 2090,
+    id: 'TB-watchdog-window', file: 'taskboard.py', line: 2101,
     anchor: "        if now - activity <= window_ms:", mutant: "        if True:",
     target: 'watchdog：滑动窗口内视为健康（不 nudge/reclaim）',
     assertion: '窗口外任务被 watchdog nudge',
   },
   {
-    id: 'TB-watchdog-nudge-threshold', file: 'taskboard.py', line: 2094,
+    id: 'TB-watchdog-nudge-threshold', file: 'taskboard.py', line: 2105,
     anchor: "        if nudges < max_nudges:", mutant: "        if False:",
     target: 'watchdog：nudge 次数未达上限前只 nudge 不升级',
     assertion: '首轮 watchdog 只 nudge（任务保持 running）',
   },
   {
-    id: 'TB-watchdog-review-no-adopt', file: 'taskboard.py', line: 2108,
+    id: 'TB-watchdog-review-no-adopt', file: 'taskboard.py', line: 2119,
     anchor: "        if m is not None and t.get('kind') != 'review':", mutant: "        if m is not None:",
     target: 'watchdog：review 任务即便有完成报告信也只 reclaim 不 adopt',
     assertion: 'review 任务被 reclaim（回 ready 而非 adopt 成 done）',
   },
   {
-    id: 'TB-adopt-evidence-negative-words', file: 'taskboard.py', line: 2057,
+    id: 'TB-adopt-evidence-negative-words', file: 'taskboard.py', line: 2068,
     anchor: "                if any(w in body for w in negative_words):",
     mutant: "                if False:",
     target: 'adopt 证据：body 含负向过程词（进行中等）不得采信为完成证据',
     assertion: '含负向词的证据被拒（任务被 reclaim 而非 adopt）',
   },
   {
-    id: 'TB-reclaim-revoke-attempt', file: 'taskboard.py', line: 2136,
+    id: 'TB-reclaim-revoke-attempt', file: 'taskboard.py', line: 2147,
     anchor: "            if att:\n                t.setdefault('attempt_revoked', []).append(att)",
     mutant: "            if False:\n                t.setdefault('attempt_revoked', []).append(att)",
     target: 'watchdog reclaim：孤儿代际必须撤销并入 revoked（迟到汇报 stale_attempt）',
     assertion: 'reclaim 后旧 attempt 的完成请求被拒绝',
   },
   {
-    id: 'TB-claim-revoke-old-attempt', file: 'taskboard.py', line: 1361,
+    id: 'TB-claim-revoke-old-attempt', file: 'taskboard.py', line: 1372,
     anchor: "        if old and old != a.attempt:", mutant: "        if False:",
     target: 'cmd_claim：认领换代必须撤销旧代际（旧代不得复活）',
     assertion: 'stale_attempt：已撤销代际不能重新认领',
@@ -154,7 +155,7 @@ const REGISTRY = [
     assertion: 'unrecoverable：被篡改的事件流拒绝读取',
   },
   {
-    id: 'TB-receipt-contract', file: 'taskboard.py', line: 3187,
+    id: 'TB-receipt-contract', file: 'taskboard.py', line: 3198,
     anchor: "    missing = [k for k in required if k not in payload]\n    if missing:",
     mutant: "    if False:",
     target: '_receipt_check：生产回执缺必备字段必须 receipt_invalid + 非零退出',
@@ -168,7 +169,7 @@ const REGISTRY = [
     assertion: 'list 尾行 revision=1（修订号随写递增）',
   },
   {
-    id: 'TB-needs-revision-escalation', file: 'taskboard.py', line: 1672,
+    id: 'TB-needs-revision-escalation', file: 'taskboard.py', line: 1683,
     anchor: "    if count > limit or esc_over:", mutant: "    if False:",
     target: '_review_needs_revision：返工超上限必须 escalated 终态（不再无限 repair）',
     assertion: 'escalated：返工超上限后任务进入终态',
@@ -542,7 +543,7 @@ const PROBES = {
 test('T4 变异测试族：taskboard.py/bus.py 门禁逻辑 29 点变异捕获（DSH_EXPERT_MUTANTS=1 启用；署名 qa-test-engineer）',
   { skip: GATED ? false : '未设 DSH_EXPERT_MUTANTS=1：变异测试默认关闭（正常跑批不执行注入）' },
   async (t) => {
-    await t.test('T4-R0 登记表锚点校验：pristine 源文件 anchor 唯一、mutant≠anchor、行号在文件范围内', () => {
+    await t.test('T4-R0 登记表锚点校验：pristine 源文件 anchor 唯一、mutant≠anchor、登记行号与 anchor 实际起始行精确一致', () => {
       assert.equal(REGISTRY.length, 29, '登记表应为 29 点（taskboard 22 + bus 7）')
       const ids = new Set()
       for (const m of REGISTRY) {
@@ -552,8 +553,11 @@ test('T4 变异测试族：taskboard.py/bus.py 门禁逻辑 29 点变异捕获�
           `${m.id}：anchor 应在 pristine ${m.file} 中恰出现 1 次（源码演化后须同步登记表）`)
         const lines = PRISTINE[m.file].split('\n')
         assert.ok(m.line >= 1 && m.line <= lines.length, `${m.id}：行号 ${m.line} 超出 ${m.file} 范围`)
-        assert.ok(lines[m.line - 1].includes(m.anchor.split('\n')[0].trim().slice(0, 24)),
-          `${m.id}：行号 ${m.line} 与 anchor 首行失配（登记表须随源码行号同步）`)
+        // T22 加严：行级 anchor 比对——anchor 全文（恰出现 1 次已断言）实际起始行须与登记
+        // 行号精确一致（旧校验仅比 anchor 首行前 24 字符的松散子串，行号漂移数行仍绿）。
+        const actualLine = PRISTINE[m.file].slice(0, PRISTINE[m.file].indexOf(m.anchor)).split('\n').length
+        assert.equal(actualLine, m.line,
+          `${m.id}：登记行号 ${m.line} 与 anchor 实际起始行 ${actualLine} 失配（登记表须随源码行号同步）`)
       }
     })
 

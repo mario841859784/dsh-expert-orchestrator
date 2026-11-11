@@ -1208,6 +1208,17 @@ def cmd_create(a, data, path):
                              hint='--auto-ready 要求全部依赖任务为 created_by 本人名下（跨 owner 依赖'
                                   '涉及他人任务闸门，须走 draft 审批面裁决）；去掉 --auto-ready 回 draft '
                                   '待批路径')
+        # ⑧'（T22 修复裁定①：⑧ 加严为 dep 全部本人名下且全部 done）——「ready 蕴含依赖已满足」
+        # 不变量在 deps_state/refresh（:926-944）与 claim 门（:1332）被主动维持，--auto-ready
+        # 直达 ready 不得绕过；否则产出「ready 但依赖未满足」任务可被第三方认领。任一 dep 非
+        # done 具名拒 agent_create_dep_open，不静默降级 draft（行为可预期优先）。
+        open_dep = [d for d in deps if data['tasks'][d].get('status') != 'done']
+        if open_dep:
+            raise BoardError('agent_create_dep_open', created_by=created_by, dep=open_dep,
+                             dep_status={d: data['tasks'][d].get('status') for d in open_dep},
+                             hint='--auto-ready 要求全部依赖任务已 done（ready 蕴含依赖已满足，'
+                                  '未完成依赖不可免审直达 ready）；先完成依赖任务，或去掉 --auto-ready '
+                                  '回 draft 待批路径')
         auto_ready_ev = {'open_pre': open_pre, 'cap': cap, 'parent_status': parent_status}
     scope = [s.strip().rstrip('/') for s in (a.scope or '').split(',') if s.strip()]
     tid = f"T{data['seq'] + 1}"
@@ -1237,7 +1248,7 @@ def cmd_create(a, data, path):
             'note': f"免审批创建（--auto-ready）：M1 链①-⑤+⑥⑦⑧全过；created_by={created_by} "
                     f"open_count={auto_ready_ev['open_pre']}（创建后 {auto_ready_ev['open_pre'] + 1} ≤ "
                     f"cap={auto_ready_ev['cap']}）；父 {of_id} 状态 {auto_ready_ev['parent_status']}；"
-                    f"dep 全部本人名下（{' '.join(deps) if deps else '无依赖'}）——免审证据可审计",
+                    f"dep 全部本人名下且已 done（{' '.join(deps) if deps else '无依赖'}）——免审证据可审计",
         })
         if _EVT_CTX.get('armed'):
             # T15：单事件 type=create 不变，args 增免审证据（open_count=前置判定时 pre 计数）

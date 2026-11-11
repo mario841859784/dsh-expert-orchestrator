@@ -10,6 +10,8 @@
 //    claim/done E2E）；c-T15) 三前置任一不过具名拒零写零事件（agent_create_open_cap/
 //    agent_create_parent_closed/agent_create_dep_cross_owner）+hint 指路 draft 回退可用；
 //    d-T15) --kind review 同传仍拒（review 永不免审）+误用面（缺代理身份/与 --draft 互斥）。
+//    e-T22) 免审前置⑧加严（dep 全部本人名下且全部 done）：dep 未 done 具名拒
+//    agent_create_dep_open（零写零事件不静默降级）+ dep 全 done 后重试直达 ready。
 // 全部用例跑在 tmp 隔离目录（mkdtemp），不触碰本仓任务板。
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -416,4 +418,41 @@ test('T15-d --kind review+--auto-ready 同传仍 agent_create_kind_rejected（re
   assert.match(r.json.message, /互斥/)
   assert.equal(boardOf(dir).revision, rev, '三条拒绝路径零写')
   assert.equal(eventsOf(dir).length, evN, '三条拒绝路径零事件')
+})
+
+// ── T22 repair：免审前置⑧加严为 dep 全部本人名下且全部 done（ready 蕴含依赖已满足不变量）──
+test('T15-e（T22）dep 未 done 具名拒 agent_create_dep_open（零写零事件，不静默降级 draft）+ dep 全 done 后重试直达 ready 成功', (t) => {
+  const dir = makeBoardDir(t, 't22-dep-open')
+  const py = (args, extraEnv = {}) => runTb(dir, args, { extraEnv })
+  py(['create', '父任务', '--owner', '甲', '--scope', 'src'])
+  py(['claim', 'T1', '甲'])
+  py(['create', '依赖任务', '--owner', '甲'])              // T2 pending（本人名下，未 done）
+  py(['create', '依赖任务2', '--owner', '甲'])             // T3：走完整生命周期到 done
+  py(['claim', 'T3', '甲'])
+  py(['done', 'T3', '收口'])
+  const rev = boardOf(dir).revision
+  const evN = eventsOf(dir).length
+  // 例一：dep 含未 done（T2 pending）→ 具名拒 agent_create_dep_open，仅具名 open 的依赖；
+  // cap 阈值覆盖为 99 使 ⑥ 不先触发（⑥ 先于 ⑧ 的次序既有语义不变）
+  let r = py(['--json', 'create', '免审任务', '--created-by', '甲', '--of', 'T1', '--scope', 'src',
+              '--dep', 'T2,T3', '--auto-ready'], { DSH_EXPERT_PEER_OPEN_CAP: '99' })
+  assert.equal(r.json.error, 'agent_create_dep_open')
+  assert.deepEqual(r.json.dep, ['T2'], '仅具名未 done 的依赖')
+  assert.deepEqual(r.json.dep_status, { T2: 'ready' }, '无依赖 pending 创建即被 refresh 提升为 ready（open 但未 done 仍拒）')
+  assert.match(r.json.hint, /去掉 --auto-ready/)
+  assert.equal(boardOf(dir).revision, rev, '拒绝路径零写')
+  assert.equal(eventsOf(dir).length, evN, '拒绝路径零事件')
+  const missing = py(['--json', 'show', 'T4'])
+  assert.equal(missing.json.error, 'command_failed', '不静默降级：任务未创建')
+  assert.match(missing.json.message, /任务 T4 不存在/)
+  // 例二：dep 全 done 后重试 → 成功直达 ready（免审证据注记如实声明加严后口径）
+  py(['claim', 'T2', '甲'])
+  py(['done', 'T2', '收口'])
+  r = py(['--json', 'create', '免审重试', '--created-by', '甲', '--of', 'T1', '--scope', 'src',
+          '--dep', 'T2,T3', '--auto-ready'])
+  assert.equal(r.json.ok, true, 'dep 全 done 后重试成功')
+  const t4 = py(['--json', 'show', 'T4']).json.data.task
+  assert.equal(t4.status, 'ready', '⑧ 加严后前置全过仍直达 ready')
+  assert.deepEqual(t4.dep, ['T2', 'T3'])
+  assert.match(t4.checkpoints.at(-1).note, /dep 全部本人名下且已 done（T2 T3）/)
 })

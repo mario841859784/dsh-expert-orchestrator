@@ -1,0 +1,4 @@
+e7368d0cc788cfccce26d8b997e9cc3398f22d88232ca9d0a7f0fedb89f2c261  AB-AU-01-A.md
+3e0d4f9dc0065431bb6cb7df90bcbaf5b019e1301edfe6f342e09bbce65265ed  AB-AU-02-A.md
+d77ffd095c02ae8776f2cdfca2bfd6b33f8d19ba830c32bfaaab00f9c1164ca6  AB-AU-03-A.md
+# B 臂 hash：随 T17 协议改版 commit 由 build-b-arm.sh 程序化生成后追加（首跑前不得手改）

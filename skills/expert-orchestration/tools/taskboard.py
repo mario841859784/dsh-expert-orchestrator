@@ -85,6 +85,12 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
     （skipped.reason=tag_mismatch 进既有 skipped 数组），不带 --tags 时带 tags 候选一律跳过（宁漏勿错）；
     全跳过仍走 claim_idle_noop。tags 与 M1 校验链（--created-by/--of）正交，不参与 scope 校验；
     声明值随事件 args.tags 留档（未声明时 args 形状不变）。
+  open-counts 反风暴查询（T9）：open-counts [owner] 按 owner 聚合 open 任务（draft/pending/ready/running，
+    draft 计入、终态不计入）计数与清单；只读无锁快照（沿 budget T38-1 降锁先例 load(repair=False)），
+    零写零事件——查询面绝不产生事件/视图写；--json data 为 {owner:{count,tasks:[id...]}}（owner 缺省
+    聚合全部；无主任务归 '' 键）。R1 口径如实声明：owner 以板面自报为准，防误用不防伪造；写面超限
+    执法不做（Q7）——编排者在 approve 代理草案/peer 互派前经本命令核查，超限不批准/不派转上报
+    （协议纪律，上限建议值见 PM 计划 §5）。
   查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（逐板标注损坏）外
     所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback。
   环检测：create --dep 与 set_dependencies 写入前做全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 且不落盘。
@@ -2396,6 +2402,35 @@ def cmd_metrics(a, data, _):
         print(f"{o} | 任务数 {n} | 累计返工 {rw} | 换人 {sw}")
 
 
+# ── open-counts 反风暴只读查询（T9，阶段二-T3）────────────────────────────────
+_OPEN_COUNTS_EVAL = {'payload': None}  # cmd_open_counts 暂存 --json 专用载荷（_structured_data 取用，watchdog 同模式）
+_OPEN_STATUSES = ('draft', 'pending', 'ready', 'running')  # open 口径：draft 计入（待批准草案占人）、终态一律不计入
+
+
+def cmd_open_counts(a, data, _):
+    """按 owner 聚合 open 任务计数与清单。零写零事件；main 派发走无锁快照（budget T38-1 先例，
+    load(repair=False)），结果=事件流某一完整前缀的折叠（快照级一致性）。R1 口径如实声明：
+    owner 以板面自报为准，防误用不防伪造；Q7 裁决写面超限执法不做，本命令仅供编排者在
+    approve 代理草案/peer 互派前核查（协议纪律：超限不批准/不派转上报）。"""
+    only = (getattr(a, 'owner', None) or '').strip()
+    groups = {}
+    for t in data['tasks'].values():
+        if t['status'] not in _OPEN_STATUSES:
+            continue
+        groups.setdefault(t['owner'] or '', []).append(t['id'])
+    for ids in groups.values():
+        ids.sort()
+    payload = {o: {'count': len(ids), 'tasks': ids} for o, ids in sorted(groups.items())}
+    if only:
+        payload = {only: payload.get(only, {'count': 0, 'tasks': []})}
+    _OPEN_COUNTS_EVAL['payload'] = payload
+    if all(g['count'] == 0 for g in payload.values()):
+        print(f"{only}: 0 个开放任务" if only else '（无开放任务）')
+        return
+    for o, g in sorted(payload.items()):
+        print(f"{o or '（无主）'}: {g['count']} 个开放任务: {' '.join(g['tasks'])}")
+
+
 
 # ── 门禁执法平面（v2.6）：commit-msg hook 双平面执法，默认关闭、显式开启 ──────
 # hook 本体选型：POSIX sh 薄壳（无 bash/第三方依赖），校验逻辑内嵌 python3 调本工具
@@ -2659,6 +2694,11 @@ def _structured_data(a, data):
         # 防御性 None 检查仅在异常序下退回旧空对象形态，不新增失败面）。
         out = _WATCHDOG_EVAL.get('payload')
         return out if isinstance(out, dict) else {}
+    if a.cmd == 'open-counts':
+        # T9（阶段二-T3）：反风暴查询是报告型命令——data 恒携带 {owner:{count,tasks}} 聚合载荷
+        # （与人类面逐 owner 行同源；空板/无匹配 owner 时 {owner:{count:0,tasks:[]}} 或 {}，均合法）。
+        out = _OPEN_COUNTS_EVAL.get('payload')
+        return out if isinstance(out, dict) else {}
     if a.cmd == 'replay':
         # v2.9 T2：重放对账载荷——四字段与人类面重放行同源同表达式（state_hash 给全值，
         # 16 字符截断是人类面显示约束；机器消费方拿全值可与事件流末事件 state_hash 直接对账；
@@ -2908,6 +2948,9 @@ def main():
     p = sub.add_parser('recover'); add_write_args(p); p.set_defaults(fn=cmd_recover)
     p = sub.add_parser('deps'); p.add_argument('id'); p.set_defaults(fn=cmd_deps)
     p = sub.add_parser('status'); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser('open-counts', help='按 owner 聚合 open 任务计数与清单（draft 计入、终态不计入；只读无锁快照，零写零事件；反风暴核查面 R1：owner 以板面自报为准）')
+    p.add_argument('owner', nargs='?', help='只统计该 owner（缺省聚合全部；无主任务归空键，人读面显示（无主））')
+    p.set_defaults(fn=cmd_open_counts)
     p = sub.add_parser('boards'); p.set_defaults(fn=cmd_boards)
     p = sub.add_parser('archive'); p.add_argument('--force', action='store_true'); p.set_defaults(fn=cmd_archive)
     p = sub.add_parser('reassign', help='转派：撤销旧代际建立新代际；attempt_id 传保留字 auto 由工具生成不可猜 token（at-<16hex>）；peer 互派用 --attempt 携带持有证明')
@@ -2972,6 +3015,16 @@ def main():
             data = load(path, repair=False)
             check_revision(a, data)  # --expected-revision 仍校验（对快照 revision，无锁下仅作乐观提示）
             a.tb_snapshot_read = True  # cmd_budget 据此走 read_events(repair=False) 快照计数读
+            _emit(a, data, path, json_mode)
+            return
+        if a.cmd == 'open-counts':
+            # ── T9（阶段二-T3）反风暴只读查询：无锁快照（沿 budget T38-1 降锁先例）──
+            # load(repair=False) 零写零 stderr（不重建视图、不自愈事件流——无锁进程绝不与持锁
+            # 写命令竞争 os.replace/O_APPEND）；不武装事件、绝不 save——查询面零写零事件。
+            # 结果=事件流某一完整前缀的折叠（快照级一致性）；--expected-revision 仍校验
+            # （对快照 revision，仅乐观提示）。人读/--json 形态与锁内路径一致。
+            data = load(path, repair=False)
+            check_revision(a, data)
             _emit(a, data, path, json_mode)
             return
         with board_lock(path):  # 进程互斥：load -> CAS 校验 -> 写入整体原子（TOCTOU 防护）

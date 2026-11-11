@@ -568,6 +568,8 @@ def _event_args(a):
         args = {'owner': a.owner, 'ids': list(a.ids)}  # 空闲续领原子认领（T39-①）：意图留档，事件 type 仍为 claim
         if getattr(a, 'tags', None) is not None:
             args['tags'] = _parse_tags(a.tags)  # claimant 能力声明随事件留档（T8；未声明时形状不变）
+        if getattr(a, 'steal', False):
+            args['steal'] = True  # T16：work-stealing 意图留档（previous_owner 由 cmd 携任务数据补挂）
         return args
     if c == 'vote':
         return {'by': a.by, 'score': a.score}
@@ -1417,7 +1419,17 @@ def cmd_claim_idle(a, data, path):
       归因不变），多候选单事件 after 携带全部变更任务快照（watchdog 单事件多任务先例）。
     拒绝面（除预算拒绝外零写零事件）：board_not_idle / claim_idle_noop /
     stale_revision（--expected-revision 既有 CAS）。人类面逐任务 show 块 + revision 尾行；
-    --json data 携带 {claimed:[id...], skipped:[{id,reason}...]}（_CLAIM_IDLE_EVAL 同源）。"""
+    --json data 携带 {claimed:[id...], skipped:[{id,reason}...]}（_CLAIM_IDLE_EVAL 同源）。
+    T16 work-stealing（--steal 显式参数，Q4 裁决）：缺省不带=上述现有语义逐字节不变。带
+    --steal 时认领面从「无主任务」扩到「他人 ready+owner 空闲任务」（ready+owner=X →
+    running+owner=认领方，无中间态），空闲闸收窄为双侧——认领方本人名下无 running（他人
+    在途不再整轮封锁）且被窃任务 owner 名下无 running（steal_owner_active 具名拒，判定先于
+    任何变更，整轮零写零事件）；不带 --steal 的全板闸 board_not_idle 逐字节不变。让渡留痕：
+    单事件 type=claim args 增 steal:true / previous_owner:{tid:上一手 owner}，任务 checkpoint
+    注记让渡、stolen_from 字段落档（每次 steal 覆写为上一手 owner）。反回摆：不得认领上一手
+    owner 为自己的任务（steal_ping_pong 具名拒，零写零事件）。约束共存：--tags 交集门逐候选
+    跳过、T13 open-cap 对认领方逐候选生效、预算门两段式章延后照常；无主任务不在 --steal
+    语义内（逐候选跳过）。"""
     owner = (a.owner or '').strip()
     if not owner:
         sys.exit('错误：claim_idle 需要非空 owner（认领方身份，空闲续领固定为编排者）')
@@ -1434,7 +1446,19 @@ def cmd_claim_idle(a, data, path):
     # claim_idle_noop 先出，env 非法不遮蔽板面结果）。计数为纯读，判定语义不变。
     running = sorted((tid for tid, t in data['tasks'].items() if t['status'] == 'running'),
                      key=lambda x: int(x[1:]))
-    if running:
+    if a.steal:
+        # T16（Q4 双侧空闲闸之 claimant 侧）：--steal 只要求认领方本人无 running——他人在途
+        # 任务与本轮无涉，全板闸在此收窄（不带 --steal 的全板闸分支逐字节不变）；被窃任务
+        # owner 名下无 running 在候选定后统一判定（steal_owner_active，判定先于任何变更）。
+        own_running = sorted((tid for tid, t in data['tasks'].items()
+                              if t['status'] == 'running' and (t.get('owner') or '') == owner),
+                             key=lambda x: int(x[1:]))
+        if own_running:
+            raise BoardError('steal_owner_active', side='claimant', owner=owner, running=own_running,
+                             hint='认领方本人名下存在在途任务（running），work-stealing 空闲闸拒绝：'
+                                  '先收口本人名下在途任务再窃（探针：taskboard.py list 核查）；'
+                                  '拒绝发生在任何变更与 save 之前（零写零事件）')
+    elif running:
         raise BoardError('board_not_idle', running=running,
                          hint='板上存在开放执行（running 任务），空闲续领整轮不动；'
                               '本轮候选未做任何认领（零写零事件），下个空闲边沿重扫')
@@ -1459,7 +1483,13 @@ def cmd_claim_idle(a, data, path):
         elif t.get('tags') and (claimant_tags is None or not (set(claimant_tags) & set(t['tags']))):
             # T8：带 tags 候选与声明无交集（或未声明）→ 逐个跳过，不进 noop 汇总语义之外的分支
             skipped.append({'id': tid, 'reason': 'tag_mismatch'})
-        elif t.get('owner'):
+        elif a.steal and not t.get('owner'):
+            # T16：无主任务不在 --steal 语义内（steal 只迁已有主空闲任务，无主走缺省路径）
+            skipped.append({'id': tid, 'reason': '无主任务不在 --steal 语义内'})
+        elif a.steal and t.get('owner') == owner:
+            # T16：窃本人名下任务无意义，复用既有 owner 跳过口径
+            skipped.append({'id': tid, 'reason': f'已有 owner={t["owner"]}'})
+        elif t.get('owner') and not a.steal:
             skipped.append({'id': tid, 'reason': f'已有 owner={t["owner"]}'})
         else:
             cap_enforced, cap_limit, cap_pre = _cap_state()
@@ -1481,6 +1511,23 @@ def cmd_claim_idle(a, data, path):
                                       '拒绝发生在任何变更与 save 之前（零写零事件）')
         raise BoardError('claim_idle_noop', skipped=skipped,
                          hint='候选在锁内权威状态下无一可认领（快照滞后/负向条件命中）；零写零事件')
+    if a.steal:
+        # T16 反回摆 + 双侧空闲闸之 owner 侧（Q4）：判定先于任何变更（先于预算门，拒绝时不落
+        # 任何章、不落任何事件，整轮零写零事件）。owner 侧：被窃任务 owner 名下有 running →
+        # 具名拒；反回摆：候选 stolen_from==认领方（上一手 owner 为本人）→ 具名拒。
+        ping = [t['id'] for t in candidates if (t.get('stolen_from') or '') == owner]
+        if ping:
+            raise BoardError('steal_ping_pong', owner=owner, tasks=ping,
+                             hint='候选任务的上一手 owner 为认领方本人（stolen_from 反回摆保护），'
+                                  '禁止窃回自己刚让渡的任务；拒绝发生在任何变更与 save 之前（零写零事件）')
+        active = sorted({(t.get('owner') or '') for t in candidates
+                         if any(x['status'] == 'running' and (x.get('owner') or '') == t['owner']
+                                for x in data['tasks'].values())})
+        if active:
+            raise BoardError('steal_owner_active', side='owner', owner=owner, owners=active,
+                             hint='被窃任务 owner 名下存在在途任务（running），双侧空闲闸拒绝：'
+                                  '等其收口后再窃（探针：taskboard.py open-counts 核查）；'
+                                  '拒绝发生在任何变更与 save 之前（零写零事件）')
     # 逐候选预算门，两段式章延后（v2.9 T11，T10 评审 🔴-1）：先全部候选判定、后统一落章——
     # 升档章暂存 stamps，全部门判定通过后才落快照、随本命令 claim 事件入账。此前「逐候选
     # 就地落章」在跨档组合下砖化：前候选章已就地改写 data 而未落账，后候选 interrupt 拒绝时
@@ -1493,10 +1540,25 @@ def cmd_claim_idle(a, data, path):
         budget_gate(_ClaimIdleGateNS(t['id'], owner), data, path, stamp_sink=stamps)
     for t, tier, who, count, th in stamps:
         _budget_stamp(t, tier, who, count, th)  # 统一落章：随本命令 claim 事件落账（零额外事件）
+    prev_owners = {}
     for t in candidates:
+        if a.steal:
+            prev_owners[t['id']] = t['owner']  # T16：上一手 owner（翻新前捕获）
         t['status'] = 'running'
         t['owner'] = owner
         t['updated'] = now_ms()
+        if a.steal:
+            # T16 让渡留痕：stolen_from 落档=上一手 owner（每次 steal 覆写，反回摆即取此字段）；
+            # checkpoint 注记让渡（时间面证据，随任务快照落盘、随本命令事件 after 携带）。
+            t['stolen_from'] = prev_owners[t['id']]
+            t.setdefault('checkpoints', []).append({
+                'time': now_ms(),
+                'note': f"让渡：{t['id']} 由 {prev_owners[t['id']]} 让渡给 {owner}"
+                        f"（claim_idle --steal work-stealing）",
+            })
+    if a.steal and _EVT_CTX.get('armed'):
+        _EVT_CTX['args']['steal'] = True
+        _EVT_CTX['args']['previous_owner'] = {tid: po for tid, po in sorted(prev_owners.items())}
     _CLAIM_IDLE_EVAL['claimed'] = [t['id'] for t in candidates]
     _CLAIM_IDLE_EVAL['skipped'] = skipped
     save(path, data)
@@ -3226,6 +3288,11 @@ def main():
     p.add_argument('--tags', help='claimant 能力声明（T8，逗号分隔）：带 tags 候选须与声明有交集才可认领，'
                                   '不匹配候选逐个跳过（skipped.reason=tag_mismatch）；不带 --tags 时带 tags '
                                   '候选一律跳过（宁漏勿错）；无 tags 候选不受影响（缺省行为不变）')
+    p.add_argument('--steal', action='store_true',
+                   help='T16 work-stealing（显式参数，缺省不带=现有语义逐字节不变）：认领他人 ready+owner '
+                        '空闲任务（→running+owner=认领方，无中间态）；空闲闸收窄双侧——认领方本人无 running '
+                        '且被窃任务 owner 名下无 running（steal_owner_active 拒）；让渡留痕 stolen_from/'
+                        'checkpoint/事件 args previous_owner；反回摆 steal_ping_pong 拒；无主候选不在本语义内')
     add_write_args(p)
     p.set_defaults(fn=cmd_claim_idle)
     p = sub.add_parser('approve'); p.add_argument('id'); add_write_args(p)

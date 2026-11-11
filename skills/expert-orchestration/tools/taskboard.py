@@ -78,6 +78,13 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
     返回 {"error":"not_task_owner",...}（无主任务的派发权在编排者通道）。'auto' 自本版起为 reassign 保留触发词；
     不带 --attempt 且不自报 'auto' 的旧用法逐字节不变；生成模式事件 args 携带 generated=true 与 proof_attempt（有持有
     证明时）留痕，token 也是合法 attempt_id——八命令既有 --attempt 校验零改动复用。
+  能力标签（T8）：create --tags "a,b" 落任务 tags 字符串数组（逗号分隔、逐项 strip、去空保序去重；
+    显式给参但解析为空一律拒绝，缺省不落 tags 字段、输出逐字节不变）。claim --tags <声明>：任务带 tags
+    且与声明无交集，或任务带 tags 而声明缺失，均返回 {"error":"tag_mismatch",...} 拒绝（宁拒勿猜 Q3，
+    零写零事件）；任务无 tags 任何认领不受影响。claim_idle --tags 同口径：不匹配候选逐个跳过
+    （skipped.reason=tag_mismatch 进既有 skipped 数组），不带 --tags 时带 tags 候选一律跳过（宁漏勿错）；
+    全跳过仍走 claim_idle_noop。tags 与 M1 校验链（--created-by/--of）正交，不参与 scope 校验；
+    声明值随事件 args.tags 留档（未声明时 args 形状不变）。
   查询失败语义：任务板文件损坏/结构非法（含深层结构，如 tasks 条目非对象）时，除 boards（逐板标注损坏）外
     所有命令返回 {"error":"unrecoverable","unrecoverable":true,...}，绝不静默返回空列表、绝不裸 traceback。
   环检测：create --dep 与 set_dependencies 写入前做全图环检测，成环返回 {"error":"dependency_cycle","cycle":"A->B->A"} 且不落盘。
@@ -543,11 +550,19 @@ def _event_args(a):
             # args 形状与旧版逐键一致（成功写事件仅产生于归一后非空值的代理创建）
             args['created_by'] = a.created_by.strip()
             args['of'] = (a.of or '').strip()
+        if getattr(a, 'tags', None) is not None:
+            args['tags'] = _parse_tags(a.tags)  # 能力标签随事件留档（T8；未声明时 args 形状不变）
         return args
     if c == 'claim':
-        return {'owner': a.owner, 'attempt': a.attempt}
+        args = {'owner': a.owner, 'attempt': a.attempt}
+        if getattr(a, 'tags', None) is not None:
+            args['tags'] = _parse_tags(a.tags)  # claimant 能力声明随事件留档（T8；未声明时形状不变）
+        return args
     if c == 'claim_idle':
-        return {'owner': a.owner, 'ids': list(a.ids)}  # 空闲续领原子认领（T39-①）：意图留档，事件 type 仍为 claim
+        args = {'owner': a.owner, 'ids': list(a.ids)}  # 空闲续领原子认领（T39-①）：意图留档，事件 type 仍为 claim
+        if getattr(a, 'tags', None) is not None:
+            args['tags'] = _parse_tags(a.tags)  # claimant 能力声明随事件留档（T8；未声明时形状不变）
+        return args
     if c == 'vote':
         return {'by': a.by, 'score': a.score}
     if c == 'done':
@@ -989,7 +1004,8 @@ def show(t):
     scope = (' scope=' + ','.join(t['scope'])) if t.get('scope') else ''
     kind = (f" kind={t['kind']}") if t.get('kind') else ''  # 缺省任务不带 kind 字段（行为不变）
     cby = (f" created_by={t['created_by']}") if t.get('created_by') else ''  # M1：仅代理自建任务携带
-    print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}{scope}{kind}{cby}")
+    tags = (f" tags={','.join(t['tags'])}") if t.get('tags') else ''  # T8：仅带 tags 字段的任务携带（缺省输出零变化）
+    print(f"{t['id']} [{t['status']}] {t['title']}{owner}{dep}{scope}{kind}{cby}{tags}")
     if t.get('artifacts'):
         print(f"  工件归属: {', '.join(t['artifacts'])}")
 
@@ -1043,6 +1059,23 @@ def cmd_own(a, data, path):
     show(t)
 
 
+def _parse_tags(raw):
+    """--tags 逗号分隔解析（T8）：raw=None（未声明）→ None；逐项 strip、去空、保序去重。
+    显式给参但解析为空（空串/纯逗号/纯空白）→ sys.exit 拒绝（宁拒勿错：空声明与未声明
+    语义不同，前者是「声明了自己没有任何能力」，静默归一成未声明会掩盖调用方笔误）。
+    该函数也被 _event_args 复用（事件留档值与落盘字段同一实现，杜绝双解析漂移）。"""
+    if raw is None:
+        return None
+    tags = []
+    for s in raw.split(','):
+        s = s.strip()
+        if s and s not in tags:
+            tags.append(s)
+    if not tags:
+        sys.exit('错误：--tags 须为至少一个非空标签（逗号分隔，如 "a,b"）；空串/纯逗号视同无效参数')
+    return tags
+
+
 def cmd_create(a, data, path):
     if a.kind and a.kind != 'review':
         sys.exit(f"错误：--kind 仅支持 review（得到 {a.kind!r}）；m 票共识等其余 kind 由后续版本提供")
@@ -1051,6 +1084,7 @@ def cmd_create(a, data, path):
             sys.exit('错误：--quorum-m 仅支持 review kind 任务（m 票布尔共识陪审团规模）')
         if a.quorum_m < 1:
             sys.exit('错误：--quorum-m 须为 ≥1 的整数（裸声明即默认陪审团 m=3；m=1 单评审员路径无需声明）')
+    tags = _parse_tags(getattr(a, 'tags', None))  # T8 能力标签：空/无效声明在此具名拒绝（任何写发生之前）
     # ── 代理 scoped 自建任务（M1）：校验链按序执行，任一不过具名拒绝零事件零落盘 ──
     # T6/B1：入口归一——--created-by 与 --of 同式 strip()，空串/纯空白视作缺参（None）；
     # 成对性校验在归一后进行：只给其一、或给空串/空白，一律同一具名成对错误拒绝（杜绝
@@ -1121,6 +1155,8 @@ def cmd_create(a, data, path):
         data['tasks'][tid]['quorum_m'] = a.quorum_m  # m 票陪审团规模（缺省不带该字段=单评审员路径）
     if agent_create:
         data['tasks'][tid]['created_by'] = created_by  # M1：单键字符串字段（lead 派发不落此字段）
+    if tags:
+        data['tasks'][tid]['tags'] = tags  # T8 能力标签（缺省不落 tags 字段=输出逐字节不变）
     promoted = refresh(data)
     save(path, data)
     show(data['tasks'][tid])
@@ -1209,6 +1245,17 @@ def cmd_claim(a, data, path):
         sys.exit(f"错误：{a.id} 已升级（escalated），等待用户处置，不可认领；用户显式 retry 可解除升级")
     if t['status'] != 'ready':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 ready 可认领")
+    # ── T8 能力标签门：任务带 tags 须与 claimant 声明有交集才可认领（宁拒勿猜 Q3）──
+    # 任务带 tags 而声明缺失 → 拒（不猜 claimant 能力面）；无交集 → 拒；任务无 tags → 任何
+    # 认领不受影响（向后兼容）。拒绝发生在任何变更与 save 之前（零写零事件）。
+    # 与 M1 校验链（--created-by/--of，作用于 create 面）正交，tags 不参与 scope 校验。
+    ttags = t.get('tags') or []
+    if ttags:
+        ct = _parse_tags(getattr(a, 'tags', None))
+        if ct is None or not (set(ct) & set(ttags)):
+            raise BoardError('tag_mismatch', task_tags=ttags, claimant_tags=ct,
+                             hint='任务带能力标签，claimant 须用 --tags 声明至少一个交集标签才可认领'
+                                  '（宁拒勿猜：不声明即拒）；任务无 tags 时任何认领不受影响')
     if a.attempt:
         if a.attempt in (t.get('attempt_revoked') or []):
             raise BoardError('stale_attempt', attempt=a.attempt, current=t.get('attempt_id'),
@@ -1263,6 +1310,9 @@ def cmd_claim_idle(a, data, path):
     owner = (a.owner or '').strip()
     if not owner:
         sys.exit('错误：claim_idle 需要非空 owner（认领方身份，空闲续领固定为编排者）')
+    # T8 能力标签声明（宁漏勿错）：未声明 --tags 时带 tags 候选一律跳过——空闲续领由编排者
+    # 发起，缺声明即无能力面证据，不猜；声明了则只放行有交集的候选。
+    claimant_tags = _parse_tags(getattr(a, 'tags', None))
     running = sorted((tid for tid, t in data['tasks'].items() if t['status'] == 'running'),
                      key=lambda x: int(x[1:]))
     if running:
@@ -1279,6 +1329,9 @@ def cmd_claim_idle(a, data, path):
             skipped.append({'id': tid, 'reason': '任务不存在'})
         elif t['status'] != 'ready':
             skipped.append({'id': tid, 'reason': f'状态为 {t["status"]}'})
+        elif t.get('tags') and (claimant_tags is None or not (set(claimant_tags) & set(t['tags']))):
+            # T8：带 tags 候选与声明无交集（或未声明）→ 逐个跳过，不进 noop 汇总语义之外的分支
+            skipped.append({'id': tid, 'reason': 'tag_mismatch'})
         elif t.get('owner'):
             skipped.append({'id': tid, 'reason': f'已有 owner={t["owner"]}'})
         else:
@@ -2795,6 +2848,8 @@ def main():
     p.add_argument('--quorum-m', type=int, nargs='?', const=DEFAULT_REVIEW_QUORUM_M, default=None,
                    help='m 票布尔共识陪审团规模（仅 review kind；裸声明即默认 3，Q3=3A）；'
                         '未声明或 m=1 为单评审员路径，行为不变')
+    p.add_argument('--tags', help='能力标签（T8，逗号分隔如 "a,b"，逐项 strip 去空保序去重；'
+                                 '落任务 tags 字符串数组；缺省不落 tags 字段，行为逐字节不变）')
     p.add_argument('--created-by',
                    help='代理 scoped 自建任务（M1）：与 --of 必须成对出现——声明创建者专家名，须等于 '
                         '--of 任务 owner（认领关系核实）；任务 JSON 落单键字符串字段 created_by，'
@@ -2809,13 +2864,20 @@ def main():
     p = sub.add_parser('list')
     p.set_defaults(fn=cmd_list)
     p = sub.add_parser('show'); p.add_argument('id'); p.set_defaults(fn=cmd_show)
-    p = sub.add_parser('claim'); p.add_argument('id'); p.add_argument('owner', nargs='?'); add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_claim)
+    p = sub.add_parser('claim'); p.add_argument('id'); p.add_argument('owner', nargs='?')
+    p.add_argument('--tags', help='claimant 能力声明（T8，逗号分隔）：任务带 tags 须与声明有交集才可认领；'
+                                  '任务带 tags 而未声明，或无交集，均 tag_mismatch 拒绝（宁拒勿猜，零写零事件）；'
+                                  '任务无 tags 时任何认领不受影响（缺省行为不变）')
+    add_attempt_arg(p); add_write_args(p); p.set_defaults(fn=cmd_claim)
     p = sub.add_parser('claim_idle', help='#20 空闲续领原子认领（v2.9 T3/T39-①）：单锁内「无 running 判定+认领」——'
                                           '并发 sweep/人工 claim 竞争下恰好一个成功（board_not_idle 整轮不动）；'
                                           '非 ready/已有 owner/不存在跳过（fail-open，全跳过 claim_idle_noop）；'
                                           '不建代际；事件仍为 claim 类型（#16 预算计数归因不变，interrupt 档照常拒绝）')
     p.add_argument('owner', help='认领方身份（空闲续领固定为编排者 IDLE_RECLAIM_OWNER）')
     p.add_argument('ids', nargs='+', help='候选任务 id 列表（一次持锁内批量认领；上限由调用方 sweep 策略控制）')
+    p.add_argument('--tags', help='claimant 能力声明（T8，逗号分隔）：带 tags 候选须与声明有交集才可认领，'
+                                  '不匹配候选逐个跳过（skipped.reason=tag_mismatch）；不带 --tags 时带 tags '
+                                  '候选一律跳过（宁漏勿错）；无 tags 候选不受影响（缺省行为不变）')
     add_write_args(p)
     p.set_defaults(fn=cmd_claim_idle)
     p = sub.add_parser('approve'); p.add_argument('id'); add_write_args(p)

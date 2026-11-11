@@ -840,10 +840,15 @@ def check_revision(a, data):
                          hint='任务板已被并发写入；重新读取（读命令末行 revision=N）后携带最新 revision 重试')
 
 
-def check_attempt(a, t):
-    """attempt 代际校验（汇报路径 done/fail/progress）：
+_UNSET = object()  # T14：显式「未传 caller」标记（区别于显式传 None=调用方无身份可核）
+
+
+def check_attempt(a, t, caller=_UNSET):
+    """attempt 代际校验（汇报路径 done/fail/progress/own/vote；reassign 持证明通道）：
     不带 --attempt 不校验（向后兼容，行为与旧版一致）；带 --attempt 时 fail closed——
-    任务无开放代际 → no_attempt；attempt 已撤销 → stale_attempt（revoked）；非当前代际 → stale_attempt。"""
+    任务无开放代际 → no_attempt；attempt 已撤销 → stale_attempt（revoked）；非当前代际 → stale_attempt。
+    T14 代际 owner 绑定（env DSH_EXPERT_ATTEMPT_BIND_OWNER 缺省关闭）：字段 attempt_owner 存在且
+    调用方声明身份（--by/--owner）不符 → attempt_owner_mismatch；未声明身份不可核不拒（R1）。"""
     att = getattr(a, 'attempt', None)
     if att is None:
         return
@@ -859,6 +864,19 @@ def check_attempt(a, t):
         raise BoardError('stale_attempt', attempt=att, current=cur,
                          revoked=revoked,
                          hint='该任务已转派到新代际；向编排者确认最新 attempt_id，或重新领取')
+    # ── T14 代际 owner 绑定校验（Q2）：env 开启且任务落有 attempt_owner 字段（旧板无字段
+    # 自动回退旧行为）时，调用方声明身份与代际绑定不符 → 具名拒 attempt_owner_mismatch。
+    # 判定先于任何变更与 save（零写零事件）；未声明身份不可核不拒；绑定与申报均为板面自报，
+    # R1 板内一致性校验防误用非防伪造。
+    bound = t.get('attempt_owner')
+    if bound and _attempt_bind_enforced():
+        if caller is _UNSET:
+            caller = getattr(a, 'by', None) or getattr(a, 'owner', None)
+        if caller and caller != bound:
+            raise BoardError('attempt_owner_mismatch', attempt=att, attempt_owner=bound,
+                             declared=caller,
+                             hint='该代际绑定 owner 与申报身份不符；向编排者确认身份或最新代际'
+                                  '（探针：show --json 的 attempt_owner 字段）')
 
 
 def find_cycle(graph):
@@ -1282,6 +1300,12 @@ def cmd_claim(a, data, path):
     t['status'] = 'running'
     if a.owner:
         t['owner'] = a.owner
+    # ── T14 代际 owner 绑定（Q2）：claim --attempt 建/续代际时落 attempt_owner=落定 owner，
+    # 并随事件 args 留痕；env DSH_EXPERT_ATTEMPT_BIND_OWNER 关闭不落字段不写 args（逐字节一致）。
+    if a.attempt and _attempt_bind_enforced():
+        t['attempt_owner'] = t['owner']
+        if _EVT_CTX.get('armed'):
+            _EVT_CTX['args']['attempt_owner'] = t['owner']
     t['updated'] = now_ms()
     save(path, data)
     show(t)
@@ -2346,7 +2370,10 @@ def cmd_reassign(a, data, path):
                          hint='peer 互派须用工具生成的新 token：reassign <id> auto --attempt <当前代际>；'
                               '自报新 attempt_id 只属于编排者通道（不带 --attempt）')
     if proof is not None:
-        check_attempt(a, t)  # 持有证明：当前开放代际校验（no_attempt/stale_attempt 具名拒绝、零写零事件）
+        # 持有证明：当前开放代际校验（no_attempt/stale_attempt 具名拒绝、零写零事件）。
+        # T14：caller 显式传当前 owner（持有证明即 owner 本人，R1 投影）；--owner 是新 owner
+        # 非调用方身份，不作为绑定校验的申报（显式传参绕开 --by/--owner 通用推断）。
+        check_attempt(a, t, caller=t.get('owner'))
         if not t.get('owner'):
             raise BoardError('not_task_owner', owner=t.get('owner'),
                              hint='peer 互派通道要求任务当前有 owner（owner==自己的板面投影：持有证明即 owner 身份，'
@@ -2380,6 +2407,13 @@ def cmd_reassign(a, data, path):
     t.pop('heartbeat_at', None)
     if a.owner:
         t['owner'] = a.owner
+    # ── T14 代际 owner 绑定（Q2）：reassign 双通道建代际时落 attempt_owner=落定 owner
+    # （编排者通道 --owner 指定 / peer 通道保持当前 owner），事件 args 留痕同 claim；
+    # env DSH_EXPERT_ATTEMPT_BIND_OWNER 关闭不落字段不写 args（逐字节一致）。
+    if _attempt_bind_enforced():
+        t['attempt_owner'] = a.owner or t['owner']
+        if _EVT_CTX.get('armed'):
+            _EVT_CTX['args']['attempt_owner'] = t['attempt_owner']
     t['updated'] = now_ms()
     save(path, data)
     show(t)
@@ -2524,6 +2558,21 @@ _ESCALATION_LIMIT_DEFAULT = 1
 def _antistorm_enforced():
     """Q7：反风暴执法总开关（DSH_EXPERT_ANTISTORM_ENFORCE），缺省关闭=现状逐字节。"""
     return bool((os.environ.get(_ANTISTORM_ENFORCE_ENV) or '').strip())
+
+
+# ── T14 代际 owner 绑定（Q2 兑现）─────────────────────────────────────────────
+# 代际建立（claim --attempt / reassign 双通道）时落 attempt_owner=落定 owner，并在事件 args
+# 留痕；check_attempt 单点校验：字段存在且调用方声明身份（--by/--owner）不符 → 具名拒
+# attempt_owner_mismatch（done/fail/progress/own/vote/reassign-proof 经 check_attempt 自动获得）。
+# env DSH_EXPERT_ATTEMPT_BIND_OWNER 缺省关闭：不落字段不校验（关闭=现状逐字节）；旧板无字段
+# 自动回退旧行为（字段缺席=不校验双保险）。R1 口径随行如实声明：绑定与申报均为板面自报
+# （CLI 无鉴权），板内一致性校验防误用非防伪造。
+_ATTEMPT_BIND_ENV = 'DSH_EXPERT_ATTEMPT_BIND_OWNER'
+
+
+def _attempt_bind_enforced():
+    """T14：任意非空值=开启；缺省/空串=关闭（缺省关闭=旧行为逐字节，与 Q7 同形）。"""
+    return bool((os.environ.get(_ATTEMPT_BIND_ENV) or '').strip())
 
 
 def _env_positive_int(name, default):

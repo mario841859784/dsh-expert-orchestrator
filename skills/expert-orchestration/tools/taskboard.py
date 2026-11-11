@@ -1784,6 +1784,7 @@ def cmd_done(a, data, path):
                                limit=REPAIR_RETRY_LIMIT, limit_label='repair 重试上限')
         return
     t['status'] = 'done'
+    t.pop('fail_streak', None)  # 方向 3：成功完成=实质进展，连续失败循环计数清零（无字段时无副作用）
     closed_repairs = []
     if a.verdict == 'pass':
         t['verdict'] = 'pass'  # review 评审通过：结论留档（非 review 任务无该字段）
@@ -1832,11 +1833,62 @@ def cmd_done(a, data, path):
         print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
 
 
+# ── 方向 3 连续失败循环升级（dev/orchestration-economics-345，opt-in 执法）──────
+# 循环失控四轴之一（另三轴：watchdog 时间窗 / #16 工具调用硬预算 / 振荡告警——各管
+# 一个轴，互补不冲突）。口径：fail_streak 跨 retry 累计（普通 failed→retry 重派不清
+# 零=循环检测的关键；done 成功清零=有实质进展；用户 retry 解除升级时重置=显式重给
+# 一轮预算），达限的 fail 不落 failed 而自动转 escalated 待用户处置（mission-control
+# 「循环失败 N 次升级给人」模式；唯一出口=用户 retry）。执法关闭（缺省）=旧路径逐字节
+# （不读 env、不落 fail_streak 字段）。
+def _failloop_enforced() -> bool:
+    return bool(os.environ.get('DSH_EXPERT_FAILLOOP_ENFORCE', '').strip())
+
+
+def _failloop_limit():
+    """DSH_EXPERT_FAILLOOP_LIMIT（缺省 3）：非法值 fail-open（执法禁用+stderr 告警，
+    沿 budget_thresholds 先例——护栏机制配置错误不静默硬拒，也绝不带着坏阈值执法）。"""
+    raw = os.environ.get('DSH_EXPERT_FAILLOOP_LIMIT')
+    if raw is None or raw == '':
+        return 3
+    try:
+        n = int(raw)
+    except ValueError:
+        print('警告：DSH_EXPERT_FAILLOOP_LIMIT 非法（须为正整数），连续失败升级执法本次禁用', file=sys.stderr)
+        return None
+    if n < 1:
+        print('警告：DSH_EXPERT_FAILLOOP_LIMIT 须 ≥1，连续失败升级执法本次禁用', file=sys.stderr)
+        return None
+    return n
+
+
 def cmd_fail(a, data, path):
     t = get_task(data, a.id)
     check_attempt(a, t)
     if t['status'] != 'running':
         sys.exit(f"错误：{a.id} 状态为 {t['status']}，只有 running 可标记失败")
+    # 方向 3 连续失败循环升级（opt-in 执法）：达限不落 failed 而自动转 escalated（事件
+    # args 携 auto_escalated/fail_streak 留痕）；未达限落 failed 但累计 fail_streak 字段
+    # （仅执法开启且限额合法时落字段——关闭期/限额非法=执法整体禁用，任务 JSON 形状
+    # 逐字节不变，沿 budget_thresholds fail-open 先例）。
+    if _failloop_enforced():
+        limit = _failloop_limit()
+        if limit is not None:
+            streak = int(t.get('fail_streak') or 0) + 1
+            if streak >= limit:
+                t['status'] = 'escalated'
+                t['fail'] = a.reason or ''
+                t['fail_streak'] = streak
+                t['updated'] = now_ms()
+                ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
+                t.setdefault('checkpoints', []).append(
+                    {'time': ts, 'note': f'连续失败 {streak} 次（fail-loop 限额 {limit}）自动升级：待用户处置（retry 解除并重置计数）'})
+                _EVT_CTX['args']['auto_escalated'] = True
+                _EVT_CTX['args']['fail_streak'] = streak
+                save(path, data)
+                show(t)
+                print(f'已自动升级：连续失败 {streak}/{limit} 次（fail-loop）——唯一出口=用户显式 retry（重置 fail_streak）')
+                return
+            t['fail_streak'] = streak
     t['status'] = 'failed'
     t['fail'] = a.reason or ''
     t['updated'] = now_ms()
@@ -1851,14 +1903,19 @@ def cmd_retry(a, data, path):
         # （用户决定再给一轮修复机会；旧 verdict/findings 留档不删，复审通过时被覆盖）。
         # m 票任务（WP-5/S3 接线点）：僵局/轮次升级解除时同步清空票箱、重置评审轮次（T20 回炉起与
         # failed retry / watchdog reclaim / recover 共用 _mvote_reset_ballot 一处实现）。
+        # 方向 3：fail-loop 升级的任务在此同步重置连续失败计数（用户 retry=显式重给一轮预算）；
+        # 无 fail_streak 字段的任务（评审升级路径/执法关闭期）pop 无副作用，落盘形状不变。
+        had_streak = int(t.get('fail_streak') or 0)
         t['status'] = 'ready'
         t['fail'] = ''
         t['repair_count'] = 0
+        t.pop('fail_streak', None)
         mvote = _mvote_reset_ballot(t)
         t['updated'] = now_ms()
         ts = datetime.datetime.fromtimestamp(now_ms() / 1000).strftime('%Y-%m-%d %H:%M:%S')
         t.setdefault('checkpoints', []).append(
             {'time': ts, 'note': '用户显式 retry：解除 escalated，回 ready；repair 重试预算已重置'
+                                 + (f'；fail-loop 连续失败计数已重置（原 {had_streak}）' if had_streak else '')
                                  + ('；m 票票箱已清空、评审轮次重置' if mvote else '')})
         save(path, data)
         show(t)

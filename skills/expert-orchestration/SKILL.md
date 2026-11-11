@@ -84,6 +84,7 @@ whenToUse: 涉及实施或任务分解时加载；已加载且未被历史压缩
 - 你是唯一的召唤者：专家会话被禁止再召唤专家，所有协调通过你完成。
 - **实施类写入（改代码/改配置/改文档/git commit）一律不得亲自执行**；你的手只碰只读操作（读 diff、跑测试、grep 核对）。
 - 专家失败或结论可疑：换专家重试、改用自带库，或进第 4 节请 PM 重排，不要反复硬试同一调用；任务板对应条目 `fail` 记录原因；中断专家的续跑按第 3 节断点续跑两态处置（新一代宿主 summon 通道自动续跑恰好一个 turn；其余按一次性纪律以检查点+全新代理重跑）。
+- **循环检测与人工升级（方向 3，四轴分工）**：循环失控有四个**独立**轴，各有自己的检测面与升级出口——① 时间窗无进展（watchdog，本节长任务存活纪律）；② 调用量发散（#16 工具调用硬预算）；③ 策略振荡（A↔B 交替告警）；④ **连续失败循环**——同一任务 `fail`→`retry` 再 `fail` 跨重派累计（`fail_streak`），**达 3 次（`DSH_EXPERT_FAILLOOP_LIMIT` 可调）强制升级**：`DSH_EXPERT_FAILLOOP_ENFORCE` 显式开启后第 N 次 `fail` 工具级自动转 **escalated**（唯一出口=用户 `retry`，重置计数再给一轮预算；`done` 成功清零），执法关闭时为协议纪律（编排者自查事件流累计，达限不得第 N+1 次重试、上报用户）；同一专家**连续召唤失败** ≥3 次（`DSH_EXPERT_SUMMON_FAILLOOP_N` 可调，召唤通道根本没跑起来的失败，与任务板 fail 循环互补）时 summon 错误尾部附【循环告警】（`DSH_EXPERT_SUMMON_FAILLOOP='0'/''` 关闭）——停止硬试，换专家/换通道/上报用户。**升级报告三要素**（上报用户必填）：当前状态（任务板条目+最新检查点）、已尝试方案（每次失败的原因与处置动作）、建议选项（换人/拆解/范围调整/放弃）。
 
 ### 3.1 子代理一次性纪律
 
@@ -270,6 +271,8 @@ v2.8 M8-2 运行时门禁开关速查（详见 §3/§5/§6 对应段；沿 DSH_E
     DSH_EXPERT_ATTEMPT_BIND_OWNER=1 # attempt owner 绑定开启（T14，缺省关闭=旧行为逐字节）：代际建立落 attempt_owner，持证明通道（done --by/vote --by/reassign）校验 attempt_owner_mismatch（§3.2 规则 6）
     DSH_EXPERT_ROUTE_PREF=quality|balanced|cost  # 三档偏好路由开启（编排经济学，非法值告警不生效）：defaults.modelByPref 配合使用，仅当专家无逐专家/组级 model 时按档取模型（显式配置优先，§3/§5）
     DSH_EXPERT_TOKEN_BUDGET=<千token正数>  # 成本熔断提示开启（编排经济学，缺省关闭）：会话召唤累计估算达阈值时 summon 结果尾部/批量结果尾部附【成本】提示行（字符启发式估算非计量值，提示级不阻断，§3）
+    DSH_EXPERT_FAILLOOP_ENFORCE=1  # 连续失败循环升级执法开启（方向 3，缺省关闭=纯协议纪律）：同一任务 fail_streak 跨 retry 累计达限（DSH_EXPERT_FAILLOOP_LIMIT 可调缺省 3）时 fail 自动转 escalated（唯一出口=用户 retry 重置计数；done 成功清零，§3）
+    DSH_EXPERT_SUMMON_FAILLOOP=0|空  # 召唤失败循环告警关闭（方向 3，缺省开启非阻断）；DSH_EXPERT_SUMMON_FAILLOOP_N=<≥2 整数> 调阈值（缺省 3 次连续失败）
 
 并发正确性与失败语义（所有写命令均可选 `--expected-revision <N>`；不传新参数时行为与旧版完全一致）：
     python3 <技能目录>/tools/taskboard.py create "标题" --expected-revision 3   # CAS 乐观锁：写命令带 --expected-revision，与当前 revision 不符返回 {"error":"stale_revision",...} 并拒绝落盘；重读后携带最新 revision 重试

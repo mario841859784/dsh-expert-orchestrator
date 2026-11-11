@@ -2,9 +2,9 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
-## [未发布] — 开发分支 dev/orchestration-economics-345（方向 2 编排经济学）
+## [未发布] — 开发分支 dev/orchestration-economics-345（方向 2 编排经济学 + 方向 3 循环检测与人工升级）
 
-> 依据 `docs/research/orchestration-economics/00-overview.md` §4 统一落地清单；设计映射与诚实边界见 `docs/internal/direction2-orchestration-economics.md`。本节发布前不 bump 版本、不 npm publish。
+> 依据 `docs/research/orchestration-economics/00-overview.md` §4 统一落地清单（方向 2）与 `docs/research/loop-detection-escalation/00-loop-detection.md`（方向 3 调研）；设计映射与诚实边界见 `docs/internal/direction2-orchestration-economics.md`。本节发布前不 bump 版本、不 npm publish。
 
 ### Added
 
@@ -14,6 +14,16 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 - **SKILL.md 协议面（清单 #3/#4/#7/#9）**: ① §1 新增「派工规模纪律（effort 分级预算硬编码）」四档——琐碎禁派子代理/简单 1 专家（调用上限 ≤10）/中等 2–4 并行（各 10–15）/复杂 ≤8 明确分工，加专家须异构视角拒绝同质扩编、复杂任务固定独立评审做中心校验；② §3 新增「读型/写型分流（派工第一判断）」「模型路由三档偏好+级联降档」「批量预热 stagger」三条纪律；③ §5 任务书模板新增「预算」变量行（调用预算下发，TALE 思路；固定五段未动，前缀缓存敏感）与「结构化回传约定」（结论/依据/置信度高中低/产物路径四要素）；④ §9 开关速查表新增 `DSH_EXPERT_ROUTE_PREF`/`DSH_EXPERT_TOKEN_BUDGET` 两行。**合入纪律**：协议文本行为改动按 §8 实验纪律在合入主干前跑对照实验（本分支内暂免，收口时补）。
 - **测试**: `test/orchestration-economics.selftest.mjs` 新增 15 用例（估算口径/封顶/fail-open/提示行双语、pref 优先级四层/写侧严格/stagger 派发序/分流建议与成本行 render 面/开关零变化真链路断言）；全量 `npm test` 580+15=595 tests 零回归（577→592 pass）。
 - **设计文档**: `docs/internal/direction2-orchestration-economics.md` 落盘清单 12 条 → 落地映射（库内实现/协议纪律/seam 不可达如实声明三分），含行为零变化纪律与诚实边界四条。
+
+### Added（方向 3 · 循环检测与人工升级）
+
+> 调研依据：`docs/research/loop-detection-escalation/00-loop-detection.md`（mission-control 3 次失败升级模式、OpenHands StuckDetector 多轴正交、DeLoop「检测必须转移控制权而非改提示」、LangGraph interrupt「终态+人工唯一出口」、医疗升级审计「漏升级主导→宁多升」）。循环失控四轴分工：watchdog 管时间窗（既有）/ 工具预算管调用量（既有）/ 振荡告警管策略乒乓（既有）/ **连续失败循环（本方向新增，最经典的缺失轴）**。
+
+- **连续失败循环升级（`skills/expert-orchestration/tools/taskboard.py`，opt-in 执法）**: env `DSH_EXPERT_FAILLOOP_ENFORCE` 显式开启后，任务新增 `fail_streak` 连续失败计数（事件流可追溯：事件 args 携 `auto_escalated`/`fail_streak` 留痕）——**跨 retry 累计**（failed→retry 重派不清零=循环检测的关键；与既有 escalation_count/review 路径互不干扰），达限（`DSH_EXPERT_FAILLOOP_LIMIT` 可调缺省 3，mission-control「失败 3 次升级给人」模式）的 `fail` 不落 failed 而自动转 **escalated** 终态（唯一出口=用户 `retry` 解除并重置计数=显式重给一轮预算，LangGraph interrupt 语义；`done` 成功=实质进展清零）；限额非法值 fail-open 整体禁用+stderr 告警（沿 budget_thresholds 先例）。执法关闭（缺省）=旧行为逐字节（不读 env、不落 fail_streak 字段，与改动前基线 c2ddb31 同输入终态+事件序列逐字段一致）。R1 口径如实：fail_streak 为板面事件溯源计数，升级=状态机迁移非消息送达——用户处置以 `status` 盘点为入口。
+- **召唤失败循环告警（`lib/fail-loop.js` 新模块 + `lib/tools.js` 接线）**: 同一专家**连续召唤失败**（召唤通道根本没跑起来的失败：名字拼错/花名册缺失/发射失效——与任务板 fail 循环互补的第四轴 lib 面）达阈值（`DSH_EXPERT_SUMMON_FAILLOOP_N` 可调缺省 3）后，summon_expert 错误尾部/summon_experts 失败条目 error 尾部附【循环告警】提示行（换专家/换通道自带库/上报用户；达阈后每次失败都提醒，成功即清零该专家 streak；batch 与单召共用同一检测器实例）。缺省开启非阻断（沿振荡告警先例），`DSH_EXPERT_SUMMON_FAILLOOP='0'/''` 关闭（enabled 于 register 时读取，关闭=错误信息逐字节不变）。
+- **SKILL.md §3「循环检测与人工升级」纪律**: 四轴分工成文（时间窗/调用量/策略振荡/连续失败，各有检测面与升级出口）；执法关闭时的协议纪律（编排者自查事件流累计，达限不得第 N+1 次重试、上报用户）；**升级报告三要素**（当前状态/已尝试方案/建议选项——上报用户必填，对抗调研揭示的「错误信号到不了人手上」静默失败元模式）；§9 开关速查表新增 `DSH_EXPERT_FAILLOOP_ENFORCE`/`DSH_EXPERT_SUMMON_FAILLOOP` 两行。
+- **测试**: `test/failloop-escalation.selftest.mjs` 新增 6 用例（执法关闭双版本行为一致+无 streak 键/累计达限升级+事件 args/唯一出口重置/done 清零/限额覆盖+非法值 fail-open/检测器语义+真链路 3 连失败告警+关闭零变化）；`test/mutation-gate.selftest.mjs` REGISTRY 8 点行号随 taskboard.py 插入同步（T22 行级校验）；全量 `npm test` 595+6=601 tests 零回归（598 pass），mutation gate 31/31。
+- **调研报告**: `docs/research/loop-detection-escalation/00-loop-detection.md` 落盘（mission-control/OpenHands/DeLoop/Anthropic/Claude Code Agent Teams/LangGraph/医疗升级审计/生产平台八组来源，全部 URL+证据强度标注）；遗留：四升级通道格式统一（升级信封）与 fail-plausible 静默失败设防留后续方向。
 
 ## [2.13.10] — 2026-11-11
 

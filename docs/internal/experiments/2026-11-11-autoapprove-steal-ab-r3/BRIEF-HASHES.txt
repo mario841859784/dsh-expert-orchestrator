@@ -1,0 +1,11 @@
+# BRIEF-HASHES：r3 档案冻结对账（sha256sum；首跑前不得手改）
+# A 臂=r2 档案 AB-R2-S3-0{1,2,3}-A.md 仅落盘路径行指向 r3 trials 的逐字节继承（其余行 diff 为空，见 FREEZE-NOTE.md）
+8d254f81d44afb00b6af49d25a638d99fc182357005f700051f89fa654897fc5  AB-R3-S3-01-A.md
+d5eedc659566b4d0966fe379437e60ac22dd03e4f2aa5ec215bc56f34e6f5d17  AB-R3-S3-02-A.md
+65c8e6a20eddd1582e2caa3b096d47aa6a4cbebb77b26b407bac867735f391a6  AB-R3-S3-03-A.md
+# B 臂 hash：随 T24 commit 由 build-b-arm.sh 程序化生成后追加（首跑前不得手改）
+a4b66a172b88bf8d9d5b07d6b442e178ce87fe1b48bdc4107f2e0d2baef2de0e  AB-R3-S3-01-B.md
+2ff37256759d836810d40fc110b0916e5e391ea58df0536c7f637a3491b4cf82  AB-R3-S3-02-B.md
+541468fc7b09023f9ec0a8f9ed05582efe64341084e9d29bbdc818476353dcfb  AB-R3-S3-03-B.md
+1eb03f4e8112f97955a276b3ad938a8900b6e8b045ac030a02ca475ddcb8dfe8  PROBE-STRINGS.txt
+# PROBE-STRINGS.txt=探针串冻结（build-b-arm.sh --probes 产物；第 3 行=规则 6 新探针串=r3 判定主探针，grep -F 全串判定用）

@@ -1,0 +1,4 @@
+--auto-ready 免审前置=M1 链①-⑤全过+⑥ created_by 名下 open 计数+1 ≤ cap（DSH_EXPERT_PEER_OPEN_CAP 可调，缺省 2，恒生效不依赖执法开关）+⑦ --of 父任务须 open（draft/pending/ready/running）+⑧ 全部 dep 依赖任务 owner==--created-by 且 status==done
+窃取前先 open-counts/show 自查并满足双侧空闲闸：本人名下无 running（拒 steal_owner_active side=claimant）、被窃任务 owner 名下无 running（拒 steal_owner_active side=owner）；不得窃回上一手：候选任务 stolen_from==本人即拒（steal_ping_pong）
+attempt_owner=落定 owner：自报口径不得谎报，以 show 回显为准，claim --attempt 为合法接管非绕过且绑定随接管翻新
+DSH_EXPERT_ANTISTORM_ENFORCE 非空时开启（缺省关闭=纯协议纪律）：approve 代理草案/claim/claim_idle/peer reassign 四点核查认领方 open 计数，超限具名拒 open_cap_exceeded；escalation 上限落档 escalation_count（用户 retry 不清零），reassign 双通道与 done needs_revision 路径达限拒 escalation_limit_exceeded（直升 escalated，不再生成 repair）

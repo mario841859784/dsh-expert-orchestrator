@@ -152,3 +152,11 @@ node scripts/sync-deploy.mjs auto   # NAS 宿主 → 本机流：profile 2.13.9�
 | 全量对账 | npm test | 580 tests / 578 pass / 0 fail / 2 skipped = 基线 576/574/0/2 + 新增 4 用例，零回归 |
 
 生产 web profile 本任务未升级（2.13.9 现状保持）：该 profile 正承载本会话 dsh web 宿主，且任务书「已最新无动作」前提与实测不符，按破坏性操作确认纪律留待 §9.3 单步收口。
+
+## 10. NAS 生产升级实际执行记录（2026-11-11 23:44，用户确认后）
+
+- 首跑 auto 失败：pnpm 无法移除 node_modules/zod（Permission denied os error 13）——根因=历史同步产物属主错位（node_modules 内容属 841859784:Users，NAS 宿主运行账号 Harness(903) 无写权限）。
+- 解法：`mv node_modules node_modules.old-2.13.9`（父目录归 Harness 可改名；旧目录整体保留兼作回滚）→ 重跑 auto 全新安装 → **实装 2.13.10**，pnpm-lock 随动，校验一致。
+- 遗留清理项：`profiles/web/node_modules.old-2.13.9` 需 841859784 账号或管理员删除（Harness 用户无权限）。
+- 遗留脚本缺陷（下迭代修）：auto 升级校验失败路径仍 exit=0（本次首跑实证），应具名非零退出。
+- 生效条件：dsh web 进程（pid 3875208）内存仍是旧代码，须 fnOS 应用中心重启 Harness。

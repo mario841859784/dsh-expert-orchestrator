@@ -1,0 +1,6 @@
+1256b4f2dc45369201c1fa51c9e5c22a59406f277e319451a6026d5ddc49fcb9  docs/internal/experiments/2026-11-12-protocol-round-ab/trials/brief-PR-S1-A.md
+a16a143508c4d94fd0c672eb7e22a6dec62e8e3abe9a619ecc8999be884728f8  docs/internal/experiments/2026-11-12-protocol-round-ab/trials/brief-PR-S1-B.md
+7aa70bb98203601448824d8e13c8bc24942af1d2165572ab47cb71acf013f677  docs/internal/experiments/2026-11-12-protocol-round-ab/trials/brief-PR-S2-A.md
+dc4d758e5e04dce448acb6c188362e6d9ecfe8261d70643241698553f91c9744  docs/internal/experiments/2026-11-12-protocol-round-ab/trials/brief-PR-S2-B.md
+d08b4a583d7d949e8cfb68552d7a77f3a1cd45701c829f5c802c7d1bad844f2a  docs/internal/experiments/2026-11-12-protocol-round-ab/trials/brief-PR-S3-A.md
+33f879b62345cdd9a7c709b88498a6e0a45daec88375aa9d6b011fe5f08c67a0  docs/internal/experiments/2026-11-12-protocol-round-ab/trials/brief-PR-S3-B.md

@@ -1,0 +1,2 @@
+8257ef1b8c13d0598f1cc41044fe1ba7a045ea9ed399dac781126229656d123d  docs/internal/experiments/2026-11-12-protocol-round-ab/skill-md-A.md
+d852244864d0e188e1ce138af43e9c8cfddb71450f79c7a25fec6955533a76ce  docs/internal/experiments/2026-11-12-protocol-round-ab/skill-md-B.md

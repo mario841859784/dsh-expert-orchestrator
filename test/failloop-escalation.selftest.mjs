@@ -6,7 +6,7 @@
 //   auto_escalated/fail_streak）、唯一出口=用户 retry（重置计数）；c) done 成功清零；
 //   d) DSH_EXPERT_FAILLOOP_LIMIT 覆盖与非法值 fail-open（执法禁用+stderr 告警）；
 // - lib/fail-loop.js 召唤失败循环告警：检测器语义（累计/达阈告警/成功清零/阈值 env）+
-//   summon_expert 真链路（连续 3 次召唤失败第 3 次错误尾部附【循环告警】、成功重置、
+//   summon_expert 真链路（连续 3 次召唤失败第 3 次错误尾部附【升级｜连续失败｜告警】信封行、成功重置、
 //   DSH_EXPERT_SUMMON_FAILLOOP='0' 关闭零变化）。
 // R1 口径如实声明：fail_streak 为板面事件溯源计数（防误用非防伪造），升级=状态机迁移
 // 非消息送达——用户处置仍以任务板 status 盘点为入口。
@@ -20,6 +20,7 @@ import { spawnSync } from 'node:child_process'
 
 import { createSummonFailLoopDetector, summonFailLoopEnabled, summonFailLoopThreshold } from '../lib/fail-loop.js'
 import { registerExpertTools } from '../lib/tools.js'
+import { msg } from '../lib/messages.js'
 
 const TASKBOARD = fileURLToPath(new URL('../skills/expert-orchestration/tools/taskboard.py', import.meta.url))
 const REPO_ROOT = fileURLToPath(new URL('../', import.meta.url))
@@ -107,7 +108,7 @@ test('方向3-b 执法开启：streak 跨 retry 累计，第 3 次 fail 自动 e
   assert.equal(r3.code, 0)
   assert.equal(taskOf(dir).status, 'escalated', '第 3 次 fail 自动转 escalated')
   assert.equal(taskOf(dir).fail_streak, 3)
-  assert.ok(r3.stdout.includes('已自动升级') && r3.stdout.includes('唯一出口'), r3.stdout)
+  assert.ok(r3.stdout.includes('【升级｜连续失败｜升级】') && r3.stdout.includes('唯一出口') && r3.stdout.includes('升级报告三要素'), r3.stdout)
   const failEvents = eventsOf(dir).filter((e) => e.type === 'fail')
   const last = failEvents[failEvents.length - 1]
   assert.equal(last.args.auto_escalated, true, '事件 args 携 auto_escalated 留痕')
@@ -186,7 +187,7 @@ test('方向3-lib 检测器：累计达阈告警、每次达阈失败都告警�
   assert.equal(d.recordFailure('甲'), null, '第 1 次：静默累计')
   assert.equal(d.recordFailure('甲'), null, '第 2 次：静默累计')
   const w3 = d.recordFailure('甲')
-  assert.ok(w3 && w3.includes('【循环告警】') && w3.includes('甲') && w3.includes('不阻断'), w3)
+  assert.ok(w3 && w3.includes('【升级｜连续失败｜告警】') && w3.includes('甲') && w3.includes('不阻断'), w3)
   assert.ok(d.recordFailure('甲'), '第 4 次仍告警（每次失败都是新事件）')
   d.recordSuccess('甲')
   assert.equal(d.recordFailure('甲'), null, '成功清零后重新累计')
@@ -195,7 +196,34 @@ test('方向3-lib 检测器：累计达阈告警、每次达阈失败都告警�
   assert.ok(d2.recordFailure('乙').includes('2 次'), '阈值 2 生效')
 })
 
-test('方向3-lib summon 真链路：同一专家连续 3 次召唤失败第 3 次附【循环告警】，成功重置，开关关闭零变化', async (t) => {
+// ── 升级信封形状契约（方向 3 收口 #4）────────────────────────────────────────
+
+test('方向3-信封形状契约：四通道提示级键统一【升级｜通道｜级别】现状：…建议：…+不阻断尾行', () => {
+  // 提示级通道（尾行恒「本提示不阻断。」）；执行级（fail-loop 工具升级行，taskboard.py
+  // print）不带尾行，由方向3-b 用例断言 stdout。
+  const ENVELOPE_KEYS = [
+    ['oscillation.warning', { a: 'A', b: 'B', roundTrips: 3, threshold: 3, run: 7 }, '振荡', '告警'],
+    ['failloop.summon', { name: '甲', count: 3, threshold: 3 }, '连续失败', '告警'],
+    ['budget.alarm', { who: '甲', count: 11, threshold: 10 }, '预算', '告警档'],
+    ['budget.wrapup', { who: '甲', count: 24, threshold: 24 }, '预算', '收尾档'],
+    ['budget.interrupt', { who: '甲', count: 31, threshold: 30 }, '预算', '中断档'],
+    ['cost.budgetExceeded', { used: '5K', budget: '3K' }, '成本', '熔断'],
+  ]
+  for (const [key, params, channel, level] of ENVELOPE_KEYS) {
+    for (const lang of ['zh', 'en']) {
+      const line = msg(key, lang, params)
+      assert.ok(line.startsWith(`【升级｜${channel}｜${level}】`), `${key}/${lang} tag 形状：${line}`)
+      assert.ok(line.includes('现状：'), `${key}/${lang} 现状槽位在列：${line}`)
+      assert.ok(line.includes('建议：'), `${key}/${lang} 建议槽位在列：${line}`)
+      assert.ok(line.endsWith('本提示不阻断。'), `${key}/${lang} 提示级尾行：${line}`)
+    }
+  }
+  // 非升级行不进信封（契约违规提示与遥测行维持既有形态）
+  assert.ok(msg('budget.contractViolation', 'zh', { id: 'T1', hint: 'h' }).startsWith('【预算】'))
+  assert.ok(msg('cost.batchSummary', 'zh', { summons: 1, ok: 1, fail: 0, sum: '5K', budget: '10 tok' }).startsWith('【成本】'))
+})
+
+test('方向3-lib summon 真链路：同一专家连续 3 次召唤失败第 3 次附【升级｜连续失败｜告警】信封行，成功重置，开关关闭零变化', async (t) => {
   const saved = process.env.DSH_EXPERT_SUMMON_FAILLOOP
   delete process.env.DSH_EXPERT_SUMMON_FAILLOOP
   t.after(() => {
@@ -231,14 +259,14 @@ test('方向3-lib summon 真链路：同一专家连续 3 次召唤失败第 3 �
   const e1 = await failOnce()
   const e2 = await failOnce()
   const e3 = await failOnce()
-  assert.ok(!e1.includes('【循环告警】') && !e2.includes('【循环告警】'), '前两次静默')
-  assert.ok(e3.includes('【循环告警】') && e3.includes('不存在专家'), `第三次达阈附告警：${e3}`)
+  assert.ok(!e1.includes('【升级｜连续失败｜告警】') && !e2.includes('【升级｜连续失败｜告警】'), '前两次静默')
+  assert.ok(e3.includes('【升级｜连续失败｜告警】') && e3.includes('不存在专家'), `第三次达阈附告警：${e3}`)
   const e4 = await failOnce()
-  assert.ok(e4.includes('【循环告警】'), '达阈后每次失败都告警（每次都是新事件）')
+  assert.ok(e4.includes('【升级｜连续失败｜告警】'), '达阈后每次失败都告警（每次都是新事件）')
   // 成功召唤甲 → 清零的是甲的 streak；不存在专家无成功，streak 保持达阈（继续告警）
   await summon.execute({ expert: '甲', task: '正常任务' }, { agent: {} })
   const f1 = await failOnce()
-  assert.ok(f1.includes('【循环告警】'), '未成功过的专家 streak 不被他人成功清零')
+  assert.ok(f1.includes('【升级｜连续失败｜告警】'), '未成功过的专家 streak 不被他人成功清零')
   // 甲自身循环：空任务=召唤失败（task 必填，解析后失败）×3 → 告警；成功一次 → 清零；再失败从 0 起算
   const failA = async () => {
     try {
@@ -251,11 +279,11 @@ test('方向3-lib summon 真链路：同一专家连续 3 次召唤失败第 3 �
   const a1 = await failA()
   const a2 = await failA()
   const a3 = await failA()
-  assert.ok(!a1.includes('【循环告警】') && !a2.includes('【循环告警】'), '甲：前两次静默')
-  assert.ok(a3.includes('【循环告警】') && a3.includes('甲'), '甲：第三次达阈告警')
+  assert.ok(!a1.includes('【升级｜连续失败｜告警】') && !a2.includes('【升级｜连续失败｜告警】'), '甲：前两次静默')
+  assert.ok(a3.includes('【升级｜连续失败｜告警】') && a3.includes('甲'), '甲：第三次达阈告警')
   await summon.execute({ expert: '甲', task: '正常任务' }, { agent: {} })
   const a4 = await failA()
-  assert.ok(!a4.includes('【循环告警】'), '甲成功重置后再失败从 0 起算（首次静默）')
+  assert.ok(!a4.includes('【升级｜连续失败｜告警】'), '甲成功重置后再失败从 0 起算（首次静默）')
   // 开关关闭（沿振荡告警先例：enabled 在 register 时读取——须全新注册实例验证零变化）
   process.env.DSH_EXPERT_SUMMON_FAILLOOP = '0'
   const descriptors2 = []
@@ -270,7 +298,7 @@ test('方向3-lib summon 真链路：同一专家连续 3 次召唤失败第 3 �
       await summon2.execute({ expert: '不存在专家', task: '任务' }, { agent: {} })
       assert.fail('应当失败')
     } catch (error) {
-      assert.ok(!String(error.message).includes('【循环告警】'), `关闭态第 ${i + 1} 次失败零告警`)
+      assert.ok(!String(error.message).includes('【升级｜连续失败｜告警】'), `关闭态第 ${i + 1} 次失败零告警`)
     }
   }
 })

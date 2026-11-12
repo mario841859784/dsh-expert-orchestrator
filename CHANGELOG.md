@@ -4,6 +4,25 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 
 ## [未发布]
 
+## [2.14.1] — 2026-11-12
+
+> 依据评审 `docs/internal/REVIEW-f533f96.md` 结论与 T1 评审建议收口；对照实验档案 `docs/internal/experiments/2026-11-12-protocol-round-ab/`；打包调研 `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md`。
+
+### Changed
+
+- **升级信封统一（lib/messages.js 六键重写 + taskboard.py 升级行收口 + SKILL.md §3 规范）**: 四通道升级/告警提示行统一为 `【升级｜<通道>｜<级别>】现状：<机制化状态>。建议：<可行动选项>。` 信封——通道=振荡/连续失败/预算（告警档/收尾档/中断档）/成本；提示级尾行恒「本提示不阻断。」，执行级（fail-loop 工具自动 escalated 升级行）不带尾行；【】tag 与 `现状：`/`建议：`/`本提示不阻断。` 为协议固定字面。收口键：oscillation.warning、budget.alarm/wrapup/interrupt（budget.contractViolation 非升级行维持原形态）、failloop.summon、cost.budgetExceeded + taskboard.py fail-loop 升级 print；**如实边界**：watchdog 通道 Python 人读面维持 v2.7 既有形态（既有字节契约，收口留后续）。**连带修复（cmd_fail 控制流回归）**: cmd_fail 升级分支控制流被 print 行改动破坏（save/show/print/return 被挪出 escalate 分支致执法开启时任何 fail 都提前 return、below-limit 落 failed 不可达）——测试翻红暴露，已修复并以 612 全量回归钉死。
+- **en 协议字面本地化（T1 评审收口）**: 升级信封六键 en 面固定字面整体本地化英文等价——tag `[ESCALATION|<channel>|<level>]`（channel/level 取英文等价名）与槽位字面 `Status:`/`Suggestion:`/`This notice does not block.`；zh 面逐字节不动，budget.contractViolation 与 cost.batchSummary 非升级行 zh/en 均不动。SKILL.md §3「两语同形」措辞同步为如实描述（zh 固定中文字面、en 本地化英文等价，grep -F 探针按语言分别引用）；messages/failloop-escalation/orchestration-economics 三测试文件契约断言改为按语言分别断言形状（en 信封键不得残留中文【】字面）。
+- **lib/tools.js stale 注释清理**: 三处旧【循环告警】字面注释同步为现行信封描述（零行为变化）。
+
+### Added（文档）
+
+- **对照实验 protocol-round-ab（§8 纪律，先写后跑）**: 档案 `docs/internal/experiments/2026-11-12-protocol-round-ab/` 落盘（PREREGISTRATION 判定标准先冻结；A 臂=7fe39f3 SKILL.md 冻结副本、B 臂=工作树，哈希留痕；trials/ 六份原始产出逐字落盘）。双主指标达标：**到达率 B 臂 3/3**（S1 预算行+置信度四要素/S2 写型串行合取+预算行/S3 连续失败+升级报告三要素，A 臂合取全不成立）+ **信封子探针 3/3**；**无误扰零回退**。裁决规则 1 适用：E1/E2/E3 协议文本保持合入。诚实留档：S2 单词「写型」无判别力（合取口径下判定不受影响）；首轮 6 并发派发触发宿主并发限 3 失败，单飞串行补跑（属派发层事故非实验变量）；AB-REPORT.md 末尾补「计数口径注明」节。
+- **打包调研报告**: `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md` 落盘——对外暴露面+密码学信任一条线：三遗留项统一为「权限跨边界流动、身份不随行」一根因 + 共享威胁模型 T1-T5；A2A v1.0/v0.3.0 规范精读、MCP stdio 出圈逐字原文 + OAuth 2.1 RS 全套（RFC 9728/8707）+ 本地替代（unix-socket SO_PEERCRED 须如实标注非标）；Ed25519 文件板签名设计与**签名买不到的东西**；打包路线表 N1→L1 每阶段带前置与不做边界。
+
+### 测试
+
+- 全量 `npm test`：612 tests / 610 pass / 0 fail / 2 skipped（信封契约用例 +1，环境条件门 skip±1 属抖动）；mutation gate（`DSH_EXPERT_MUTANTS=1 node test/mutation-gate.selftest.mjs`）31/31。2.14.0 → 2.14.1 改动含信封格式与 cmd_fail 控制流修复，已由全量回归与 31 点变异捕获钉死。
+
 ## [2.14.0] — 2026-11-12
 
 > 依据 `docs/research/orchestration-economics/00-overview.md` §4 统一落地清单（方向 2）、`docs/research/loop-detection-escalation/00-loop-detection.md`（方向 3 调研）、`docs/research/agent-identity-trust/00-identity-trust.md`（方向 4 调研）、`docs/research/protocol-interop-mcp-a2a/00-protocol-interop.md`（方向 5 调研）；方向 2 设计映射与诚实边界见 `docs/internal/direction2-orchestration-economics.md`。

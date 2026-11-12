@@ -9,6 +9,15 @@ node_modules/
 # 任务板目录（cwd 唯一板解析会在仓库内留下 board.json/.lock 运行态残件，不入库；T40）
 .expert-taskboards/
 
+# 路由遥测样本（⑤ summon 边界埋点，cwd 运行态产物不入库；lib/route-telemetry.js）
+.expert-routing/
+
+# 事件签名密钥（M3 运行态：私钥绝不入库；revoked-keys 属部署面按需留档）
+.dsh/keys/
+skills/expert-orchestration/tools/revoked-keys
+.expert-taskboards/revoked-keys
+revoked-keys
+
 # gh CLI state 残留目录，防误提交
 .local/
 

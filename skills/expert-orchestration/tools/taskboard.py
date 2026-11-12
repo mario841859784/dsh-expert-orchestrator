@@ -198,7 +198,7 @@ per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭
     ② commit_event 落视图仅写 {tasks,seq,revision}+簿记（event_seq/event_state_hash），当前命令集不写板
        顶层其他键；未来新增板顶层键须同步纳入 seed/折叠/state_hash 口径，否则重放折叠缺该键、对账失配。
 """
-import argparse, collections, contextlib, copy, datetime, decimal, glob, hashlib, json, os, re, subprocess, sys, time, uuid
+import argparse, base64, collections, contextlib, copy, datetime, decimal, glob, hashlib, json, os, re, subprocess, sys, time, uuid
 
 try:
     # POSIX 标准库；Windows 等无 fcntl 平台降级（见 board_lock）
@@ -414,7 +414,156 @@ def _state_hash(d):
 
 
 def _event_hash(ev):
-    return _sha_hex(_canonical({k: v for k, v in ev.items() if k != 'hash'}))
+    # sig 不进 hash 输入（签名自身不可自指；sigkey 进——hash 链覆盖落款指纹）。
+    # 无 sig 事件（缺省/旧板）canonical 输入逐字节不变（M3 additive 语义）。
+    return _sha_hex(_canonical({k: v for k, v in ev.items() if k not in ('hash', 'sig')}))
+
+
+# ── M3 Ed25519 事件签名（exposure-crypto-trust 报告 §4.2/§5.7，opt-in）─────────
+# 写入路径：DSH_TASKBOARD_SIGN_KEY 配置（32 字节 seed 的 base64 内联或文件路径）时，
+# 每条事件附 sigkey（公钥指纹 sha256[:16]）+ sig（Ed25519 签名，覆盖 canonical(事件去
+# hash/sig)——与 _event_hash 同一规范化面）。hash 链给防篡改、签名给归因，两者叠加
+# （报告 §4.2）；签名归因「密钥持有者」，不证明「内容为真」（报告 §4.5 买不到清单）。
+# 验签点=折叠/重放（repair=True 读路径，报告 §4.2）：公钥面（DSH_TASKBOARD_SIGN_PUBKEY_DIR
+# 或缺省 ~/.dsh/keys 预共享目录，报告 §4.3 载体一/二）配置时逐条验；invalid/revoked/
+# unknown_key **标记不静默**（stderr 汇总 + replay --json 载荷），不是 unrecoverable——
+# 签名不做权限执法（报告 §5.7 不做边界），链 hash 校验仍按既有语义 unrecoverable。
+# 吊销：板根（板文件所在目录）revoked-keys 文件，每行=base64 公钥全文；空/缺失=空吊销集
+# （显式不学 SSH 的「吊销文件失效=停用全体」fail-closed 语义，报告 §4.3）。
+# 无签名事件（旧板/未开签名）→ unsigned 如实计数不告警（模式混合是常态）。
+SIGN_KEY_ENV = 'DSH_TASKBOARD_SIGN_KEY'
+SIGN_PUBKEY_DIR_ENV = 'DSH_TASKBOARD_SIGN_PUBKEY_DIR'
+SIGN_PUBKEY_DEFAULT_DIR = os.path.join(os.path.expanduser('~'), '.dsh', 'keys')
+REVOKED_FILENAME = 'revoked-keys'
+_SIG_AUDIT = {'payload': None}  # 折叠验签结果暂存（replay --json 载荷取用，_WATCHDOG_EVAL 同模式）
+
+
+def _sign_seed():
+    """私钥解析（写入路径）：内联 base64（32 字节 seed）或文件路径（存在即读）。
+    非法 → stderr 告警 + None（本命令不签名——不阻断 CLI，告警可见不静默）。"""
+    raw = os.environ.get(SIGN_KEY_ENV, '').strip()
+    if not raw:
+        return None
+    if os.path.isfile(raw):
+        with open(raw, 'r', encoding='utf-8') as f:
+            raw = f.read().strip()
+    try:
+        seed = base64.b64decode(raw, validate=True)
+        if len(seed) == 32:
+            return seed
+    except Exception:
+        pass
+    print(f'警告：{SIGN_KEY_ENV} 配置非法（须为 32 字节 seed 的 base64 或其文件路径）——本命令不签名', file=sys.stderr)
+    return None
+
+
+def _key_fingerprint(pub):
+    """公钥指纹（事件 sigkey 落款与吊销比对锚）：sha256[:16] hex。"""
+    return hashlib.sha256(pub).hexdigest()[:16]
+
+
+def _pubkey_face():
+    """验签公钥面（预共享目录载体）：env 目录或 ~/.dsh/keys（存在即用）→ {指纹: 公钥}。
+    目录缺失 → None；目录存在但空 → {}（空面合法——吊销判定不依赖 keys 收录，见
+    _sig_audit_events）。目录内 *.pub 逐文件读取，损坏文件跳过并告警（不静默当空）。"""
+    d = os.environ.get(SIGN_PUBKEY_DIR_ENV, '').strip() or (
+        SIGN_PUBKEY_DEFAULT_DIR if os.path.isdir(SIGN_PUBKEY_DEFAULT_DIR) else '')
+    if not d or not os.path.isdir(d):
+        return None
+    keys = {}
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith('.pub'):
+            continue
+        try:
+            with open(os.path.join(d, fn), 'r', encoding='utf-8') as f:
+                pub = base64.b64decode(f.read().strip(), validate=True)
+            if len(pub) == 32:
+                keys[_key_fingerprint(pub)] = pub
+            else:
+                print(f'警告：公钥文件非 32 字节跳过（{os.path.join(d, fn)}）', file=sys.stderr)
+        except Exception:
+            print(f'警告：公钥文件损坏跳过（{os.path.join(d, fn)}）', file=sys.stderr)
+    return keys
+
+
+def _revoked_fps(path):
+    """板根吊销集：板文件所在目录 revoked-keys 文件（每行=base64 公钥全文）→ 指纹集合。
+    文件缺失/空=空吊销集（显式不学 SSH 的 fail-closed 停用全体语义，报告 §4.3）。
+    损坏/长度不符行跳过并告警（不静默）。"""
+    fp = os.path.join(os.path.dirname(path) or '.', REVOKED_FILENAME)
+    if not os.path.isfile(fp):
+        return set()
+    out = set()
+    with open(fp, 'r', encoding='utf-8') as f:
+        for ln in f:
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                pub = base64.b64decode(s, validate=True)
+                if len(pub) == 32:
+                    out.add(_key_fingerprint(pub))
+                else:
+                    print(f'警告：revoked-keys 行非 32 字节公钥，跳过（{fp}）', file=sys.stderr)
+            except Exception:
+                print(f'警告：revoked-keys 行损坏跳过（{fp}）', file=sys.stderr)
+    return out
+
+
+def _sig_audit_events(evs, path):
+    """折叠验签（验签点=折叠/重放）：验签面（公钥目录 或 板根吊销文件）任一存在即逐条
+    验，audit dict 经 _SIG_AUDIT 暂存；异常面 stderr 一次汇总。configured 判定含吊销面
+    ——吊销行自描述公钥，判定不依赖 keys 收录。纯 python 验签量级慢（~30ms/条）——
+    事件量小（每任务个位数事件/日，报告 §4.2 口径）+ 快照读（repair=False）不验，量级可接受。"""
+    keys = _pubkey_face()
+    revoked = _revoked_fps(path)
+    face_dir = os.environ.get(SIGN_PUBKEY_DIR_ENV, '').strip() or (
+        SIGN_PUBKEY_DEFAULT_DIR if os.path.isdir(SIGN_PUBKEY_DEFAULT_DIR) else '')
+    revoked_present = os.path.isfile(os.path.join(os.path.dirname(path) or '.', REVOKED_FILENAME))
+    if not face_dir and not revoked_present:
+        return {'configured': False}
+    import _ed25519  # 同目录 vendored Ed25519（hashlib 单依赖，正确性由 node:crypto 互验钉死）
+    keys = keys or {}
+    audit = {'configured': True, 'keys': len(keys), 'revoked_keys': len(revoked),
+             'signed': 0, 'verified': 0, 'unsigned': 0,
+             'invalid': [], 'revoked': [], 'unknown_key': []}
+    for ev in evs:
+        sig = ev.get('sig')
+        if not isinstance(sig, str):
+            audit['unsigned'] += 1
+            continue
+        audit['signed'] += 1
+        sigkey = ev.get('sigkey') if isinstance(ev.get('sigkey'), str) else None
+        if sigkey in revoked:
+            # 吊销判定优先于公钥面（revoked-keys 行=base64 公钥全文自描述，不依赖 keys 目录收录）
+            audit['revoked'].append(ev.get('seq'))
+            continue
+        if sigkey not in keys:
+            audit['unknown_key'].append(ev.get('seq'))
+            continue
+        canon = _canonical({k: v for k, v in ev.items() if k not in ('hash', 'sig')}).encode('utf-8')
+        try:
+            ok = _ed25519.checkvalid(base64.b64decode(sig, validate=True), canon, keys[sigkey])
+        except Exception:
+            ok = False
+        if ok:
+            audit['verified'] += 1
+        else:
+            audit['invalid'].append(ev.get('seq'))
+    bad = len(audit['invalid']) + len(audit['revoked']) + len(audit['unknown_key'])
+    if bad:
+        print(f"警告：事件签名验签异常 {bad} 条（invalid={len(audit['invalid'])} revoked={len(audit['revoked'])} "
+              f"unknown_key={len(audit['unknown_key'])}）——签名面如实标记不静默；签名不做执法（处置交编排者/板外验证器）", file=sys.stderr)
+    return audit
+
+
+def _append_event_signature(ev, seed):
+    """给已建事件（state_hash/sigkey/hash 均就位）附 sig：签名覆盖 canonical(事件去
+    hash/sig)——与 _event_hash 同一规范化面（sigkey 在内、sig 自身不在）。"""
+    import _ed25519
+    pub = _ed25519.publickey(seed)
+    canon = _canonical({k: v for k, v in ev.items() if k not in ('hash', 'sig')}).encode('utf-8')
+    ev['sig'] = base64.b64encode(_ed25519.signature(canon, seed, pub)).decode('ascii')
 
 
 def _repair_events(ep, evs):
@@ -493,6 +642,10 @@ def read_events(path, repair=True):
                 os.fsync(f.fileno())
             print(f'警告：事件流末尾缺失换行符（疑似写入中断残留），已补写自愈: {ep}', file=sys.stderr)
         # repair=False：完整末行照常解析，不补写（无锁快照读零写）
+    if repair:
+        # M3 折叠验签点（报告 §4.2）：常规读路径逐条验事件签名（公钥面配置时）；
+        # 快照读（repair=False）不验——无锁快照零写零 stderr 语义一致，验签只读不写。
+        _SIG_AUDIT['payload'] = _sig_audit_events(evs, path)
     return evs
 
 
@@ -683,7 +836,15 @@ def commit_event(path, data):
     ev = {'seq': prev_seq + 1, 'ts': ctx['ts'], 'type': ctx['type'], 'args': ctx['args'],
           'after': after, 'board_seq': int(data.get('seq', 0)), 'revision': new_rev, 'prev': prev_hash}
     ev['state_hash'] = _state_hash(data)  # 先算状态 hash，事件 hash 覆盖含 state_hash 的全部其余字段
+    # M3 事件签名（opt-in）：sigkey 先落（hash 覆盖落款指纹），hash 次之，sig 最后
+    # （签名覆盖 canonical(事件去 hash/sig)，含 sigkey）——无签名配置时事件 JSON 逐字节不变。
+    sig_seed = _sign_seed()
+    if sig_seed:
+        import _ed25519  # noqa: 本仓 vendored（hashlib 单依赖）——白名单例外见 tools.selftest WP-1(e)
+        ev['sigkey'] = _key_fingerprint(_ed25519.publickey(sig_seed))
     ev['hash'] = _event_hash(ev)
+    if sig_seed:
+        _append_event_signature(ev, sig_seed)
     _append_event(path, ev)
     # 簿记同步进内存折叠态（与下方视图文件同源）：--json 信封（_emit）据此读「本次落账后」的
     # event_seq/state_hash——此前仅落视图、内存 data 滞后一写（N2 对账锚点取值修正）。
@@ -3195,10 +3356,12 @@ def _structured_data(a, data):
         # v2.9 T2：重放对账载荷——四字段与人类面重放行同源同表达式（state_hash 给全值，
         # 16 字符截断是人类面显示约束；机器消费方拿全值可与事件流末事件 state_hash 直接对账；
         # 无事件流的旧板/空板 event_seq=0、state_hash=''，与人类面占位口径一致）。
+        # M3：sig_audit=折叠验签结果（公钥面未配置 → {'configured': False} 如实占位）。
         return {'event_seq': int(data.get('event_seq', 0)),
                 'revision': int(data.get('revision', 0)),
                 'task_count': len(data['tasks']),
-                'state_hash': data.get('event_state_hash') or ''}
+                'state_hash': data.get('event_state_hash') or '',
+                'sig_audit': _SIG_AUDIT.get('payload') or {'configured': False}}
     if a.cmd == 'budget':
         # #16（T27）：预算盘点是报告型命令——data 恒携带 budget 载荷（enabled/thresholds/epoch/
         # stamped/budgets），不落「报告型命令 data={}」的机器消费面问题（前轮评审备忘(2)）。
@@ -3275,6 +3438,15 @@ def cmd_replay(a, data, path):
     print(f"已从事件流重放折叠状态: event_seq={data.get('event_seq', 0)} "
           f"revision={data.get('revision', 0)} 任务数={len(data['tasks'])} "
           f"state_hash={str(data.get('event_state_hash', ''))[:16]}")
+    # M3：签名验签汇总行（仅公钥面配置且存在带签/异常事件时出现——未开签名面输出逐字节不变）
+    audit = _SIG_AUDIT.get('payload')
+    if isinstance(audit, dict) and audit.get('configured') and (
+            audit.get('signed') or audit.get('invalid') or audit.get('revoked') or audit.get('unknown_key')):
+        extras = (f" invalid={len(audit['invalid'])}" if audit.get('invalid') else '')
+        extras += (f" revoked={len(audit['revoked'])}" if audit.get('revoked') else '')
+        extras += (f" unknown_key={len(audit['unknown_key'])}" if audit.get('unknown_key') else '')
+        extras += (f" unsigned={audit['unsigned']}" if audit.get('unsigned') else '')
+        print(f"签名验签: verified={audit.get('verified', 0)}/{audit.get('signed', 0)}{extras}")
 
 
 def cmd_archive(a, data, path):

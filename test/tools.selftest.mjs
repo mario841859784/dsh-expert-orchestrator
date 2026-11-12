@@ -839,10 +839,12 @@ test('WP-1 (d) 环检测：set_dependencies 构造 A→B→C→A 被拒且不落
 // (e) 全程无第三方 import：taskboard.py 仅标准库
 test('WP-1 (e) taskboard.py 零第三方 import（import 语句逐一落进标准库白名单）', () => {
   const src = readFileSync(TASKBOARD, 'utf-8')
-  const stdlib = new Set(['argparse', 'collections', 'contextlib', 'copy', 'datetime', 'decimal', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid'])
+  // 白名单含 _ed25519：本仓 vendored（hashlib 单依赖、零 pip 安装面）——「零第三方」指
+  // 无外部可安装依赖，vendored 纯 python 模块不破此约束（M3 签名面，exposure-crypto §4.4）。
+  const stdlib = new Set(['argparse', 'base64', 'collections', 'contextlib', 'copy', 'datetime', 'decimal', 'fcntl', 'glob', 'hashlib', 'json', 'os', 're', 'subprocess', 'sys', 'time', 'uuid', '_ed25519'])
   const found = []
   for (const m of src.matchAll(/^\s*import\s+(.+)$/gm)) {
-    for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0])
+    for (const name of m[1].split(',')) found.push(name.trim().split(/\s+as\s+/)[0].split('#')[0].trim())
   }
   for (const m of src.matchAll(/^\s*from\s+([\w.]+)\s+import\s/g)) found.push(m[1])
   assert.ok(found.length >= 8, `应至少解析出既有 8 个标准库 import，实际 ${JSON.stringify(found)}`)
@@ -5938,7 +5940,7 @@ test('T2 (v2.9) watchdog --json data：五计数与人类面汇总行同源、�
   assert.ok(w4h.stdout.includes('watchdog: 无 running 任务'), w4h.stdout)
 })
 
-test('T2 (v2.9) replay --json data：四字段与人类面重放行同源、与视图/事件流独立对账一致；空板 event_seq=0、state_hash 为空串', (t) => {
+test('T2 (v2.9) replay --json data：字段与人类面重放行同源、与视图/事件流独立对账一致；空板 event_seq=0、state_hash 为空串', (t) => {
   const dir = makeBoardDir(t, 't2-replay-json')
   const ok = (...args) => { const r = runTb(dir, args); assert.equal(r.code, 0, args.join(' ')); return r }
   ok('create', '任务A', '--owner', '甲')
@@ -5962,6 +5964,8 @@ test('T2 (v2.9) replay --json data：四字段与人类面重放行同源、与�
   assert.equal(env.data.task_count, Number(hm[3]))
   assert.match(env.data.state_hash, /^[0-9a-f]{64}$/)
   assert.ok(env.data.state_hash.startsWith(hm[4]), `state_hash 全值与人类面 16 位截断不同源: ${env.data.state_hash}`)
+  // M3：sig_audit 第五键（折叠验签载荷；验签面未配置 → configured:false 如实占位）
+  assert.deepEqual(env.data.sig_audit, { configured: false }, '验签面未配置=如实占位（≠验签通过）')
   assert.equal(env.revision, env.data.revision, '信封顶层 revision 与 data.revision 同值（S1：replay 带 revision）')
   // 独立对账①：命令刚重写的折叠视图与 data 一致（消费方不信任命令自述，直接读盘核对）
   const view = readBoard(join(dir, BOARD_REL))
@@ -5983,7 +5987,7 @@ test('T2 (v2.9) replay --json data：四字段与人类面重放行同源、与�
   const empty = makeBoardDir(t, 't2-replay-empty')
   const er = runTb(empty, ['--json', 'replay'])
   assert.equal(er.code, 0)
-  assert.deepEqual(er.json.data, { event_seq: 0, revision: 0, task_count: 0, state_hash: '' })
+  assert.deepEqual(er.json.data, { event_seq: 0, revision: 0, task_count: 0, state_hash: '', sig_audit: { configured: false } })
   assert.equal(er.json.revision, 0)
 })
 

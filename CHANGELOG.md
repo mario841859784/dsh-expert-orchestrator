@@ -4,6 +4,23 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 
 ## [未发布]
 
+> 依据 `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md` §5 打包路线表近期轮（N1→N2→watchdog 收口→M1）落地。
+
+### Added
+
+- **M1：A2A 最小 HTTP 服务端（tools/a2a_taskboard.py，零依赖 python3 标准库）**: 复用 mcp_taskboard.py「子进程调用 taskboard.py」骨架（import 复用 run_taskboard/parse_receipt/花名册解析），外部协调者（A2A client，如 hermes）跨进程给 dsh 派任务。MVP 方法面=message/send 同步（落任务板 create：首行=标题、其余行=完成标准；metadata `dsh:owner`/`dsh:scope` 显式声明才透传）+ tasks/get 轮询（未知 id → -32001 TaskNotFoundError）；GET /.well-known/agent-card.json 发卡（preferredTransport=JSONRPC、capabilities streaming/push 照实 false、skills=花名册同口径映射、dsh:rosterSource/dsh:writeFace/dsh:blocking 元数据）。状态映射：draft/pending/ready→submitted、running→working、done→completed、failed→failed、rejected→rejected、escalated→input-required（中断态）。**阻塞语义（规范 MUST wait 落地）**：缺省阻塞轮询至终态/中断态（上限 --block-max-sec/DSH_TASKBOARD_A2A_BLOCK_MAX_SEC 缺省 300s，0=不阻塞），configuration.returnImmediately=true 立即返回；超时如实返回当前非终态（文件板无服务端执行体的如实偏差——不虚构终态，文件头声明）。**鉴权先于暴露（MCP transports 2025-06-18 Security Warning 三条最低配）**：① Origin 校验 MUST——带 Origin 头不在白名单一律 403（缺省空名单=全拒，非浏览器客户端不带 Origin 不受影响；--allow-origin/DSH_TASKBOARD_A2A_ALLOW_ORIGIN 扩白）；② 本地绑定 SHOULD——缺省 127.0.0.1；③ 认证按报告「不做无鉴权 HTTP 面」执行为恒开——bearer 恒要求（--token/DSH_TASKBOARD_A2A_TOKEN > 启动生成 a2a-<32hex> 并 stderr 横幅打印，常时时间比较；401 带 WWW-Authenticate），另加 Host 头 rebinding 纵深校验（evil.com → 403）。**写面纪律（与 MCP 导出面同款）**：message/send 落板属写面——DSH_TASKBOARD_A2A_WRITES=1 opt-in 才暴露（缺省具名拒 writes_disabled），外部写入=代理转达的板面变更（自报口径），task.metadata 以 dsh:* 键回显 boardStatus/owner/eventSeq/revision 对账面；非 text part → -32005 ContentTypeNotSupportedError（宁拒勿猜）；taskId 续话 → -32004 具名拒（MVP 不做）。keep-alive 语义：401/403 早退不读体并显式 Connection: close（残体毒化连接复用的实测坑已修）。测试：test/a2a-server.selftest.mjs 8 用例（卡形状/鉴权三件/JSON-RPC 层/写链全链/校验面/写面缺省关/阻塞到终态+超时如实/启动面）。
+- **N2：MCP 写面审计回显 + 写命令回执机器可读审计字段（taskboard.py additive 扩展）**: ① mcp_taskboard.py 写工具（create/claim/progress/done/fail）成功响应尾行附【审计】回显行——`【审计】task=<id> status=<终态> owner=… by=… event_seq=… revision=…`，全部取自 --json 信封（by=调用参数自报），外部调用方（hermes）能看到自己写的任务被怎么处置并持 event_seq 对事件流核对；拒绝面（isError）不附审计行（零写零事件，拒绝本身就是处置）。② taskboard.py 配套 additive 契约扩展：写命令（_WRITE_CMDS）--json 信封顶层附 `event_seq`=本次落账后事件流末 seq（与 replay data.event_seq 同源的对账锚点；连带修正 commit_event 内存簿记滞后一写的取值缺陷——event_seq/event_state_hash 此前仅落视图不回内存）；create 的 data 载荷由空对象改为携带创建后任务全量快照（_CREATE_EVAL 暂存，_WATCHDOG_EVAL 同模式——此前 create 无 id 参数致回执拿不到新任务 id/owner/状态）。
+- **N1：卡面安全声明先于卡面端点（gen-agent-card.mjs + 服务端卡同款）**: AgentCard 新增 securitySchemes（bearer：type http/scheme bearer，description 如实声明「凭证带外分发、卡面不承载明文密钥」）+ security `[{bearer: []}]` + preferredTransport='JSONRPC'（v0.3.0 卡必备字段）+ `dsh:writeFace` 元数据（message/send 写面 opt-in 如实声明）；url 维持空占位不变（url 非空=端点可核查承诺——部署 a2a_taskboard.py 后以 --url 宣称实际端点）。
+
+### Changed
+
+- **watchdog 通道 Python 人读面收口（升级信封五通道闭合，exposure-crypto 收口轮）**: taskboard.py watchdog 三条升级线改走统一信封格式——nudge=提示级 `【升级｜时间窗｜告警】现状：…建议：…本提示不阻断。`（不改任务状态带尾行），adopt/reclaim=执行级 `【升级｜时间窗｜执行】现状：…建议：…`（工具已完成状态迁移不带尾行）；SKILL.md §3 升级信封规范句同步（通道增列时间窗，移除「watchdog 维持既有形态收口留后续」如实边界——本项即该收口）。诚实边界：检查点落盘轨迹（watchdog: 前缀注记）、telemetry 头行/汇总行（nudge=N adopt=N…）、无变更分支维持 v2.7 字面（数据面与遥测面不是升级提示行）；既有测试的子串断言（已 nudge/nudge=i/M/已采纳为 done/已 reclaim）全部保留通过，信封形状断言新增（tools.selftest 三线前缀+尾行规则）。实验纪律说明：信封固定字面格式已由 2026-11-12 protocol-round-ab 对照实验验证到达率与无误扰（档案 docs/internal/experiments/2026-11-12-protocol-round-ab/），本项为同一已验证格式应用到 watchdog 通道 + §3 覆盖面措辞如实化（T1 评审措辞级收口先例），未另开实验。
+
+### 测试
+
+- 全量 `npm test`：621 tests / 618 pass / 0 fail / 3 skipped（+9：a2a-server 8 用例 + receipt P2b）；mutation gate（`DSH_EXPERT_MUTANTS=1 npm test`）：651/649 pass / 0 fail / 2 skipped，29 变异点全捕获零逃逸——taskboard.py 22 点行级锚点按 anchor 字符串回查实况批量重写（REGISTRY 与源码同步纪律）。受 additive 契约影响的基线逐字节回归测试（tags/antistorm/attempt-owner-bind/claim-steal/agent-create 五文件）按「显式 additive 键剥除后双版本比对」更新，契约 delta 在测试内留注释。
+
+
 ## [2.14.1] — 2026-11-12
 
 > 依据评审 `docs/internal/REVIEW-f533f96.md` 结论与 T1 评审建议收口；对照实验档案 `docs/internal/experiments/2026-11-12-protocol-round-ab/`；打包调研 `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md`。

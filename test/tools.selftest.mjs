@@ -3000,6 +3000,10 @@ test('T11/S2-a 滑动无进展 watchdog：heartbeat 重臂并清零 nudge；nudg
   const w1 = runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2'])
   assert.equal(w1.code, 0, w1.stdout + w1.stderr)
   assert.ok(w1.stdout.includes('nudge=1/2') && w1.stdout.includes('已 nudge'), w1.stdout)
+  // 升级信封形状契约（exposure-crypto-trust 收口）：nudge=提示级【升级｜时间窗｜告警】+尾行
+  const nudgeLine = w1.stdout.split('\n').find((l) => l.includes('已 nudge'))
+  assert.ok(nudgeLine.startsWith('【升级｜时间窗｜告警】现状：'), nudgeLine)
+  assert.ok(nudgeLine.includes('建议：') && nudgeLine.endsWith('本提示不阻断。'), nudgeLine)
   assert.equal(readTask(dir, 'T1').nudges, 1)
   // 心跳响应 → nudge 清零：健康的长任务永不升级
   assert.equal(runTb(dir, ['heartbeat', 'T1', '--attempt', 'A1']).code, 0)
@@ -3009,6 +3013,10 @@ test('T11/S2-a 滑动无进展 watchdog：heartbeat 重臂并清零 nudge；nudg
   assert.ok(runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2']).stdout.includes('nudge=2/2'))
   const w4 = runTb(dir, ['watchdog', '--window-sec', '0', '--max-nudges', '2'])
   assert.ok(w4.stdout.includes('已 reclaim') && w4.stdout.includes('reclaim=1'), w4.stdout)
+  // reclaim=执行级信封：不带「本提示不阻断」尾行（工具已完成状态迁移）
+  const recLine = w4.stdout.split('\n').find((l) => l.includes('已 reclaim'))
+  assert.ok(recLine.startsWith('【升级｜时间窗｜执行】现状：') && recLine.includes('建议：'), recLine)
+  assert.ok(!recLine.includes('本提示不阻断。'), recLine)
   const t1 = readTask(dir, 'T1')
   assert.equal(t1.status, 'ready')
   assert.ok((t1.attempt_revoked || []).includes('A1'), JSON.stringify(t1)) // 孤儿代际撤销
@@ -3036,6 +3044,10 @@ test('T11/S2-b 断言 d：watchdog reclaim 前发现落盘完成报告则 adopt 
   assert.equal(a1.code, 0, a1.stdout + a1.stderr)
   assert.ok(a1.stdout.includes('已采纳为 done') && a1.stdout.includes('mev001@archive'), a1.stdout)
   assert.ok(!a1.stdout.includes('已 reclaim'), a1.stdout) // 采纳而非重试
+  // adopt=执行级信封（不带尾行）
+  const adoptLine = a1.stdout.split('\n').find((l) => l.includes('已采纳为 done'))
+  assert.ok(adoptLine.startsWith('【升级｜时间窗｜执行】现状：') && adoptLine.includes('建议：'), adoptLine)
+  assert.ok(!adoptLine.includes('本提示不阻断。'), adoptLine)
   const t1 = readTask(dir1, 'T1')
   assert.equal(t1.status, 'done')
   assert.ok(t1.summary.startsWith('[watchdog adopt] T1 完成'), t1.summary) // 汇报内容入 summary

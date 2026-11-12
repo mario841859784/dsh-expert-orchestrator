@@ -2,9 +2,10 @@
 //
 // 依据 docs/research/protocol-interop-mcp-a2a/00-protocol-interop.md（A2A AgentCard 规范：
 // name/description/url/version/protocolVersion/capabilities/skills[AgentSkill]；发现路径
-// /.well-known/agent-card.json）。定位：**card-first，transport 后置**——把「本编排者 +
-// 专家花名册」描述成 A2A 可发现的节点卡（每位专家=一个 AgentSkill），供外部代理生态
-// 注册表/发现面消费；实际 A2A HTTP transport（message/send 等）留后续（如实声明）。
+// /.well-known/agent-card.json）。定位：**card-first**——把「本编排者 + 专家花名册」描述成
+// A2A 可发现的节点卡（每位专家=一个 AgentSkill），供外部代理生态注册表/发现面消费；
+// A2A 最小 HTTP transport 已随插件交付（tools/a2a_taskboard.py，M1：message/send 同步 +
+// tasks/get 轮询，exposure-crypto-trust 报告 §5.4 形状），本卡描述该能力面。
 //
 // 用法：node scripts/gen-agent-card.mjs [--out <path>] [--url <https://host>] [--skill-dir <dir>]
 // - 花名册源：deployed merged roster（<skill-dir>/expert-sources/merged/roster.json，真实
@@ -12,7 +13,10 @@
 //   bundled experts/ frontmatter 兜底（与 MCP list_experts 同一兜底口径）；
 //   --skill-dir 可指向其他部署副本（自测/对账用），缺省=本仓技能目录；
 // - version 取 package.json（单一事实源，不硬编码——发版三点 bump 后卡自动跟随）；
-// - url 缺省为空串占位（卡只描述能力，不宣称已有 A2A transport 端点——如实边界）。
+// - url 缺省为空串占位（卡只描述能力；url 非空=「此端点可用此传输」的可核查承诺，
+//   部署 a2a_taskboard.py 后以 --url 宣称实际端点——如实边界，v0.3.0 §5.6）；
+// - securitySchemes/security 按暴露面调研 N1 落地（exposure-crypto-trust 报告 §5.1）：
+//   卡在「有端点」之前就如实声明接入需要什么（bearer、凭证带外分发、卡面不承载明文密钥）。
 import { readFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -111,15 +115,30 @@ const skills = experts
 
 const card = {
   name: 'dsh-expert-orchestrator',
-  description: '专家编排节点：分诊 → PM 规划 → 专家委派 → 依赖 DAG 任务板 → 分级交付门禁。任务板与专家花名册经 MCP（tools/mcp_taskboard.py，缺省只读）导出；本卡为 A2A 发现面（card-first，A2A HTTP transport 未部署）。',
+  description: '专家编排节点：分诊 → PM 规划 → 专家委派 → 依赖 DAG 任务板 → 分级交付门禁。任务板与专家花名册经 MCP（tools/mcp_taskboard.py，缺省只读）导出；A2A JSON-RPC 最小面由 tools/a2a_taskboard.py 提供（message/send 同步 + tasks/get 轮询，写面 opt-in）。本卡为 A2A 发现面（card-first）。',
   url,
   version: PLUGIN_VERSION,
   protocolVersion: '0.3.0',
+  preferredTransport: 'JSONRPC',
   capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false },
   defaultInputModes: ['text/plain'],
   defaultOutputModes: ['text/plain'],
+  // N1（exposure-crypto-trust §5.1）：卡面安全声明先于卡面端点——bearer + 带外分发，如实
+  // 声明「接入需要什么」；凭证获取在 A2A 协议范围之外（v0.3.0 §5.6 带外口径），卡面不承载
+  // 明文密钥（「NOT RECOMMENDED to include plaintext secrets」）。
+  securitySchemes: {
+    bearer: {
+      type: 'http',
+      scheme: 'bearer',
+      description: 'A2A JSON-RPC 端点要求 bearer token；凭证经带外通道分发（服务端启动输出 / env 注入），不在卡面承载。',
+    },
+  },
+  security: [{ bearer: [] }],
   skills,
   'dsh:rosterSource': deployed ? 'deployed-merged' : 'bundled-core-fallback',
+  // 写面如实声明：message/send 落任务板属写面（外部写入=代理转达的板面变更），服务端
+  // DSH_TASKBOARD_A2A_WRITES=1 opt-in 才暴露；tasks/get 只读缺省开放（与 MCP 导出面同纪律）。
+  'dsh:writeFace': 'message/send 为写面（服务端 DSH_TASKBOARD_A2A_WRITES=1 opt-in，缺省只读）；tasks/get 只读。',
 }
 
 const json = JSON.stringify(card, null, 2)

@@ -83,16 +83,37 @@ test('T2-P2 --json claim/list 成功信封：claim 后 data.task 反映认领态
   makeBoard(cwd)
   const cl = runTb(cwd, ['--json', 'claim', 'T1', 'worker'])
   assert.equal(cl.code, 0)
-  assert.deepEqual(Object.keys(cl.json).sort(), ['cmd', 'data', 'ok', 'revision'])
+  // 写命令信封附 event_seq（exposure-crypto-trust N2 对账锚点：本次落账后事件流末 seq，
+  // 与 replay data.event_seq 同源）——恰键集随之扩展。
+  assert.deepEqual(Object.keys(cl.json).sort(), ['cmd', 'data', 'event_seq', 'ok', 'revision'])
   assert.equal(cl.json.cmd, 'claim')
   assert.equal(cl.json.data.task.status, 'running')
   assert.equal(cl.json.data.task.owner, 'worker')
+  assert.equal(cl.json.event_seq, 2, '首板 create(seq1)+claim(seq2)')
   const lst = runTb(cwd, ['--json', 'list'])
   assert.equal(lst.code, 0)
-  assert.deepEqual(Object.keys(lst.json).sort(), ['cmd', 'data', 'ok', 'revision'])
+  assert.deepEqual(Object.keys(lst.json).sort(), ['cmd', 'data', 'ok', 'revision'], '读命令信封不带 event_seq')
   assert.ok(Array.isArray(lst.json.data.tasks))
   assert.equal(lst.json.data.tasks.length, 1)
   assert.equal(lst.json.data.tasks[0].id, 'T1')
+})
+
+test('T2-P2b --json create 成功信封：data.task=创建后任务快照（N2 审计回显），event_seq 对账锚点递增', (t) => {
+  const cwd = makeDir(t, 'p2b')
+  const cr = runTb(cwd, ['--json', 'create', '审计回显任务', '--owner', 'pm', '--desc', 'd'])
+  assert.equal(cr.code, 0)
+  assert.deepEqual(Object.keys(cr.json).sort(), ['cmd', 'data', 'event_seq', 'ok', 'revision'])
+  const task = cr.json.data.task
+  assert.equal(task.id, 'T1', 'create 无 id 参数——回执仍须携带创建后任务（data.task）')
+  assert.equal(task.title, '审计回显任务')
+  assert.equal(task.owner, 'pm')
+  assert.equal(task.status, 'ready', '无依赖任务经 refresh 提升后最终态如实回显')
+  assert.equal(cr.json.event_seq, 1)
+  // 再写一笔：event_seq 递增到 2（对账锚点与事件流末 seq 一致）
+  const cl = runTb(cwd, ['--json', 'claim', 'T1', 'worker'])
+  assert.equal(cl.json.event_seq, 2)
+  const rp = runTb(cwd, ['--json', 'replay'])
+  assert.equal(rp.json.data.event_seq, 2, '信封 event_seq 与 replay 对账载荷同源')
 })
 
 test('T2-P3 --json boards 成功信封：恰键集 {ok,cmd,data}（无 revision，约定保持）', (t) => {

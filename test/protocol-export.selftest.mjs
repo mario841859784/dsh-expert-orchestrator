@@ -3,11 +3,13 @@
 // 覆盖面：
 // - MCP initialize/协议版本回显/serverInfo；notifications/initialized 零回包；ping；
 //   tools/list 缺省只读（7 读工具、零写工具）；tools/call 读链路（status/show/open-counts/
-//   budget/list_experts 兜底）；写面缺省具名拒 writes_disabled（isError=true）；
-//   DSH_TASKBOARD_MCP_WRITES=1 时写工具入列 + create/claim/progress/done 全链真写；
+//   budget/list_experts 兜底）；写面缺省具名拒 writes_disabled（isError=true，拒绝面不附审计行）；
+//   DSH_TASKBOARD_MCP_WRITES=1 时写工具入列 + create/claim/progress/done 全链真写 +
+//   N2 写面审计回显（【审计】尾行：task/status/owner/by/event_seq/revision）；
 //   未知 method -32601；DSH_TASKBOARD_MCP_BOARD --board 透传；
 // - AgentCard：bundled 兜底 11 skills、必备字段、disabled/shadowed 过滤、--out 落盘、
-//   deployed roster 源切换。
+//   deployed roster 源切换、N1 安全声明（securitySchemes/security/preferredTransport/
+//   dsh:writeFace、url 空占位）。
 // R1 口径如实声明：stdio = 与 CLI 同信任级别（能启动进程者本就能直跑 taskboard.py）；
 // 写面 opt-in 缺省只读（外部写入=代理转达变更，方向 4 审计口径）。
 import test from 'node:test'
@@ -71,6 +73,7 @@ test('方向5-mcp tools/list 缺省只读：7 读工具、零写工具；写面�
   const writeCall = respOf(out, 2)
   assert.equal(writeCall.result.isError, true, '写面关闭：isError')
   assert.ok(writeCall.result.content[0].text.includes('writes_disabled') && writeCall.result.content[0].text.includes('DSH_TASKBOARD_MCP_WRITES'), writeCall.result.content[0].text)
+  assert.ok(!writeCall.result.content[0].text.includes('【审计】'), '拒绝面不附审计行（零写零事件，拒绝本身就是处置）')
   // 空板 status 正常（人读输出回退）
   const st = respOf(out, 3)
   assert.equal(st.result.isError, false, 'status 只读可用')
@@ -94,6 +97,18 @@ test('方向5-mcp 写面开启：写工具入列 + create/claim/progress/done �
   for (const id of [2, 3, 4, 5]) {
     assert.equal(respOf(out, id).result.isError, false, `tools/call ${id} 成功`)
   }
+  // N2 写面审计回显：写工具成功响应尾行附【审计】行（task/status/owner/by/event_seq/revision，
+  // 字段取自 taskboard.py --json 信封——event_seq=本次落账后事件流末 seq，外部调用方对账锚点）。
+  const auditOf = (id) => respOf(out, id).result.content[0].text.trim().split('\n').pop()
+  const aCreate = auditOf(2)
+  assert.ok(aCreate.startsWith('【审计】task=T1 status=ready'), aCreate)
+  assert.ok(aCreate.includes('event_seq=1') && aCreate.includes('revision=1'), aCreate)
+  const aClaim = auditOf(3)
+  assert.ok(aClaim.startsWith('【审计】') && aClaim.includes('owner=外部代理A') && aClaim.includes('event_seq=2'), aClaim)
+  const aProg = auditOf(4)
+  assert.ok(aProg.includes('owner=外部代理A') && !aProg.includes('by='), aProg) // progress 无 by 参数
+  const aDone = auditOf(5)
+  assert.ok(aDone.includes('status=done') && aDone.includes('by=外部代理A') && aDone.includes('event_seq=4'), aDone)
   const showText = respOf(out, 6).result.content[0].text
   const receipt = JSON.parse(showText)
   assert.equal(receipt.ok, true, 'show --json 信封结构化回传')
@@ -115,7 +130,8 @@ test('方向5-mcp 未知 method -32601；--board 透传（DSH_TASKBOARD_MCP_BOAR
   writeFileSync(board, JSON.stringify({ tasks: {}, seq: 0, revision: 0 }))
   const env = { DSH_TASKBOARD_MCP_BOARD: board, DSH_TASKBOARD_MCP_WRITES: '1' }
   const { out: out2 } = drive(dirB, [rpc(1, 'tools/call', { name: 'taskboard_create', arguments: { title: '定向板任务' } })], env)
-  const receipt = JSON.parse(respOf(out2, 1).result.content[0].text)
+  // 写面响应=回执 JSON + N2 审计回显尾行——解析时剥掉【审计】行
+  const receipt = JSON.parse(respOf(out2, 1).result.content[0].text.replace(/\n【审计】[^\n]*$/, ''))
   assert.equal(receipt.ok, true)
   assert.ok(Object.keys(JSON.parse(readFileSync(board, 'utf-8')).tasks).length === 1, '写入落在 --board 指定板')
 })
@@ -170,6 +186,16 @@ test('方向5-card AgentCard：bundled 兜底 11 skills、必备字段、--out �
   const card = JSON.parse(readFileSync(outPath, 'utf-8'))
   assert.equal(card.name, 'dsh-expert-orchestrator')
   assert.ok(card.description && card.protocolVersion && card.capabilities)
+  // N1（exposure-crypto-trust §5.1）：卡面安全声明先于卡面端点——bearer + 带外分发如实声明；
+  // preferredTransport 为 v0.3.0 卡必备字段（本插件实现的传输=JSONRPC）；url 缺省空占位不变
+  // （url 非空=端点可核查承诺）。
+  assert.deepEqual(card.security, [{ bearer: [] }], 'security=OR 列表（bearer）')
+  assert.equal(card.securitySchemes.bearer.type, 'http')
+  assert.equal(card.securitySchemes.bearer.scheme, 'bearer')
+  assert.ok(card.securitySchemes.bearer.description.includes('带外'), '声明凭证带外分发、卡面不承载明文密钥')
+  assert.equal(card.preferredTransport, 'JSONRPC')
+  assert.equal(card.url, '', 'url 缺省空占位（不宣称未部署的端点）')
+  assert.ok(card['dsh:writeFace'].includes('DSH_TASKBOARD_A2A_WRITES'), '写面 opt-in 如实声明')
   // version=package.json 单一事实源（② 评审项断言：不硬编码）
   const pkgVersion = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf-8')).version
   assert.equal(card.version, pkgVersion, `card.version 须跟随 package.json（=${pkgVersion}）`)

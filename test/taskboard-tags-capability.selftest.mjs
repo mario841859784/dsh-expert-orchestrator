@@ -35,6 +35,12 @@ const makeBoardDir = (t, label) => {
 }
 
 const boardOf = (dir) => JSON.parse(readFileSync(join(dir, BOARD_REL), 'utf-8'))
+// exposure-crypto 收口轮（N2）显式 additive 契约增量：写命令 --json 信封顶层 event_seq（事件流
+// 对账锚点）与 create 的 data.task（创建后任务审计快照）——旧基线（ca91bda）无此二键；比对前
+// 双版本同函数剥除，其余输出（含人读面与 show 的 data.task）仍逐字节一致。
+const stripAuditAdditions = (s) => s
+  .replace(/, "event_seq": \d+\}/g, '}')
+  .replace(/("cmd": "create", "data": )\{"task": \{.*?\}\}, ("revision")/g, '$1{}, $2')
 const eventsOf = (dir) => readFileSync(join(dir, EVENTS_REL), 'utf-8').trim().split('\n')
   .filter((l) => l.trim()).map((l) => JSON.parse(l))
 
@@ -63,12 +69,14 @@ test('T8-a 缺省兼容：create/claim/claim_idle 不带 --tags 与 HEAD 逐字�
     old: runTb(dirHead, args, headPy),
   }))
   for (const { args, cur, old } of outs) {
-    assert.equal(cur.stdout, old.stdout, `缺省输出逐字节一致：${args.join(' ')}`)
+    assert.equal(stripAuditAdditions(cur.stdout), stripAuditAdditions(old.stdout), `缺省输出逐字节一致（N2 additive 键剥除后）：${args.join(' ')}`)
     assert.equal(cur.code, old.code)
     if (args[0] === '--json') {
-      // --json data 键集一致（T3 任务对象无 tags 字段、claim_idle data 键集一致；error 信封无 data 双版本同形）
-      assert.deepEqual(Object.keys(cur.json.data || {}), Object.keys(old.json.data || {}))
-      if (cur.json.data && cur.json.data.task) assert.deepEqual(Object.keys(cur.json.data.task), Object.keys(old.json.data.task))
+      // --json data 键集一致（T3 任务对象无 tags 字段、claim_idle data 键集一致；error 信封无 data
+      // 双版本同形）——create 的 data.task 为 N2 审计回显 additive 键，双版本不对称属预期，过滤后比。
+      const curKeys = Object.keys(cur.json.data || {}).filter((k) => !(args[1] === 'create' && k === 'task'))
+      assert.deepEqual(curKeys, Object.keys(old.json.data || {}))
+      if (cur.json.data?.task && old.json.data?.task) assert.deepEqual(Object.keys(cur.json.data.task), Object.keys(old.json.data.task))
     }
   }
   // 事件 args 键集一致（双版本全部事件逐条比对 type 与 args 键集）

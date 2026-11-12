@@ -37,6 +37,12 @@ const norm = (s) => s.replace(/"(created|updated)": \d+/g, '"$1": T')
   .replace(/"(time|ts)": "?\d{13}"?/g, '"$1": "T"')
   .replace(/\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/g, '[T]')
 
+// exposure-crypto 收口轮（N2）显式 additive 契约增量：写命令 --json 信封顶层 event_seq（旧基线
+// 无此键）——比对前双版本同函数剥除，其余输出仍逐字节一致。
+const stripAuditAdditions = (s) => s
+  .replace(/, "event_seq": \d+\}/g, '}')
+  .replace(/("cmd": "create", "data": )\{"task": \{.*?\}\}, ("revision")/g, '$1{}, $2')
+
 const makeBoardDir = (t, label) => {
   const dir = mkdtempSync(join(tmpdir(), `t16-claim-steal-${label}-`))
   mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
@@ -95,13 +101,13 @@ test('T16-a 缺省路径双版本逐字节：claim_idle 成功/board_not_idle �
   for (const step of script) {
     const h = runTb(dirH, step(TASKBOARD), { omitEnv: OMIT })
     const b = runTb(dirB, step(tbBase), { omitEnv: OMIT })
-    assert.equal(norm(h.stdout), norm(b.stdout), `逐字节（norm）：${step(TASKBOARD).join(' ')}`)
+    assert.equal(norm(stripAuditAdditions(h.stdout)), norm(stripAuditAdditions(b.stdout)), `逐字节（norm）：${step(TASKBOARD).join(' ')}`)
     assert.equal(h.code, b.code, `退出码：${step(TASKBOARD).join(' ')}`)
   }
   // 机器面（独立分板）：--json data 形状与基线逐字节一致
   const j = runTb(dirH2, ['--json', 'claim_idle', '乙', 'T4'], { omitEnv: OMIT })
   const jb = runTb(dirB2, ['--json', 'claim_idle', '乙', 'T4'], { omitEnv: OMIT, tb: tbBase })
-  assert.equal(norm(j.stdout), norm(jb.stdout), '逐字节（norm）：--json claim_idle T4')
+  assert.equal(norm(stripAuditAdditions(j.stdout)), norm(stripAuditAdditions(jb.stdout)), '逐字节（norm）：--json claim_idle T4')
   assert.equal(j.code, jb.code)
   // HEAD 精断：--json data 形状与事件 args 键集（缺省不带 --steal 时形状与基线一致）
   assert.deepEqual(Object.keys(j.json.data ?? {}).sort(), ['claimed', 'skipped'])

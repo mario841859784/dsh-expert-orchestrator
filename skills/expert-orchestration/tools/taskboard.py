@@ -121,6 +121,8 @@ m 票布尔共识（v2.7，WP-5/S3，用户裁决 Q3=3A）：create --kind revie
     无证据 reclaim（撤销当前代际防迟到汇报、清 owner 回 ready）。nudge/reclaim/adopt 均落检查点轨迹
     （watchdog: 前缀）；所有变更走既有事件追加路径（watchdog/heartbeat 为写命令，单事件携带全部变更
     任务 after 快照），新字段 heartbeat_at/nudges/nudged_at 随快照折叠只增不减，既有命令输出零变化。
+    （v2.14.2 升级信封收口：stdout 三条升级线 nudge/adopt/reclaim 改走【升级｜时间窗｜…】信封格式
+    （SKILL.md §3），检查点落盘轨迹与 telemetry/汇总行维持 v2.7 字面不变。）
 per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭 opt-in）：
   DSH_EXPERT_TOOL_BUDGET 显式开启后，执行面写命令（claim/progress/heartbeat/done/fail/own/vote）派发前做
   事件溯源计数——计数唯一事实源是事件流（验收 a：模型自报不入境，bus 消息/检查点文本/任何叙述性内容
@@ -159,9 +161,11 @@ per-(任务,专家) 工具调用硬预算（v2.8 M8-2，#16，T27；默认关闭
 机器可读结构化输出通道（v2.8 S1，T17）：全局 --json 开关——开启后 stdout 恰一行 JSON 信封、
   人类可读文本不再上 stdout（stderr 诊断/告警不受影响），退出码语义与缺省完全一致。信封形态：
   成功 {"ok":true,"cmd":<命令>,"data":<结构化载荷>,"revision":<板级 revision（archive/_hook-check 缺省不带，与人类面末行约定一致）>}；
+  写命令（_WRITE_CMDS）另附 "event_seq"=本次落账后事件流末 seq（exposure-crypto-trust N2 对账锚点，与 replay data.event_seq 同源）；
   失败 {"ok":false,"error":<具名错误码或 command_failed>,...既有错误字段}（BoardError 字段原样保留，人读 sys.exit 类拒绝归一为
   command_failed+message）。data 载荷：任务中心命令给完整任务对象（含全部簿记字段——新增字段对机器消费方透明可见，这正是
-  结构化通道的意义：不再依赖展示层文本行格式）、list 给 id 升序任务数组、boards 给逐板摘要数组、其余命令给空对象。
+  结构化通道的意义：不再依赖展示层文本行格式）、create 给创建后任务对象（N2 审计回显）、list 给 id 升序任务数组、boards 给逐板摘要数组、
+  其余命令给空对象。
   缺省（不带 --json）人类可读面逐字节零变化；消费方契约升级路径：lib/tools.js auto-claim 已改走本通道（v2.8 S1）。
 事件溯源化核心（v2.7）：
   状态权威：append-only JSONL 事件流 <板文件>.events.jsonl；JSON 板文件降级为「折叠视图」缓存（对外只增簿记字段
@@ -681,6 +685,10 @@ def commit_event(path, data):
     ev['state_hash'] = _state_hash(data)  # 先算状态 hash，事件 hash 覆盖含 state_hash 的全部其余字段
     ev['hash'] = _event_hash(ev)
     _append_event(path, ev)
+    # 簿记同步进内存折叠态（与下方视图文件同源）：--json 信封（_emit）据此读「本次落账后」的
+    # event_seq/state_hash——此前仅落视图、内存 data 滞后一写（N2 对账锚点取值修正）。
+    data['event_seq'] = ev['seq']
+    data['event_state_hash'] = ev['state_hash']
     save_view(path, {'tasks': data['tasks'], 'seq': int(data.get('seq', 0)), 'revision': new_rev,
                      'event_seq': ev['seq'], 'event_state_hash': ev['state_hash']})
 
@@ -1114,6 +1122,14 @@ def _parse_tags(raw):
     return tags
 
 
+# _CREATE_EVAL 为 cmd_create → _structured_data 的 --json data 载荷进程内暂存（_WATCHDOG_EVAL/
+# _BUDGET_EVAL 同模式）：create 无 id 参数，--json 载荷此前为空对象——暴露面审计（exposure-
+# crypto-trust 报告 N2）要求写面回执带创建后任务快照（含 refresh 提升后的最终状态），外部
+# 调用方（MCP/A2A 写面）据此回显审计行。拒绝路径（任一门禁 sys.exit/BoardError）先于暂存
+# 发生，载荷保持空对象=「零写零事件」如实反映。
+_CREATE_EVAL = {'task': None}
+
+
 def cmd_create(a, data, path):
     if a.kind and a.kind != 'review':
         sys.exit(f"错误：--kind 仅支持 review（得到 {a.kind!r}）；m 票共识等其余 kind 由后续版本提供")
@@ -1264,6 +1280,7 @@ def cmd_create(a, data, path):
             _EVT_CTX['args']['open_count'] = auto_ready_ev['open_pre']
     promoted = refresh(data)
     save(path, data)
+    _CREATE_EVAL['task'] = data['tasks'][tid]  # --json 载荷暂存（save 后取最终态：pending 已提升则记 ready）
     show(data['tasks'][tid])
     if promoted:
         print('依赖已满足，自动转 ready: ' + ' '.join(promoted))
@@ -2176,7 +2193,11 @@ def cmd_watchdog(a, data, path):
     完成报告落盘证据在 bus 收件箱/归档/发件箱），有证据 adopt 为 done，无证据 reclaim 回 ready 并撤销
     当前代际。review kind 任务例外（T19 回炉，重要-1）：评审结论必须经显式 done --verdict 落地，
     watchdog 永不代答——即使发现落盘报告也照常 reclaim（回 ready 重新评审），防 verdict 门禁被绕过。
-    全部变更合入一个 watchdog 事件（after 快照差分），stdout 为新增命令自有契约；
+    全部变更合入一个 watchdog 事件（after 快照差分），stdout 为新增命令自有契约——三条升级线
+    （nudge/adopt/reclaim）按升级信封格式输出（exposure-crypto-trust 收口：nudge=提示级
+    【升级｜时间窗｜告警】带「本提示不阻断」尾行，adopt/reclaim=执行级【升级｜时间窗｜执行】
+    不带尾行；格式规范见 SKILL.md §3）；telemetry 头行/汇总行/无变更分支与检查点落盘轨迹维持
+    v2.7 字面（数据面与遥测面不是升级提示行）。
     adopt 显式记录实际执行者（executors，对齐手工 done --by 审计），汇总行输出 healthy 计数。"""
     window_ms = max(0, a.window_sec) * 1000
     max_nudges = max(0, a.max_nudges)
@@ -2204,8 +2225,9 @@ def cmd_watchdog(a, data, path):
             t['updated'] = now
             nudged += 1
             changed += 1
-            lines.append(f"{tid} [running] owner={t['owner'] or '（未分配）'} 无进展 {stale_s}s "
-                         f"nudge={t['nudges']}/{max_nudges} → 已 nudge（重臂 window={a.window_sec}s，等 heartbeat/progress 响应）")
+            lines.append(f"【升级｜时间窗｜告警】现状：任务 {tid} [running] owner={t['owner'] or '（未分配）'} 无进展 {stale_s}s"
+                         f"（nudge={t['nudges']}/{max_nudges}）——已 nudge（重臂 window={a.window_sec}s，等 heartbeat/progress 响应）。"
+                         f"建议：立即 heartbeat 或 progress 报活；工作已完成则落 done 收口。本提示不阻断。")
             continue
         m, loc = _completion_evidence(tid, t, bus_root)
         att = t.get('attempt_id') or ''
@@ -2225,8 +2247,10 @@ def cmd_watchdog(a, data, path):
             t['updated'] = now
             adopted += 1
             changed += 1
-            lines.append(f"{tid} [running] owner={t['owner'] or '（未分配）'} 无进展 {stale_s}s nudge={nudges}/{max_nudges}"
-                         f" → 已采纳为 done（落盘完成报告 {m.get('id')}@{loc}）；完成标准：{t.get('desc', '')[:60]}")
+            lines.append(f"【升级｜时间窗｜执行】现状：任务 {tid} [running] owner={t['owner'] or '（未分配）'} 无进展 {stale_s}s"
+                         f"（nudge={nudges}/{max_nudges} 达上限），发现落盘完成报告 {m.get('id')}@{loc}"
+                         f"——已采纳为 done（完成标准：{t.get('desc', '')[:60]}）。"
+                         f"建议：核对采纳内容与完成标准一致；误采纳走 reassign/recover 处置。")
         else:
             orig_owner = t.get('owner') or '未分配'
             if m is not None:  # review 任务有落盘报告也不采纳（verdict 门禁不可被 watchdog 代答）
@@ -2254,8 +2278,9 @@ def cmd_watchdog(a, data, path):
             t['updated'] = now
             reclaimed += 1
             changed += 1
-            lines.append(f"{tid} [running] owner=（原 {orig_owner}）无进展 {stale_s}s nudge={nudges}/{max_nudges}"
-                         f" → 已 reclaim（{why_line}；attempt {att or '（无）'} 撤销，转 ready 待重新派工）")
+            lines.append(f"【升级｜时间窗｜执行】现状：任务 {tid} [running] owner=（原 {orig_owner}）无进展 {stale_s}s"
+                         f"（nudge={nudges}/{max_nudges} 达上限）——已 reclaim（{why_line}；attempt {att or '（无）'} 撤销，"
+                         f"转 ready 待重新派工）。建议：重新派工（claim/reassign）或上报用户附升级报告三要素。")
     # --json data 载荷（v2.9 T2）：扫描一结束即暂存，无变更早退与有变更两分支同源覆盖
     #（adopted/reclaimed/nudged/healthy/changed 与人类面汇总行同口径，changed=本轮实际变更数）。
     _WATCHDOG_EVAL['payload'] = {'adopted': adopted, 'reclaimed': reclaimed,
@@ -3189,6 +3214,12 @@ def _structured_data(a, data):
         # （报告型命令 data 恒非空惯例沿 T27 budget；失败面的 running/skipped 在错误信封字段）。
         return {'claimed': list(_CLAIM_IDLE_EVAL['claimed']),
                 'skipped': [dict(s) for s in _CLAIM_IDLE_EVAL['skipped']]}
+    if a.cmd == 'create':
+        # 暴露面审计（exposure-crypto-trust 报告 N2）：create 的机器消费面给创建后任务全量
+        # 快照（_CREATE_EVAL 暂存，save 后取最终态）——写面回执此前 data={}（无 id 参数），
+        # 外部调用方拿不到新任务 id/owner/状态，无法回显审计行与对账事件流。
+        out = _CREATE_EVAL.get('task')
+        return {'task': out} if isinstance(out, dict) else {}
     tid = getattr(a, 'id', None)
     if isinstance(tid, str) and tid in data.get('tasks', {}):
         return {'task': data['tasks'][tid]}
@@ -3314,6 +3345,12 @@ def _emit(a, data, path, json_mode):
         if a.cmd not in ('archive', '_hook-check'):  # 与人类面末行 revision 约定一致
             envelope['revision'] = int(data.get('revision', 0))
             required.append('revision')
+        if a.cmd in _WRITE_CMDS:
+            # 暴露面审计（exposure-crypto-trust 报告 N2）：写命令信封附 event_seq=本次落账后
+            # 事件流末 seq（与 replay data.event_seq 同源）——外部调用方（MCP/A2A 写面）据此
+            # 回显审计行并核对事件流。additive 键（_receipt_check 对额外键透明）；budget 只读
+            # 盘点走同白名单，取值=快照对账锚点（快照级一致性语义见 T38-1 注释）。
+            envelope['event_seq'] = int(data.get('event_seq', 0))
         _receipt_check(envelope, required, json_mode)
     else:
         a.fn(a, data, path)
@@ -3325,8 +3362,9 @@ def main():
     ap = argparse.ArgumentParser(description='expert-orchestrator 任务板')
     ap.add_argument('--board', help='状态文件路径，默认 <cwd>/.expert-taskboard.json；--install-hook 时可固化项目板进 hook')
     ap.add_argument('--json', action='store_true',
-                    help='机器可读结构化输出通道（v2.8 S1）：stdout 恰一行 JSON 信封（成功 {"ok":true,cmd,data,revision}；'
-                         '失败 {"ok":false,error,...}），人类可读文本不上 stdout，stderr 与退出码语义不变；'
+                    help='机器可读结构化输出通道（v2.8 S1）：stdout 恰一行 JSON 信封（成功 {"ok":true,cmd,data,revision}'
+                         '[,event_seq 写命令对账锚点]；失败 {"ok":false,error,...}），人类可读文本不上 stdout，'
+                         'stderr 与退出码语义不变；'
                          '缺省（不带本参数）人类可读面逐字节零变化。仅支持任务板子命令，不与 --install-hook/--uninstall-hook 同用')
     ap.add_argument('--install-hook', action='store_true',
                     help='门禁执法平面（默认关闭）：向当前仓库 .git/hooks/commit-msg 安装零依赖三查 hook；已有同名 hook 报错不覆盖')

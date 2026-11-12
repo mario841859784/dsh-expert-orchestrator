@@ -14,6 +14,12 @@
 #   不新增执法面（CLI 无鉴权，防误用不防伪造），只做协议转换与写面开关。
 # - 身份自报：调用方身份经工具参数（owner/--by 类参数）与 initialize 的 clientInfo 留痕，
 #   板面「自报，防误用不防伪造」口径不变。
+# - **写面审计回显（N2，exposure-crypto-trust 报告 §5.2）**：写工具成功响应尾行附【审计】
+#   回显行——task/status/owner/by/event_seq/revision，全部取自 taskboard.py --json 信封
+#   （event_seq=本次落账后事件流末 seq，写命令信封对账锚点；by=调用参数自报）。把「代理
+#   转达变更」的审计口径变成可机读对账面：外部调用方（如 hermes）能看到自己写的任务被
+#   怎么处置，并可持 event_seq 对事件流对账。不做边界：不为 stdio 添加伪鉴权（env 即边界的
+#   口径不变），拒绝面（isError）不附审计行（零写零事件，拒绝本身就是处置）。
 # - 单向导出：summon/编排工具**不导出**（递归防护 deny 清单语义的镜像——外部节点拿到的
 #   是板面 CRUD 与花名册只读视图，不是「再召唤专家」的入口）。
 import json
@@ -223,6 +229,27 @@ def is_write_tool(name):
     return any(t['name'] == name for t in WRITE_TOOLS)
 
 
+def audit_echo(name, args, receipt):
+    """写面审计回显行（N2）：字段全部取自 --json 回执（信封顶层 event_seq/revision +
+    data.task 快照）与调用参数（by=自报，与 --by 口径一致），一行组装；data.task 缺失
+    （旧版 taskboard.py 回执或异常形态）返回 None——回显缺位不是错误，正文回执照常返回。"""
+    if not isinstance(receipt, dict):
+        return None
+    t = receipt.get('data', {}).get('task')
+    if not isinstance(t, dict):
+        return None
+    fields = [f'task={t.get("id", "?")}', f'status={t.get("status", "?")}']
+    owner = t.get('owner') or ''
+    if owner:
+        fields.append(f'owner={owner}')
+    by = (args.get('by') or args.get('owner') or '') if isinstance(args, dict) else ''
+    if by:
+        fields.append(f'by={by}')
+    fields.append(f'event_seq={receipt.get("event_seq")}')
+    fields.append(f'revision={receipt.get("revision")}')
+    return '【审计】' + ' '.join(fields)
+
+
 def call_tool(name, args):
     """返回 MCP content 数组。写面关闭时具名拒（isError=True + 指路 env）。
     结构化调用统一带 --json（全局旗标置于子命令前）——信封单行 JSON 可解析，
@@ -284,7 +311,12 @@ def call_tool(name, args):
         return _err_text(f'taskboard_exit_{r["code"]}: {detail.strip()}')
     receipt = parse_receipt(r['stdout'])
     if receipt is not None:
-        return _ok_text(json.dumps(receipt, ensure_ascii=False, indent=2))
+        text = json.dumps(receipt, ensure_ascii=False, indent=2)
+        if is_write_tool(name):
+            audit = audit_echo(name, a, receipt)  # N2：写面成功响应尾行附审计回显
+            if audit:
+                text += '\n' + audit
+        return _ok_text(text)
     return _ok_text(r['stdout'].strip() or '（无输出）')
 
 

@@ -40,6 +40,13 @@ const runTb = (cwd, args, { tb = TASKBOARD, extraEnv = {}, omitEnv = [] } = {}) 
   return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', json }
 }
 
+// exposure-crypto 收口轮（N2）显式 additive 契约增量：写命令 --json 信封顶层 event_seq（事件流
+// 对账锚点）与 create 的 data.task（创建后任务审计快照）——旧基线（594e699）无此二键；比对前
+// 双版本同函数剥除，其余输出仍逐字节一致。
+const stripAuditAdditions = (s) => s
+  .replace(/, "event_seq": \d+\}/g, '}')
+  .replace(/("cmd": "create", "data": )\{"task": \{.*?\}\}, ("revision")/g, '$1{}, $2')
+
 const makeBoardDir = (t, label) => {
   const dir = mkdtempSync(join(tmpdir(), `t13-antistorm-${label}-`))
   mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
@@ -109,7 +116,7 @@ test('T13-a env 关闭：claim/claim_idle/approve 代理草案/reassign peer 四
   // 时间戳归一（created/updated 毫秒双版本必然不同；键与结构逐字节一致才是断言对象）
   const norm = (s) => s.replace(/"(created|updated)": \d+/g, '"$1": T')
   for (let i = 0; i < script.length; i++) {
-    assert.equal(norm(rc[i].r.stdout), norm(ro[i].r.stdout), `逐字节一致：${script[i].join(' ')}`)
+    assert.equal(norm(stripAuditAdditions(rc[i].r.stdout)), norm(stripAuditAdditions(ro[i].r.stdout)), `逐字节一致：${script[i].join(' ')}`)
     assert.equal(rc[i].r.code, ro[i].r.code, `exit code 一致：${script[i].join(' ')}`)
   }
   // T5 attempt_id 双版本各自生成，show（只读）取各自值续跑 reassign peer 两条
@@ -122,11 +129,12 @@ test('T13-a env 关闭：claim/claim_idle/approve 代理草案/reassign peer 四
   const tc = tail(atCur).map((args) => ({ args, r: runTb(dirCur, args, { ...OPTS, tb: TASKBOARD }) }))
   const to = tail(atOld).map((args) => ({ args, r: runTb(dirOld, args, { ...OPTS, tb: headPy }) }))
   for (let i = 0; i < tc.length; i++) {
-    assert.equal(norm(tc[i].r.stdout), norm(to[i].r.stdout), `逐字节一致：${tc[i].args.join(' ')}`)
+    assert.equal(norm(stripAuditAdditions(tc[i].r.stdout)), norm(stripAuditAdditions(to[i].r.stdout)), `逐字节一致：${tc[i].args.join(' ')}`)
     assert.equal(tc[i].r.code, to[i].r.code)
     if (tc[i].r.json && to[i].r.json) {
       // reassign 成功路径 task 键集一致；stale_attempt 错误信封键集一致
-      assert.deepEqual(Object.keys(tc[i].r.json), Object.keys(to[i].r.json))
+      // （成功信封顶层 event_seq 为 N2 additive 键，旧基线无——过滤后比）
+      assert.deepEqual(Object.keys(tc[i].r.json).filter((k) => k !== 'event_seq'), Object.keys(to[i].r.json))
     }
   }
   // 事件流：type 序列与 args 键集逐条一致（事件形状零变化）

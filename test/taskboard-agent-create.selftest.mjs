@@ -62,10 +62,19 @@ test('T2-a 逐字节兼容：不带新参数 create 人类面输出精确不变�
   assert.equal(r.code, 0)
   assert.equal(r.stdout, 'T1 [ready] 任务A owner=甲 scope=src\n依赖已满足，自动转 ready: T1\nrevision=1\n')
   assert.equal(r.stderr, '')
-  // --json 信封：create 既有 data={} 形状不变
+  // --json 信封：create 回执自 exposure-crypto 收口轮（N2）起带创建后任务审计快照——
+  // 恰键集扩展为 {ok,cmd,data,revision,event_seq}，data.task 快照可对账（additive 契约）；
+  // 人读面（上方断言）逐字节不变。
   const j = runTb(dir, ['--json', 'create', '任务B', '--dep', 'T1'])
   assert.equal(j.code, 0)
-  assert.deepEqual(j.json, { ok: true, cmd: 'create', data: {}, revision: 2 })
+  assert.deepEqual(Object.keys(j.json), ['ok', 'cmd', 'data', 'revision', 'event_seq'])
+  assert.equal(j.json.ok, true)
+  assert.equal(j.json.cmd, 'create')
+  assert.equal(j.json.revision, 2)
+  assert.equal(j.json.event_seq, 2)
+  assert.equal(j.json.data.task.id, 'T2')
+  assert.equal(j.json.data.task.status, 'pending', '依赖 T1 未 done → 不提升，最终态如实回显')
+  assert.equal(j.json.data.task.title, '任务B')
   // 任务 JSON：无 created_by 键；事件流 type=create args 形状与旧版逐键一致
   for (const tid of ['T1', 'T2']) assert.ok(!('created_by' in boardOf(dir).tasks[tid]), tid)
   const createEvents = eventsOf(dir).filter((e) => e.type === 'create')

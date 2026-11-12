@@ -36,6 +36,12 @@ const runTb = (cwd, args, { tb = TASKBOARD, extraEnv = {}, omitEnv = [] } = {}) 
   return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', json }
 }
 
+// exposure-crypto 收口轮（N2）显式 additive 契约增量：写命令 --json 信封顶层 event_seq（旧基线
+// eb756a7 无此键）——比对前双版本同函数剥除，其余输出仍逐字节一致。
+const stripAuditAdditions = (s) => s
+  .replace(/, "event_seq": \d+\}/g, '}')
+  .replace(/("cmd": "create", "data": )\{"task": \{.*?\}\}, ("revision")/g, '$1{}, $2')
+
 const makeBoardDir = (t, label) => {
   const dir = mkdtempSync(join(tmpdir(), `t14-bind-${label}-`))
   mkdirSync(join(dir, '.expert-taskboards'), { recursive: true })
@@ -78,7 +84,8 @@ test('T14-a env 关闭：claim --attempt/reassign 双通道/done --by/vote/progr
   const rc = script.map((args) => runTb(dirCur, args, { ...OPTS }))
   const ro = script.map((args) => runTb(dirOld, args, { ...OPTS, tb: headPy }))
   for (let i = 0; i < script.length; i++) {
-    assert.equal(norm(rc[i].stdout), norm(ro[i].stdout), `逐字节一致：${script[i].join(' ')}`)
+    // --json reassign/vote 信封顶层 event_seq 为 N2 additive 键（旧基线无）——剥除后比，其余逐字节
+    assert.equal(norm(stripAuditAdditions(rc[i].stdout)), norm(stripAuditAdditions(ro[i].stdout)), `逐字节一致：${script[i].join(' ')}`)
     assert.equal(rc[i].code, ro[i].code, `exit code 一致：${script[i].join(' ')}`)
   }
   // attempt_owner 字段不落档（env 关）

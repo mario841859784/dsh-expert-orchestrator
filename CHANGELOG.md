@@ -19,17 +19,36 @@ All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a 
 ### Added（第二批：⑤ 路由遥测 + ③ M3 事件签名，2026-11-13）
 
 - **⑤小切口：专家路由实测数据回填（lib/route-telemetry.js + scripts/routing-metrics.mjs）**: summon 边界只读埋点——成功/失败两处记账点同步落实测样本到会话 cwd `.expert-routing/samples.jsonl`（专家/模型/pref 档/stopReason/任务书与回包字符数/估算 token/实测时长；usage 键恒 null 占位——宿主结算 seam 尚无 usage 字段，lib/cost.js 头注预留的同一消费缝，接入后同槽位换实测值）。**只读边界**：任务板/事件流/总线零写入、summon 输出零变化（answer 逐字节不动）；样本不含正文（与记账同口径，只存规模与离散字段）。**默认开启**（攒数据是切口目的——排期原文「零风险的数据积累，随时可启动」），`DSH_EXPERT_ROUTE_TELEMETRY='0'/''` 关闭；单文件 8MB 软顶超顶停写不删；I/O 异常 fail-open 本会话禁用（warn 一次性）。聚合面 `scripts/routing-metrics.mjs`（只读，--json 机读）：按专家/模型聚合 ok 率、tok/字 反推比（估算系数校准锚点）、时长分位、stopReason 分布。runExpertOneShot/Continuable 返回值 additive 增 `stopReason` 键（宿主结算面真实离散面）。
-- **③ M3：Ed25519 事件签名 + 板外验证器（exposure-crypto-trust 报告 §4.2/§5.7 设计落地）**: ① `tools/_ed25519.py` vendored 纯 python Ed25519（RFC 8032，hashlib 单依赖，零 pip 安装面——零依赖约束下的唯一签名路径）；**正确性双实现互验钉死**：RFC 8032 §7.1 TEST 1 向量逐字节 + L·B==单位元群阶自检 + node:crypto（OpenSSL 独立实现）互签互验（python 签==node 签逐字节、双向往验）——实现过程实锤一处「2^252 加式群阶常量尾数抄错」（pk 路径全绿而 r/S 归约全错的隐蔽形态），群阶自检锚点与互验测试已入测试防回归。② taskboard.py 写路径签名（opt-in `DSH_TASKBOARD_SIGN_KEY`=seed base64 内联或文件路径）：每条事件附 `sigkey`（公钥指纹 sha256[:16]）+ `sig`（覆盖 canonical(事件去 hash/sig)，与 `_event_hash` 同一规范化面）；hash 链覆盖 sigkey 落款（换钥冒名即断链）；**无签名配置时事件 JSON 逐字节不变**（additive 语义）。③ 折叠/重放验签（`DSH_TASKBOARD_SIGN_PUBKEY_DIR` 或缺省 `~/.dsh/keys` 预共享目录；板根 `revoked-keys` 吊销文件——每行=base64 公钥全文，空/缺失=空吊销集，显式不学 SSH 停用全体）：invalid/revoked/unknown_key **标记不静默**（stderr 汇总 + `replay --json` data.sig_audit 载荷），非 unrecoverable——**签名不做权限执法**（报告 §5.7 不做边界），链 hash 校验仍按既有 unrecoverable 语义；无签名事件如实计 unsigned；验签面未配置=configured:false 如实占位（≠验签通过）。④ `scripts/board-keys.mjs`（gen：.key 0600+.pub 分发面；fingerprint/pubkey 子命令）+ `scripts/verify-board.mjs` **板外验证器**（§5.10 验收标准「签名不能只被写入方自己验证」）：独立进程只持公钥验整板——hash 链逐条重算（python `_canonical` 字节面复刻：键递归排序+紧凑分隔，事件键 ASCII/数值安全整数域前提如实声明）+ OpenSSL 逐条验签 + 吊销比对，异常退出码 1。诚实边界：签名归因「密钥持有者」，不证明「内容为真」、不签批准语义、不做权限执法（报告 §4.5 买不到清单）；纯 python 验签量级慢（~30ms/条）但事件量小+快照读不验（报告 §4.2 口径）。
+- **③ M3：Ed25519 事件签名 + 板外验证器（exposure-crypto-trust 报告 §4.2/§5.7 设计落地）**: ① `tools/_ed25519.py` vendored 纯 python Ed25519（RFC 8032，hashlib 单依赖，零 pip 安装面——零依赖约束下的唯一签名路径）；**正确性双实现互验钉死**：RFC 8032 §7.1 TEST 1 向量逐字节 + L·B==单位元群阶自检 + node:crypto（OpenSSL 独立实现）互签互验（python 签==node 签逐字节、双向往验）——实现过程实锤一处「2^252 加式群阶常量尾数抄错」（pk 路径全绿而 r/S 归约全错的隐蔽形态），群阶自检锚点与互验测试已入测试防回归。② taskboard.py 写路径签名（opt-in `DSH_TASKBOARD_SIGN_KEY`=seed base64 内联或文件路径）：每条事件附 `sigkey`（公钥指纹 sha256[:16]）+ `sig`（覆盖 canonical(事件去 hash/sig)，与 `_event_hash` 同一规范化面）；hash 链覆盖 sigkey 落款（换钥冒名即断链）；**无签名配置时事件 JSON 逐字节不变**（additive 语义）。③ 折叠/重放验签（`DSH_TASKBOARD_SIGN_PUBKEY_DIR` 或缺省 `~/.dsh/keys` 预共享目录；板根 `revoked-keys` 吊销文件——每行=base64 公钥全文，空/缺失=空吊销集，显式不学 SSH 停用全体）：invalid/revoked/unknown_key **标记不静默**（stderr 汇总 + `replay --json` data.sig_audit 载荷），非 unrecoverable——**签名不做权限执法**（报告 §5.7 不做边界），链 hash 校验仍按既有 unrecoverable 语义；无签名事件如实计 unsigned；验签面未配置=configured:false 如实占位（≠验签通过）。④ `scripts/board-keys.mjs`（gen：.key 0600+.pub 分发面；fingerprint/pubkey 子命令）+ `scripts/verify-board.mjs` **板外验证器**（§5.10 验收标准「签名不能只被写入方自己验证」）：独立进程只持公钥验整板——hash 链逐条重算（python `_canonical` 字节面复刻：键递归排序+紧凑分隔，事件键 ASCII/数值安全整数域前提如实声明）+ OpenSSL 逐条验签 + 吊销比对，异常退出码 1。诚实边界：签名归因「密钥持有者」，不证明「内容为真」、不签批准语义、不做权限执法（报告 §4.5 买不到清单）；纯 python 验签量级慢（~30ms/条）但事件量小+快照读不验（报告 §4.2 口径）；**实现为非常量时间**（安全审计中-1 如实声明：sign 路径消费秘密标量，不抵抗同机侧信道观测——适用边界=单用户本地进程模型，见 tools/_ed25519.py 头注）。
 
 ### 测试
 
 - 全量 `npm test`：621 tests / 618 pass / 0 fail / 3 skipped（+9：a2a-server 8 用例 + receipt P2b）；mutation gate（`DSH_EXPERT_MUTANTS=1 npm test`）：651/649 pass / 0 fail / 2 skipped，29 变异点全捕获零逃逸——taskboard.py 22 点行级锚点按 anchor 字符串回查实况批量重写（REGISTRY 与源码同步纪律）。受 additive 契约影响的基线逐字节回归测试（tags/antistorm/attempt-owner-bind/claim-steal/agent-create 五文件）按「显式 additive 键剥除后双版本比对」更新，契约 delta 在测试内留注释。
 - ⑤③ 批次后：`npm test` 632 tests / 629 pass / 0 fail / 3 skipped（+11：route-telemetry 6 用例 + board-signing 5 用例）；mutation gate 662/660 pass / 0 fail / 2 skipped（29 变异全捕获，REGISTRY 再次回查重写）。签名面连带修复三处实测回归：① route-telemetry 失败路径引用 try 块内声明的 summonT0（ReferenceError 打破 summon 失败路径）——声明挪 try 外；② taskboard.py 零第三方 import 白名单补 base64 + _ed25519（vendored 例外在测试内注明）；③ replay --json data 恰键断言扩 sig_audit 第五键（空板/正常板两处）。
+- 评审收口批次后：`npm test` 632/629 pass / 0 fail / 3 skipped（a2a `--` 用例并入既有校验面 test 块，test 计数不变）；mutation gate **664/662 pass / 0 fail / 2 skipped（两次连跑同结果）**——REGISTRY 29→31 点（M3 判定面 2 点入册），**必改-1 竞态在负载跑批下两连跑零 fail**（评审实测修复前 1/2 次 fail）——门禁间歇假红已闭合。
 
 
 ## [2.14.1] — 2026-11-12
 
 > 依据评审 `docs/internal/REVIEW-f533f96.md` 结论与 T1 评审建议收口；对照实验档案 `docs/internal/experiments/2026-11-12-protocol-round-ab/`；打包调研 `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md`。
+
+### 评审收口（REVIEW-ef3b962.md + REVIEW-ef3b962-security.md，2026-11-13，两报告入 docs/internal/）
+
+> 独立评审结论：主报告「同意合入放行（必改 1 项测试竞态；不涉产品代码语义缺陷）」；安全审计「无阻断项、无高危项」（中 2 低 4，均为声明/加固面）。以下逐条落地；两条报告原文入库 docs/internal/ 留档。
+
+- **必改-1（测试基建）a2a 启动面用例竞态修复（双保险）**：①服务端启动横幅把 `A2A_TOKEN`（凭证）移到 `A2A_LISTEN`（暴露点）之前打印——「凭证先于暴露」叙事落地；②测试 helper startServer resolve 条件改为「LISTEN 行且凭证行到齐」（负载下 stderr 分块到达不再缺席 token 行）——mutation gate 门禁不再间歇假红。
+- **安全中-2：A2A message/send 标题参数注入面加固**：title（网络不可信输入直达子进程 positional 的唯一点）改经 `--` 分隔符传 create（选项在前、`--` 紧贴 title 恒居末位）——选项旗标拼接（如标题 `--auto-ready` 改写任务语义）永不成立；selftest 新增 `-` 开头标题字面落板用例钉死。
+- **安全中-1：_ed25519.py 非常量时间如实声明**（纯声明性）：文件头注「不抵抗同机侧信道观测，适用边界=单用户本地进程模型」+ CHANGELOG 本条目同步。
+- **安全低-1：A2A 兜底错误回显收紧**：unexpected 异常回包只给 `{type(e).__name__}`（详细消息落 stderr 服务端日志面）；taskboard 拒绝面具名 JSON 信封全透传（调用方可操作），stderr 人读文本截断 200 字符。
+- **建议1（verify-board 视图对账）**：board.json 的 seq/revision 与事件流末事件比对——事件流被删尾而视图未动即判异常 exit 1（python load 路径 event_seq>末 seq 防御的板外复刻）；视图缺失/损坏如实跳过注记。
+- **建议2+安全低-2（剥签重写防误读）**：verify-board「全部通过」在含 unsigned 事件时附提示（「全部通过」≠「未被篡改」）；新增 `--require-signed` 严格开关（已知全签名板对账用）；replay 在验签面已配置且整板无签名时打一行显式提示（比对历史基线核验）。
+- **建议3（验签性能注记）**：SKILL.md §9 签名段注记「~30ms/条且常规读路径全量重跑（无缓存）」+ 缓存留后续。
+- **建议4（写面开关 bool 语义）**：SKILL.md §9 注记「bool 非空即开（X=0 亦开启）」既有约定边界，统一收紧留后续。
+- **建议5+安全低-4（a2a MVP 已知边界）**：文件头如实注记阻塞轮询 spawn 开销（0.5s/次，300s 上限=600 次）与 ThreadingHTTPServer 无并发上限（缓解面：bearer 恒开+回环+1MB 体上限；信号量/速率上限留后续）。
+- **建议6（canonical 值域声明补全）**：verify-board.mjs 头注补 U+2028/2029 转义差异理论边角。
+- **建议7（checkvalid 契约注记）**：docstring 明示「失败语义双态：格式/点非法抛 ValueError、验证不通过返回 False——调用方必须 catch」。
+- **安全低-3（board-keys 私钥落仓告警）**：gen 检测 out-dir 位于 git 仓库内即 stderr 告警（不在任何 .gitignore 覆盖面，严禁随仓库提交；不拒绝，操作者自决）。
+- **备案建议（M3 判定面入册 mutation gate）**：REGISTRY 29→31 点，新增 `TB-event-hash-excludes-sig`（mutant：hash 输入含 sig→签名板重放链校验失败被钉）与 `TB-sig-revoked-first`（mutant：吊销判定跳过→漏判 verified 被钉）——probe 夹具固定 seed（bytes(range(32)) 可复现）+ pristine 面板加 _ed25519.py 副本（签名逻辑本身不变异）。
 
 ### Changed
 

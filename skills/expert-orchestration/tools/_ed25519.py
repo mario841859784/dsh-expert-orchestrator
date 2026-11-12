@@ -10,6 +10,10 @@
 # 边界（如实声明）：
 # - 纯大整数实现，性能量级慢于原生（sign ~10ms、verify ~30ms @CPython/arm64，消息小）——
 #   事件面量小（每任务个位数事件/日，报告 §4.2 口径），仅在签名/验签配置面存在时付出。
+# - **非常量时间实现（安全审计 REVIEW-ef3b962-security 中-1 如实声明）**：教科书式
+#   double-and-add 标量乘与朴素模运算，sign 路径消费秘密标量（seed 派生），耗时随密钥位
+#   模式波动——不抵抗同机共驻进程的耗时侧信道统计。适用边界=单用户本地进程模型（本仓
+#   威胁模型：本地部署 + 密钥短命 + 事件签名不做执法），多租户/对抗性共驻场景不适用。
 # - 验签严格面：S ≥ l 拒（canonical S，与 OpenSSL 语义对齐）；非曲线点/长度不符拒。
 # - 不含 BIP32/EDSA 等扩展；仅 sign/verify/publickey 三面。
 import hashlib
@@ -140,7 +144,10 @@ def signature(m, seed, pk):
 
 
 def checkvalid(sig, m, pk):
-    """验签（严格面）：S 范数拒（≥L）、点解码拒、[S]B == R + [k]A 射影等价比对。"""
+    """验签（严格面）：S 范数拒（≥L）、点解码拒、[S]B == R + [k]A 射影等价比对。
+    失败语义双态：格式/点非法**抛 ValueError**、验证不通过**返回 False**——调用方
+    必须 try/except 收敛（既有两处调用点 taskboard.py `_sig_audit_events`、
+    verify-board.mjs 均已 catch；新增调用点勿裸调，REVIEW-ef3b962 建议7）。"""
     if len(sig) != 64:
         raise ValueError('签名长度须 64 字节')
     if len(pk) != 32:

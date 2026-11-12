@@ -3447,6 +3447,12 @@ def cmd_replay(a, data, path):
         extras += (f" unknown_key={len(audit['unknown_key'])}" if audit.get('unknown_key') else '')
         extras += (f" unsigned={audit['unsigned']}" if audit.get('unsigned') else '')
         print(f"签名验签: verified={audit.get('verified', 0)}/{audit.get('signed', 0)}{extras}")
+        if not audit.get('signed') and audit.get('unsigned'):
+            # 低-2（REVIEW-ef3b962-security）：验签面已配置但整板无签名——剥签重写（hash 链
+            # 自洽、全 unsigned）在「模式混合是常态」口径下不判异常，此处显式提示防误读；
+            # 比对历史 unsigned 基线核验，处置权在持有者（签名不做执法）。
+            print(f"提示：验签面已配置但未检出任何签名（unsigned={audit['unsigned']}）——该板可能从未开启"
+                  "签名，或被整板剥签重写（hash 链自洽无从区分）；比对历史基线核验，签名不做执法")
 
 
 def cmd_archive(a, data, path):

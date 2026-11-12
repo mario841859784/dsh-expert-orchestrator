@@ -1,7 +1,7 @@
 // test/mutation-gate.selftest.mjs — taskboard.py/bus.py 门禁逻辑变异测试族（v2.13 T4，node:test，零依赖）。
 // 署名：qa-test-engineer
 //
-// 目标：证明关键门禁不是「装饰性 if」。对 29 个安全/一致性锚点各注入一个语义变异
+// 目标：证明关键门禁不是「装饰性 if」。对 31 个安全/一致性锚点各注入一个语义变异
 // （mutant），随后运行针对性 probe——probe 只断言「正确行为」；变异被注入后 probe 翻红
 // （抛 AssertionError）即门禁有效（变异被捕获），probe 仍绿即变异逃逸（门禁失效，测试失败）。
 //
@@ -27,12 +27,12 @@ const BUS = join(TOOLS_DIR, 'bus.py')
 const GATED = process.env.DSH_EXPERT_MUTANTS === '1'
 
 // ---------------------------------------------------------------------------
-// 变异登记表：29 点 = taskboard 22 + bus 7。每点：
+// 变异登记表：31 点 = taskboard 24 + bus 7。每点：
 //   id/file/line/anchor/mutant/target/assertion（assertion = probe 断言的门禁名，
 //   变异注入后 probe 抛 AssertionError 即「该门禁被该 probe 捕获」）。
 // ---------------------------------------------------------------------------
 const REGISTRY = [
-  // === taskboard.py（22 点）===
+  // === taskboard.py（24 点，含 M3 签名判定面 2 点）===
   {
     id: 'TB-cas-stale-revision', file: 'taskboard.py', line: 1017,
     anchor: "if er is not None and er != cur:", mutant: "if er is not None and er == cur:",
@@ -155,7 +155,7 @@ const REGISTRY = [
     assertion: 'unrecoverable：被篡改的事件流拒绝读取',
   },
   {
-    id: 'TB-receipt-contract', file: 'taskboard.py', line: 3494,
+    id: 'TB-receipt-contract', file: 'taskboard.py', line: 3500,
     anchor: "    missing = [k for k in required if k not in payload]\n    if missing:",
     mutant: "    if False:",
     target: '_receipt_check：生产回执缺必备字段必须 receipt_invalid + 非零退出',
@@ -173,6 +173,20 @@ const REGISTRY = [
     anchor: "    if count > limit or esc_over:", mutant: "    if False:",
     target: '_review_needs_revision：返工超上限必须 escalated 终态（不再无限 repair）',
     assertion: 'escalated：返工超上限后任务进入终态',
+  },
+  {
+    id: 'TB-event-hash-excludes-sig', file: 'taskboard.py', line: 419,
+    anchor: "return _sha_hex(_canonical({k: v for k, v in ev.items() if k not in ('hash', 'sig')}))",
+    mutant: "return _sha_hex(_canonical({k: v for k, v in ev.items() if k != 'hash'}))",
+    target: 'M3 _event_hash：sig 不进 hash 输入（mutant 下重放把 sig 计入→签名板链校验失败）',
+    assertion: '签名板读命令正常（hash 与 sig 解耦，REVIEW-ef3b962 备案建议：M3 判定面入册）',
+  },
+  {
+    id: 'TB-sig-revoked-first', file: 'taskboard.py', line: 537,
+    anchor: "        if sigkey in revoked:",
+    mutant: "        if False:",
+    target: 'M3 _sig_audit_events：吊销判定优先于公钥面收录（revoked-keys 行=base64 公钥自描述）',
+    assertion: '吊销板 replay 的 audit.revoked 非空（mutant 漏判为 verified）',
   },
   // === bus.py（7 点）===
   {
@@ -225,7 +239,13 @@ const REGISTRY = [
 // ---------------------------------------------------------------------------
 // 通用工具
 // ---------------------------------------------------------------------------
-const PRISTINE = { 'taskboard.py': readFileSync(TB, 'utf-8'), 'bus.py': readFileSync(BUS, 'utf-8') }
+// _ed25519.py 一并进 pristine 面板（M3 签名 probe 的副本 taskboard.py 需 import 同目录
+// vendored 模块；签名逻辑本身不变异——probe 变异点在 taskboard.py 的 hash/吊销判定面）。
+const PRISTINE = {
+  'taskboard.py': readFileSync(TB, 'utf-8'),
+  'bus.py': readFileSync(BUS, 'utf-8'),
+  '_ed25519.py': readFileSync(join(TOOLS_DIR, '_ed25519.py'), 'utf-8'),
+}
 
 /** 临时目录（os.tmpdir，主树零污染；t.after 自动清理）。 */
 const makeDir = (t, label) => {
@@ -234,10 +254,29 @@ const makeDir = (t, label) => {
   return dir
 }
 
-/** 把 pristine 两文件复制进 dir（taskboard watchdog/收件箱检索不 import bus，但一并拷贝零成本）。 */
+/** 把 pristine 三文件复制进 dir（taskboard watchdog/收件箱检索不 import bus，但一并拷贝零成本；
+ *  _ed25519.py 为 M3 签名 probe 的同目录 import 面——pristine 版，签名逻辑本身不变异）。 */
 const deployPristine = (dir) => {
   for (const [name, text] of Object.entries(PRISTINE)) writeFileSync(join(dir, name), text)
   return { tb: join(dir, 'taskboard.py'), bus: join(dir, 'bus.py') }
+}
+
+/** M3 签名 probe 夹具：固定 seed（bytes(range(32))，可复现）+ 公钥面文件 + 1 条签名事件。
+ *  写入经 process.env 直传（probe 同步顺序执行，写后即删私钥面 env；验签面 env 留给读命令）。 */
+const setupSignedBoard = (ctx) => {
+  const seedB64 = Buffer.from(Array.from({ length: 32 }, (_, i) => i)).toString('base64')
+  const pubB64 = spawnSync('python3', ['-c',
+    `import sys, base64; sys.path.insert(0, ${JSON.stringify(TOOLS_DIR)}); import _ed25519; print(base64.b64encode(_ed25519.publickey(base64.b64decode(${JSON.stringify(seedB64)}))).decode())`],
+    { encoding: 'utf-8' }).stdout.trim()
+  assert.equal(pubB64.length, 44, `签名 probe 夹具：公钥应为 32B base64（44 字符），实为 ${pubB64}`)
+  const keysDir = join(ctx.dir, 'sig-keys')
+  mkdirSync(keysDir, { recursive: true })
+  writeFileSync(join(keysDir, 'writer.pub'), pubB64 + '\n')
+  ctx.sigPub = pubB64
+  process.env.DSH_TASKBOARD_SIGN_KEY = seedB64
+  process.env.DSH_TASKBOARD_SIGN_PUBKEY_DIR = keysDir
+  runTb(ctx.dir, ctx.tb, ['create', 'sig-probe'])
+  delete process.env.DSH_TASKBOARD_SIGN_KEY
 }
 
 /** 注入：anchor 恰出现 1 次 → 单点替换为 mutant，写回 tmp 副本。 */
@@ -443,6 +482,20 @@ const PROBES = {
     assert.ok((after.attempt_revoked ?? []).includes('a1'),
       `T4-A-claim-revoke：旧代际 a1 应记入 attempt_revoked，实为 ${JSON.stringify(after.attempt_revoked)}`)
   },
+  'TB-event-hash-excludes-sig': (ctx) => {
+    setupSignedBoard(ctx)
+    const r = runTb(ctx.dir, ctx.tb, ['--json', 'list'])
+    assert.equal(r.code, 0, `T4-A-sig-hash：签名板读命令应正常（mutant 把 sig 计入 hash→重放链校验失败；stdout=${r.stdout.trim()} stderr=${r.stderr.trim()}）`)
+    assert.equal(r.json?.ok, true, `T4-A-sig-hash：--json 信封 ok（stderr=${r.stderr.trim()}）`)
+  },
+  'TB-sig-revoked-first': (ctx) => {
+    setupSignedBoard(ctx)
+    writeFileSync(join(ctx.dir, '.expert-taskboards', 'revoked-keys'), ctx.sigPub + '\n')
+    const r = runTb(ctx.dir, ctx.tb, ['--json', 'replay'])
+    assert.equal(r.code, 0, `T4-A-sig-revoked：replay 应成功（stderr=${r.stderr.trim()}）`)
+    assert.ok((r.json?.data?.sig_audit?.revoked ?? []).length >= 1,
+      `T4-A-sig-revoked：吊销板 audit.revoked 应非空（mutant 漏判为 verified），实为 ${JSON.stringify(r.json?.data?.sig_audit)}`)
+  },
   'TB-event-hash-chain': (ctx) => {
     lifecycle.create(ctx, 'T1')
     const eventsPath = `${boardPath(ctx.dir)}.events.jsonl`
@@ -540,11 +593,11 @@ const PROBES = {
 // ---------------------------------------------------------------------------
 // 主测试
 // ---------------------------------------------------------------------------
-test('T4 变异测试族：taskboard.py/bus.py 门禁逻辑 29 点变异捕获（DSH_EXPERT_MUTANTS=1 启用；署名 qa-test-engineer）',
+test('T4 变异测试族：taskboard.py/bus.py 门禁逻辑 31 点变异捕获（DSH_EXPERT_MUTANTS=1 启用；署名 qa-test-engineer）',
   { skip: GATED ? false : '未设 DSH_EXPERT_MUTANTS=1：变异测试默认关闭（正常跑批不执行注入）' },
   async (t) => {
     await t.test('T4-R0 登记表锚点校验：pristine 源文件 anchor 唯一、mutant≠anchor、登记行号与 anchor 实际起始行精确一致', () => {
-      assert.equal(REGISTRY.length, 29, '登记表应为 29 点（taskboard 22 + bus 7）')
+      assert.equal(REGISTRY.length, 31, '登记表应为 31 点（taskboard 24 + bus 7）')
       const ids = new Set()
       for (const m of REGISTRY) {
         assert.ok(!ids.has(m.id), `登记表 id 重复：${m.id}`); ids.add(m.id)

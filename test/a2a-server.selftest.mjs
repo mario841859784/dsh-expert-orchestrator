@@ -62,7 +62,9 @@ const rpcBody = (id, method, params) =>
   JSON.stringify(id === null ? { jsonrpc: '2.0', method, ...(params ? { params } : {}) } : { jsonrpc: '2.0', id, method, ...(params ? { params } : {}) })
 
 /** 启动服务端（临时端口），解析 stderr 横幅拿 url 与生效 token（生成态取横幅值；env/--token
- * 配置态回读测试侧配置——服务端不回显显式凭证）。 */
+ * 配置态回读测试侧配置——服务端不回显显式凭证）。resolve 条件=LISTEN 行且凭证行到齐
+ * （REVIEW-ef3b962 必改-1②：服务端已把凭证行先于 LISTEN 打印，这里再等齐——负载下
+ * stderr 分块到达也不会在凭证行缺席时 resolve，门禁不再间歇假红）。 */
 const startServer = (t, cwd, { env = {}, args = [] } = {}) => new Promise((resolve, reject) => {
   let settled = false
   const proc = spawn('python3', [A2A, '--port', '0', ...args], { cwd, env: { ...process.env, ...env } })
@@ -72,6 +74,8 @@ const startServer = (t, cwd, { env = {}, args = [] } = {}) => new Promise((resol
     stderr += d.toString()
     const listen = stderr.match(/A2A_LISTEN (\S+)/)
     if (!listen) return
+    const tokenReady = /^A2A_TOKEN /m.test(stderr) // 生成态 a2a-xxx 或 显式态「A2A_TOKEN 来源=…」
+    if (!tokenReady) return
     settled = true
     const generated = (stderr.match(/^A2A_TOKEN (a2a-[0-9a-f]{32})$/m) || [])[1] ?? null
     const fromFlag = (() => { const i = args.indexOf('--token'); return i >= 0 ? args[i + 1] : null })()
@@ -258,6 +262,16 @@ test('M1-message/send 校验面：缺 messageId/非 text part/空标题/taskId �
   assert.equal(own.json.result.metadata['dsh:owner'], 'hermes')
   const board = tb(dir, ['--json', 'show', 'T2'])
   assert.equal(board.json.data.task.owner, 'hermes', 'metadata dsh:owner → create --owner（自报口径）')
+  // 中-2（REVIEW-ef3b962-security）：首行 '-' 开头的标题经 `--` 分隔保护原样落板
+  //（无防护时 argparse 把它当旗标 → 误拒；未来 create 旗标扩展下静默注入）
+  const dash = await post(url, token, rpcBody(8, 'message/send', {
+    message: { role: 'user', messageId: 'm-dash', parts: [{ kind: 'text', text: '-开头的标题行' }] },
+    configuration: { returnImmediately: true },
+  }))
+  assert.equal(dash.status, 200, dash.text)
+  assert.equal(dash.json.result.id, 'T3')
+  const dashBoard = tb(dir, ['--json', 'show', 'T3'])
+  assert.equal(dashBoard.json.data.task.title, '-开头的标题行', `-- 保护后标题字面落板: ${dashBoard.json.data.task.title}`)
 })
 
 test('M1-写面缺省关：message/send 具名拒 writes_disabled；tasks/get 读面不受影响', async (t) => {

@@ -25,3 +25,10 @@ grep 复核：`grep -rn '2\.14\.0'`（排除 node_modules/package-lock）全仓�
 
 ## push / publish
 - 由委派方执行（本任务不 commit / 不 push / 不 publish）。
+
+## 收口记录（2026-11-12）
+
+- 发版提交：b8ca88f（T20），push 859a70f..b8ca88f → origin/main
+- npm publish 成功：dsh-expert-orchestrator@2.14.1（tag latest）
+- registry 实证：dist-tags latest=2.14.1；shasum=c507a1672e2915355782440f86bca3020ac565ab
+- 测试对账：npm test 612/610 pass/0 fail/2 skipped + mutation gate 31/31（专家+编排者双跑一致）

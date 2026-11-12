@@ -198,29 +198,35 @@ test('方向3-lib 检测器：累计达阈告警、每次达阈失败都告警�
 
 // ── 升级信封形状契约（方向 3 收口 #4）────────────────────────────────────────
 
-test('方向3-信封形状契约：四通道提示级键统一【升级｜通道｜级别】现状：…建议：…+不阻断尾行', () => {
-  // 提示级通道（尾行恒「本提示不阻断。」）；执行级（fail-loop 工具升级行，taskboard.py
-  // print）不带尾行，由方向3-b 用例断言 stdout。
+test('方向3-信封形状契约：四通道提示级键按语言分别断言（zh【升级｜通道｜级别】现状：…建议：…+不阻断尾行；en [ESCALATION|channel|level] Status:…Suggestion:…+不阻断尾行）', () => {
+  // 提示级通道（尾行恒不阻断：zh「本提示不阻断。」/en「This notice does not block.」）；
+  // 执行级（fail-loop 工具升级行，taskboard.py print）不带尾行，由方向3-b 用例断言 stdout。
   const ENVELOPE_KEYS = [
-    ['oscillation.warning', { a: 'A', b: 'B', roundTrips: 3, threshold: 3, run: 7 }, '振荡', '告警'],
-    ['failloop.summon', { name: '甲', count: 3, threshold: 3 }, '连续失败', '告警'],
-    ['budget.alarm', { who: '甲', count: 11, threshold: 10 }, '预算', '告警档'],
-    ['budget.wrapup', { who: '甲', count: 24, threshold: 24 }, '预算', '收尾档'],
-    ['budget.interrupt', { who: '甲', count: 31, threshold: 30 }, '预算', '中断档'],
-    ['cost.budgetExceeded', { used: '5K', budget: '3K' }, '成本', '熔断'],
+    // [key, params, zhTag, enTag]
+    ['oscillation.warning', { a: 'A', b: 'B', roundTrips: 3, threshold: 3, run: 7 }, '【升级｜振荡｜告警】', '[ESCALATION|oscillation|alarm]'],
+    ['failloop.summon', { name: '甲', count: 3, threshold: 3 }, '【升级｜连续失败｜告警】', '[ESCALATION|consecutive-failures|alarm]'],
+    ['budget.alarm', { who: '甲', count: 11, threshold: 10 }, '【升级｜预算｜告警档】', '[ESCALATION|budget|alarm]'],
+    ['budget.wrapup', { who: '甲', count: 24, threshold: 24 }, '【升级｜预算｜收尾档】', '[ESCALATION|budget|wrap-up]'],
+    ['budget.interrupt', { who: '甲', count: 31, threshold: 30 }, '【升级｜预算｜中断档】', '[ESCALATION|budget|interrupt]'],
+    ['cost.budgetExceeded', { used: '5K', budget: '3K' }, '【升级｜成本｜熔断】', '[ESCALATION|cost|circuit-break]'],
   ]
-  for (const [key, params, channel, level] of ENVELOPE_KEYS) {
-    for (const lang of ['zh', 'en']) {
-      const line = msg(key, lang, params)
-      assert.ok(line.startsWith(`【升级｜${channel}｜${level}】`), `${key}/${lang} tag 形状：${line}`)
-      assert.ok(line.includes('现状：'), `${key}/${lang} 现状槽位在列：${line}`)
-      assert.ok(line.includes('建议：'), `${key}/${lang} 建议槽位在列：${line}`)
-      assert.ok(line.endsWith('本提示不阻断。'), `${key}/${lang} 提示级尾行：${line}`)
-    }
+  for (const [key, params, zhTag, enTag] of ENVELOPE_KEYS) {
+    const zhLine = msg(key, 'zh', params)
+    assert.ok(zhLine.startsWith(zhTag), `${key}/zh tag 形状：${zhLine}`)
+    assert.ok(zhLine.includes('现状：'), `${key}/zh 现状槽位在列：${zhLine}`)
+    assert.ok(zhLine.includes('建议：'), `${key}/zh 建议槽位在列：${zhLine}`)
+    assert.ok(zhLine.endsWith('本提示不阻断。'), `${key}/zh 提示级尾行：${zhLine}`)
+    const enLine = msg(key, 'en', params)
+    assert.ok(enLine.startsWith(enTag), `${key}/en tag 形状（本地化英文等价）：${enLine}`)
+    assert.ok(enLine.includes('Status:'), `${key}/en 现状槽位在列：${enLine}`)
+    assert.ok(enLine.includes('Suggestion:'), `${key}/en 建议槽位在列：${enLine}`)
+    assert.ok(enLine.endsWith('This notice does not block.'), `${key}/en 提示级尾行：${enLine}`)
   }
-  // 非升级行不进信封（契约违规提示与遥测行维持既有形态）
+  // 非升级行不进信封（契约违规提示与遥测行维持既有形态，zh/en 两语均不动）
   assert.ok(msg('budget.contractViolation', 'zh', { id: 'T1', hint: 'h' }).startsWith('【预算】'))
   assert.ok(msg('cost.batchSummary', 'zh', { summons: 1, ok: 1, fail: 0, sum: '5K', budget: '10 tok' }).startsWith('【成本】'))
+  assert.ok(msg('budget.contractViolation', 'en', { id: 'T1', hint: 'h' }).startsWith('【预算】'))
+  assert.ok(msg('cost.batchSummary', 'en', { summons: 1, ok: 1, fail: 0, sum: '5K', budget: '10 tok' }).startsWith('【成本】'))
 })
 
 test('方向3-lib summon 真链路：同一专家连续 3 次召唤失败第 3 次附【升级｜连续失败｜告警】信封行，成功重置，开关关闭零变化', async (t) => {

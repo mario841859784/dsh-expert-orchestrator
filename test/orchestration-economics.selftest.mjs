@@ -128,7 +128,7 @@ test('方向2 costBudgetHint：未达阈值零变化、达阈值出提示、双�
   assert.ok(zh.includes('5K') && zh.includes('3K'), zh)
   assert.ok(zh.includes('不阻断'), zh)
   const en = costBudgetHint(totals, 3000, 'en')
-  assert.ok(en.startsWith('【升级｜成本｜熔断】') && en.includes('本提示不阻断'), en)
+  assert.ok(en.startsWith('[ESCALATION|cost|circuit-break]') && en.includes('This notice does not block'), en)
 })
 
 // ── 三档偏好路由（expert-profiles）───────────────────────────────────────────

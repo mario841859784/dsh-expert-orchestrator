@@ -4,7 +4,8 @@
 //      （HEAD=a1e46b4 原文逐字复制）断言——硬契约，含 effort model 降级告警；
 //   ② lang 归一：仅精确 'en' 生效英文，非法/缺失（'EN'/'zh-Hans'/undefined/''）
 //      一律降级 zh（与 resolveReplyLanguage 降级口径一致），绝不 throw；
-//   ③ en 语料：全量 key 双语完整性 + en 输出英文且【】tag 保持中文原字面；
+//   ③ en 语料：全量 key 双语完整性 + 非信封键 en 输出英文且【】tag 保持中文原字面；
+//      升级信封六键 en 面整体本地化（tag+槽位字面均为英文等价，T1 评审裁决）；
 //   ④ producer 级 lang 参数：withLessonHint / buildResumePrompt /
 //      preflightEffort / budgetNoticeFromEnvelope / createOscillationDetector /
 //      autoClaimSummonedTasks（skipLocate 路径，tmp cwd 无板）en 生效、缺省 zh；
@@ -83,11 +84,11 @@ test('T9 ① zh 逐字节：预算三档 + 契约违规行', () => {
   })
   // 三档原文（lib/budget.js 收口前字面量，含全角标点与空格）
   assert.equal(budgetNoticeFromEnvelope(envelope('interrupt', { interrupt: 30 }, 31), 'w'),
-    '【预算】w 在本任务的执行面调用已达硬预算（31/30，interrupt 档）——推进类调用（claim/progress/heartbeat/own）会被拒；交付出口 done/fail 仍开放。请让该专家立即收尾交付，或改派他人 / budget --reset 显式重置（编排者裁决）')
+    '【升级｜预算｜中断档】现状：w 在本任务的执行面调用已达硬预算（31/30，跨 attempt/续领累计）——推进类调用（claim/progress/heartbeat/own）此后当场被拒，交付出口 done/fail 仍开放。建议：让该专家立即收尾交付，或改派他人 / budget --reset 显式重置（编排者裁决）。本提示不阻断。')
   assert.equal(budgetNoticeFromEnvelope(envelope('wrap-up', { 'wrap-up': 24 }, 24), 'w'),
-    '【预算】w 在本任务已计入 24/24 次执行面调用（wrap-up 收尾档）——任务书须要求立即收敛交付，勿再展开新阶段')
+    '【升级｜预算｜收尾档】现状：w 在本任务已计入 24/24 次执行面调用。建议：任务书须要求立即收敛交付（尽快 done/fail），勿再展开新阶段。本提示不阻断。')
   assert.equal(budgetNoticeFromEnvelope(envelope('alarm', { alarm: 10 }, 11), 'w'),
-    '【预算】w 在本任务已计入 11/10 次执行面调用（alarm 告警档）——注意调用开销，保持收敛')
+    '【升级｜预算｜告警档】现状：w 在本任务已计入 11/10 次执行面调用。建议：注意调用开销，保持收敛。本提示不阻断。')
   assert.equal(msg('budget.contractViolation', 'zh', { id: 'T1', hint: 'missing data' }),
     '【预算】T1 任务板回执契约违规：missing data')
 })
@@ -97,7 +98,7 @@ test('T9 ① zh 逐字节：振荡告警 + 自动续领全路径行', () => {
   let out = ''
   for (let i = 0; i < 7; i++) out = det.record(i % 2 === 0 ? 'A' : 'B') ?? out
   assert.equal(out,
-    '【振荡告警】检测到「A」与「B」之间已交替派工 3 次来回（阈值 3；近 7 次委派呈 A↔B 交替）——请核对任务分解：方案分歧应先收敛裁决（评审/PM 检查点/用户裁决），而不是在两位专家间反复横跳返工。本告警不阻断派工。')
+    '【升级｜振荡｜告警】现状：「A」与「B」之间已交替派工 3 次来回（阈值 3；近 7 次委派呈 A↔B 交替，典型成因是方案分歧未收敛就反复返工）。建议：方案分歧先收敛裁决（评审/PM 检查点/用户裁决），勿在两位专家间反复横跳；同段同对只告警一次，第三个名字打断后重臂。本提示不阻断。')
   assert.equal(msg('reclaim.contractViolation', 'zh', { hint: 'missing ok' }),
     '【自动续领】任务板回执契约违规：missing ok，本轮跳过')
   assert.equal(msg('reclaim.writeTimeout', 'zh', { timeoutMs: 8000 }),
@@ -169,7 +170,7 @@ test('T9 ② lang 归一：仅精确 en 生效英文，其余降级 zh；normali
 
 // ---------- ③ en 语料完整性（全量 key 双语 + tag 原字面）----------
 
-test('T9 ③ en 完整性：全量 key 双语齐备、en 输出含英文且【】tag 保持中文原字面', () => {
+test('T9 ③ en 完整性：全量 key 双语齐备；非信封键 en【】tag 保持中文原字面；升级信封六键 en 面整体本地化英文等价', () => {
   const keys = messageKeys()
   assert.ok(keys.length >= 30, `字典应覆盖全部收口行（实测 ${keys.length}）`)
   for (const key of keys) {
@@ -180,12 +181,11 @@ test('T9 ③ en 完整性：全量 key 双语齐备、en 输出含英文且【�
     assert.ok(typeof en === 'string' && en.length > 0, `${key} en 应为非空串`)
     assert.notEqual(zh, en, `${key} en 不应照抄 zh`)
   }
-  // 抽样：【】tag 保持中文原字面（协议标记稳定性）
+  // 抽样：非信封键【】tag 保持中文原字面（协议标记稳定性）；升级信封键 en 面为
+  // 本地化英文等价 tag（[ESCALATION|<channel>|<level>]，T1 评审裁决 en 不留中文字面）
   const tagSamples = [
     ['lesson.header', {}, '【经验提示'],
     ['autoclaim.skipLocate', { reason: 'r', ids: 'T1' }, '【auto-claim 跳过】'],
-    ['budget.interrupt', { who: 'w', count: 1, threshold: 1 }, '【预算】'],
-    ['oscillation.warning', { a: 'A', b: 'B', roundTrips: 3, threshold: 3, run: 7 }, '【振荡告警】'],
     ['reclaim.claimed', { id: 'T1', owner: 'o', board: 'b' }, '【自动续领】'],
     ['resume.header', {}, '【断点续跑】'],
     ['lock.degraded', {}, '【per-cwd 写锁降级】'],
@@ -193,13 +193,25 @@ test('T9 ③ en 完整性：全量 key 双语齐备、en 输出含英文且【�
   for (const [key, params, tag] of tagSamples) {
     assert.ok(msg(key, 'en', params).startsWith(tag), `${key} en 应以中文 tag「${tag}」开头`)
   }
+  const envelopeTagSamples = [
+    ['budget.interrupt', { who: 'w', count: 1, threshold: 1 }, '[ESCALATION|budget|interrupt]'],
+    ['budget.wrapup', { who: 'w', count: 1, threshold: 1 }, '[ESCALATION|budget|wrap-up]'],
+    ['budget.alarm', { who: 'w', count: 1, threshold: 1 }, '[ESCALATION|budget|alarm]'],
+    ['oscillation.warning', { a: 'A', b: 'B', roundTrips: 3, threshold: 3, run: 7 }, '[ESCALATION|oscillation|alarm]'],
+    ['cost.budgetExceeded', { used: '5K', budget: '3K' }, '[ESCALATION|cost|circuit-break]'],
+    ['failloop.summon', { name: 'x', count: 3, threshold: 3 }, '[ESCALATION|consecutive-failures|alarm]'],
+  ]
+  for (const [key, params, tag] of envelopeTagSamples) {
+    assert.ok(msg(key, 'en', params).startsWith(tag), `${key} en 应以英文等价 tag「${tag}」开头`)
+    assert.ok(!msg(key, 'en', params).includes('【'), `${key} en 面不应保留中文【】字面`)
+  }
   // 抽样 5 条 en 语料语义对照 zh（行动指令保留）：
   assert.equal(msg('claim.taken', 'en', { tag: 'auto-claim', id: 'T1', owner: 'w' }),
     '【auto-claim】T1 already has owner=w; not overwriting, claim skipped')
   assert.equal(msg('autoclaim.truncated', 'en', { total: 10, max: 8, ids: 'T1', joined: 'x' }),
     '【auto-claim】10 task ids in total, exceeding the cap of 8; only the first 8 will be claimed (T1) — claim the rest manually per the protocol; x')
   assert.equal(msg('budget.interrupt', 'en', { who: 'w', count: 31, threshold: 30 }),
-    '【预算】w has reached the hard tool-call budget on this task (31/30, interrupt tier) — advancing calls (claim/progress/heartbeat/own) will be rejected; the delivery exits done/fail remain open. Have this expert wrap up and deliver immediately, or reassign the task / reset explicitly via budget --reset (orchestrator\'s call)')
+    '[ESCALATION|budget|interrupt] Status: w has reached the hard tool-call budget on this task (31/30, cumulative across attempts/reclaims) — advancing calls (claim/progress/heartbeat/own) will now be rejected on the spot; the delivery exits done/fail remain open. Suggestion: have this expert wrap up and deliver immediately, or reassign the task / reset explicitly via budget --reset (orchestrator\'s call). This notice does not block.')
   assert.ok(msg('reclaim.boardNotIdle', 'en').endsWith('board_not_idle'))
   assert.ok(msg('resume.progressEmpty', 'en').includes('checkpoint'), 'en 无清单行保留「先落检查点」行动指令')
 })
@@ -221,13 +233,13 @@ test('T9 ④ producer en：withLessonHint / buildResumePrompt / preflightEffort 
     ok: true, cmd: 'budget',
     data: { task: 'T1', budget: { enabled: true, thresholds: { alarm: 10 }, budgets: [{ owner: 'w', count: 11, tier: 'alarm' }] } },
   }, 'w', 'en')
-  assert.ok(bud.startsWith('【预算】'))
-  assert.ok(bud.includes('alarm tier'))
+  assert.ok(bud.startsWith('[ESCALATION|budget|alarm]'), 'en 信封 tag 本地化英文等价')
+  assert.ok(bud.includes('has used 11/10 tool calls'))
   const det = createOscillationDetector({ threshold: 3 })
   let out = ''
   for (let i = 0; i < 7; i++) out = det.record(i % 2 === 0 ? 'A' : 'B', 'en') ?? out
-  assert.ok(out.startsWith('【振荡告警】'))
-  assert.ok(out.includes('alternating dispatch between "A" and "B"'))
+  assert.ok(out.startsWith('[ESCALATION|oscillation|alarm]'), 'en 信封 tag 本地化英文等价')
+  assert.ok(out.includes('round-trips of dispatch (threshold 3'))
   // 非法 lang 降级 zh：producer 级同样只认精确 'en'
   assert.equal(preflightEffort({ profile: { model: 'm' }, providerName: 'p', lang: 'EN' }).warnings[0],
     '专家档案 model=m 未生效：provider "p" 未声明 agentOptions 能力（旧代宿主，降级可见）')

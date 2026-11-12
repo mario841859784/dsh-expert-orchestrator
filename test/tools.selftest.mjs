@@ -7268,7 +7268,7 @@ test('T26 振荡检测单元：交替段来回数推导/阈值告警/段内一�
   const seq = ['甲', '乙', '甲', '乙', '甲', '乙']
   assert.ok(seq.every((n) => d.record(n) === null), '前 6 次不告警')
   const warn = d.record('甲')
-  assert.ok(warn && warn.includes('【振荡告警】'), '第 7 次（3 来回）告警（验收 (e)）')
+  assert.ok(warn && warn.includes('【升级｜振荡｜告警】'), '第 7 次（3 来回）告警（验收 (e)）')
   assert.ok(warn.includes('甲') && warn.includes('乙'))
   assert.ok(warn.includes('3 次来回'))
   assert.equal(d.record('乙'), null, '同段同对只告警一次')
@@ -7278,7 +7278,7 @@ test('T26 振荡检测单元：交替段来回数推导/阈值告警/段内一�
   const seq2 = ['甲', '乙', '甲', '乙', '甲', '乙']
   assert.ok(seq2.slice(0, 6).every((n) => d.record(n) === null))
   const warn2 = d.record('甲')
-  assert.ok(warn2 && warn2.includes('【振荡告警】'), '新段重臂后再告警')
+  assert.ok(warn2 && warn2.includes('【升级｜振荡｜告警】'), '新段重臂后再告警')
   // 低阈值：N=2 → 第 5 次交替派发即告警
   const d2 = createOscillationDetector({ threshold: 2 })
   ;['甲', '乙', '甲', '乙'].forEach((n) => assert.equal(d2.record(n), null))
@@ -7295,7 +7295,7 @@ test('T26 #22 (e) 真实 summon 面 E2E：甲↔乙交替派工达阈值 → 告
     results.push(r.answer)
   }
   assert.ok(results.slice(0, 4).every((a) => !a.includes('振荡告警')), '前 4 次（1 来回）无告警')
-  assert.ok(results[4].includes('【振荡告警】'), '第 5 次（2 来回，N=2）告警附 answer 尾')
+  assert.ok(results[4].includes('【升级｜振荡｜告警】'), '第 5 次（2 来回，N=2）告警附 answer 尾')
   assert.ok(results[4].includes('不阻断'), '告警语义非阻断')
   // 开关关闭：registerExpertTools 不建记录器 → 零告警
   process.env.DSH_EXPERT_OSCILLATION = '0'
@@ -7790,11 +7790,11 @@ test('T27 #16 JS 消费面：budgetNoticeFromEnvelope 三档翻译/未启用/坏
   const th = { alarm: 200, 'wrap-up': 250, interrupt: 300 }
   // 三档文案（owner 命中才提示；档位语义与 taskboard.py 一一对应）
   const alarm = budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 200, tier: 'alarm' }] }), '后端工程师')
-  assert.ok(alarm.includes('【预算】') && alarm.includes('alarm 告警档') && alarm.includes('200/200'))
+  assert.ok(alarm.includes('【升级｜预算｜告警档】') && alarm.includes('200/200'))
   const wrap = budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 250, tier: 'wrap-up' }] }), '后端工程师')
-  assert.ok(wrap.includes('wrap-up 收尾档') && wrap.includes('立即收敛'))
+  assert.ok(wrap.includes('【升级｜预算｜收尾档】') && wrap.includes('立即收敛'))
   const interrupt = budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 301, tier: 'interrupt' }] }), '后端工程师')
-  assert.ok(interrupt.includes('interrupt 档') && interrupt.includes('done/fail 仍开放') && interrupt.includes('--reset'))
+  assert.ok(interrupt.includes('【升级｜预算｜中断档】') && interrupt.includes('done/fail 仍开放') && interrupt.includes('--reset'))
   // 未达档/owner 不匹配/未启用/坏信封 → ''（零变化 fail-open）
   assert.equal(budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '后端工程师', count: 3, tier: null }] }), '后端工程师'), '')
   assert.equal(budgetNoticeFromEnvelope(mk({ enabled: true, thresholds: th, epoch: 0, stamped: null, budgets: [{ owner: '甲', count: 300, tier: 'interrupt' }] }), '后端工程师'), '')
@@ -7822,7 +7822,7 @@ test('T27 #16 summonBudgetHint：预算开启时消费 budget --json 信封产�
   // 板唯一定位 + 显式 id：达档 owner 命中 → 提示行（计数 3=claim+2 progress，2=WRAPUP → wrap-up 档；
   // env 显式注入——生产路径读 process.env，runTaskboard 同 env 贯通到子进程）
   const on = await summonBudgetHint('继续推进 T1', '后端工程师', dir, 15000, th)
-  assert.ok(on.includes('【预算】') && on.includes('wrap-up 收尾档'), on)
+  assert.ok(on.includes('【升级｜预算｜收尾档】'), on)
   // 预算关闭（默认态）：零提示
   const off = await summonBudgetHint('继续推进 T1', '后端工程师', dir, 15000)
   assert.equal(off, '')
@@ -7832,7 +7832,7 @@ test('T27 #16 summonBudgetHint：预算开启时消费 budget --json 信封产�
   assert.equal(await summonBudgetHint('T999 继续', '后端工程师', dir, 15000, th), '')
 })
 
-test('T27 #16 summon 接线 E2E：告警档续派附【预算】提示行（answer 尾，非阻断）；预算关闭零提示', async (t) => {
+test('T27 #16 summon 接线 E2E：收尾档续派附【升级｜预算】信封行（answer 尾，非阻断）；预算关闭零提示', async (t) => {
   guardT26Env(t)
   guardT27BudgetEnv(t)
   const f = makeT26Fixture(t, 'budget-e2e')
@@ -7844,22 +7844,22 @@ test('T27 #16 summon 接线 E2E：告警档续派附【预算】提示行（answ
   assert.equal(tb(['claim', 'T1', '甲']).status, 0)
   assert.equal(tb(['progress', 'T1', 'p1'], th).status, 0)
   assert.equal(tb(['progress', 'T1', 'p2'], th).status, 0) // 计数 3=claim+2 progress，2=WRAPUP → 收尾档
-  // 预算开启：summon 续派（任务书引用 T1）→ answer 尾附【预算】提示行
+  // 预算开启：summon 续派（任务书引用 T1）→ answer 尾附【升级｜预算】信封行
   process.env.DSH_EXPERT_TOOL_BUDGET = th.DSH_EXPERT_TOOL_BUDGET
   process.env.DSH_EXPERT_TOOL_BUDGET_ALARM = th.DSH_EXPERT_TOOL_BUDGET_ALARM
   process.env.DSH_EXPERT_TOOL_BUDGET_WRAPUP = th.DSH_EXPERT_TOOL_BUDGET_WRAPUP
   process.env.DSH_EXPERT_TOOL_BUDGET_INTERRUPT = th.DSH_EXPERT_TOOL_BUDGET_INTERRUPT
   try {
     const r = await f.summon.execute({ expert: '甲', task: '请继续 T1 的收尾工作' }, { agent: {} })
-    assert.ok(r.answer.includes('【预算】'), r.answer)
-    assert.ok(r.answer.includes('wrap-up 收尾档'), r.answer)
+    assert.ok(r.answer.includes('【升级｜预算｜收尾档】'), r.answer)
+    assert.ok(r.answer.includes('立即收敛交付'), r.answer)
     assert.ok(r.answer.includes('【auto-claim】'), 'auto-claim 提示行共存（同通道）')
   } finally {
     for (const k of BUDGET_ENV_KEYS) delete process.env[k]
   }
   // 预算关闭：同任务续派零提示（默认态零变化）
   const r2 = await f.summon.execute({ expert: '甲', task: '请继续 T1 的收尾工作' }, { agent: {} })
-  assert.ok(!r2.answer.includes('【预算】'), r2.answer)
+  assert.ok(!r2.answer.includes('【升级｜预算'), r2.answer)
   assert.ok(r2.answer.includes('【auto-claim】'), 'auto-claim 行为不受影响')
 })
 

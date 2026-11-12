@@ -1920,7 +1920,9 @@ def cmd_fail(a, data, path):
                 _EVT_CTX['args']['fail_streak'] = streak
                 save(path, data)
                 show(t)
-                print(f'已自动升级：连续失败 {streak}/{limit} 次（fail-loop）——唯一出口=用户显式 retry（重置 fail_streak）')
+                # 方向 3 收口 #4：升级行收口进统一信封格式（执行级——状态迁移已由本命令完成，
+                # 故不带「本提示不阻断」尾行；格式规范见 SKILL.md §3 升级信封段）。
+                print(f'【升级｜连续失败｜升级】现状：任务 {a.id} 连续失败 {streak}/{limit} 次（fail_streak 跨 retry 累计），已自动转 escalated。建议：唯一出口=用户显式 retry（重置 fail_streak）；上报用户须附升级报告三要素（现状/已尝试/建议选项）。')
                 return
             t['fail_streak'] = streak
     t['status'] = 'failed'

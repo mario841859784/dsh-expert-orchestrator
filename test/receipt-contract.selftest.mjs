@@ -286,5 +286,5 @@ test('T2-C5 消费端预算面不回归：budgetNoticeFromEnvelope 对缺字段�
     ok: true, cmd: 'budget',
     data: { task: 'T1', budget: { enabled: true, thresholds: { alarm: 10 }, budgets: [{ owner: 'w', count: 11, tier: 'alarm' }] } },
   }, 'w')
-  assert.ok(hit.includes('【预算】w'))
+  assert.ok(hit.includes('【升级｜预算｜告警档】现状：w'))
 })

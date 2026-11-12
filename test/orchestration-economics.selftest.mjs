@@ -124,11 +124,11 @@ test('方向2 costBudgetHint：未达阈值零变化、达阈值出提示、双�
   assert.equal(costBudgetHint(totals, 10000, 'zh'), '', '未达阈值=空串（零变化）')
   assert.equal(costBudgetHint(totals, null, 'zh'), '', '未开启=空串')
   const zh = costBudgetHint(totals, 3000, 'zh')
-  assert.ok(zh.startsWith('【成本】'), zh)
+  assert.ok(zh.startsWith('【升级｜成本｜熔断】'), zh)
   assert.ok(zh.includes('5K') && zh.includes('3K'), zh)
   assert.ok(zh.includes('不阻断'), zh)
   const en = costBudgetHint(totals, 3000, 'en')
-  assert.ok(en.startsWith('【成本】') && en.includes('does not block'), en)
+  assert.ok(en.startsWith('[ESCALATION|cost|circuit-break]') && en.includes('This notice does not block'), en)
 })
 
 // ── 三档偏好路由（expert-profiles）───────────────────────────────────────────
@@ -181,7 +181,7 @@ test('方向2 resolveExpertModel pref 优先级：per-expert/组层压过偏好�
 
 // ── lib/tools.js 接线（真 summon 链路）────────────────────────────────────────
 
-test('方向2 summon_expert 成本提示：DSH_EXPERT_TOKEN_BUDGET 开启达阈值附【成本】，关闭零变化', async (t) => {
+test('方向2 summon_expert 成本熔断：DSH_EXPERT_TOKEN_BUDGET 开启达阈值附【升级｜成本｜熔断】信封行，关闭零变化', async (t) => {
   guardEconEnv(t)
   const f = makeRosterFixture(t, 'cost-hint')
   const { descriptors, ctx } = makeSummonCtx({ capabilities: { agentOptions: true } })
@@ -190,13 +190,13 @@ test('方向2 summon_expert 成本提示：DSH_EXPERT_TOKEN_BUDGET 开启达阈�
   // 阈值 10 token：任务书+回包+origin-chain 标记行（ASCII ≈20 tok）合计首召即达阈
   process.env.DSH_EXPERT_TOKEN_BUDGET = '0.01'
   const r1 = await summon.execute({ expert: '测试专家', task: '这是首次召唤的任务书正文' }, { agent: {} })
-  assert.ok(r1.answer.includes('【成本】'), `累计达阈应提示：${r1.answer}`)
+  assert.ok(r1.answer.includes('【升级｜成本｜熔断】'), `累计达阈应提示：${r1.answer}`)
   assert.ok(r1.answer.includes('不阻断'), r1.answer)
   assert.ok(r1.answer.startsWith('ok0'), '提示行附在 answer 尾部，正文前置不动')
-  // 关闭（删除 env）→ 零变化：无【成本】行
+  // 关闭（删除 env）→ 零变化：无升级信封成本行
   delete process.env.DSH_EXPERT_TOKEN_BUDGET
   const r3 = await summon.execute({ expert: '测试专家', task: '关闭开关后的第三次召唤' }, { agent: {} })
-  assert.ok(!r3.answer.includes('【成本】'), '开关关闭=提示行零变化')
+  assert.ok(!r3.answer.includes('【升级｜成本'), '开关关闭=提示行零变化')
 })
 
 test('方向2 summon_expert 路由偏好：env 激活按档取 model、per-expert 压过偏好、关闭零变化', async (t) => {

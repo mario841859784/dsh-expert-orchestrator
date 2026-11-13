@@ -39,6 +39,12 @@
 # DSH_TASKBOARD_A2A_WRITES=1 opt-in 才暴露（缺省具名拒 writes_disabled）；外部写入=
 # 代理转达的板面变更，审计走 CLI 事件流自报口径（create 回执带 event_seq/revision 对账锚点，
 # A2A task.metadata 以 dsh:* 键回显）。单向导出：不提供任何「召唤专家」入口。
+#
+# MVP 已知边界（REVIEW-ef3b962 建议5 / 安全低-4，如实记录不隐瞒）：
+# - 阻塞轮询每 0.5s spawn 一次 taskboard show 子进程，--block-max-sec 300s 上限=单请求最多
+#   600 次 spawn（子进程有 board flock 串行化不破坏数据；后续可改事件文件 mtime 长轮询或常驻读面）；
+# - ThreadingHTTPServer 每连接一线程且无并发上限——持合法 token 者可并发开大量阻塞 send
+#   耗尽线程/进程表（缓解：bearer 恒开 + 回环缺省 + 1MB 体上限；并发信号量/速率上限留后续）。
 import argparse
 import hmac
 import json
@@ -240,8 +246,11 @@ class A2ABoardServer:
         except _RpcError as e:
             return e.http_status, {'jsonrpc': '2.0', 'id': rid, 'error': e.envelope()}
         except Exception as e:  # 兜底：绝不裸 traceback，统一 InternalError
+            # 低-1（REVIEW-ef3b962-security）：回包只给异常类型名——异常消息可能携带板文件
+            # 绝对路径等本机信息，落 stderr（服务端日志面）不回调用方（bearer 后可达者也不外泄）。
+            print(f'a2a: internal error（id={rid}）: {type(e).__name__}: {e}', file=sys.stderr)
             return 500, {'jsonrpc': '2.0', 'id': rid,
-                         'error': {'code': ERR_INTERNAL, 'message': f'internal error: {type(e).__name__}: {e}'}}
+                         'error': {'code': ERR_INTERNAL, 'message': f'internal error: {type(e).__name__}'}}
 
     def _handle(self, method, params):
         if method == 'message/send':
@@ -288,7 +297,7 @@ class A2ABoardServer:
         for src in (params.get('metadata'), message.get('metadata')):
             if isinstance(src, dict):
                 meta.update(src)
-        argv = ['--json', 'create', title]
+        argv = ['--json', 'create']
         owner = meta.get('dsh:owner')
         if isinstance(owner, str) and owner.strip():
             argv += ['--owner', owner.strip()]
@@ -299,11 +308,20 @@ class A2ABoardServer:
             argv += ['--scope', scope.strip()]
         elif isinstance(scope, list) and scope:
             argv += ['--scope', ','.join(str(s).strip() for s in scope if str(s).strip())]
+        # 中-2（REVIEW-ef3b962-security）：title 是网络不可信输入直达子进程 positional 的
+        # 唯一点——`--` 分隔符钉死「此后恒为 positional」，选项旗标拼接（如标题 '--auto-ready'
+        # 改写任务语义）永不成立；`--` 后不得再跟选项，故 title 恒放 argv 末位。
+        argv += ['--', title]
         r = self.mtb.run_taskboard(argv)
         receipt = self.mtb.parse_receipt(r['stdout'])
         if r['code'] != 0:
-            detail = receipt if receipt else (r['stderr'] or r['stdout']).strip()
-            raise _RpcError(ERR_INVALID_PARAMS, f'taskboard 拒绝（exit {r["code"]}）：{json.dumps(detail, ensure_ascii=False) if isinstance(detail, dict) else detail}',
+            # 低-1（REVIEW-ef3b962-security）：具名错误信封（调用方可操作）全透传；stderr
+            # 人读文本截断 200 字符（防板路径等本机信息长回显；具名面不受影响）。
+            if receipt is not None:
+                detail = json.dumps(receipt, ensure_ascii=False)
+            else:
+                detail = (r['stderr'] or r['stdout']).strip()[:200]
+            raise _RpcError(ERR_INVALID_PARAMS, f'taskboard 拒绝（exit {r["code"]}）：{detail}',
                             http_status=200)
         if not isinstance(receipt, dict) or not receipt.get('ok'):
             raise _RpcError(ERR_INTERNAL, 'taskboard 回执不可解析（无 --json 信封）', http_status=200)
@@ -542,15 +560,18 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
 
-    # 启动横幅（stderr；stdout 保持干净）。token 仅生成态回显——显式提供不回显（不放大秘密面）。
-    print(f'A2A_LISTEN {card_url}', file=sys.stderr)
-    print(f'A2A_PROTOCOL {PROTOCOL_VERSION}（message/send 同步 + tasks/get 轮询；streaming/push 照实 false）', file=sys.stderr)
+    # 启动横幅（stderr；stdout 保持干净）。凭证行先于 LISTEN 暴露点打印（REVIEW-ef3b962
+    # 必改-1①：「凭证先于暴露」叙事 + 测试 helper 在 LISTEN 出现即 resolve，凭证行必须
+    # 已在更早 chunk——否则负载下 resolve 时缺 token 行，门禁间歇假红）。token 仅生成态
+    # 回显——显式提供不回显（不放大秘密面）。
     if token_generated:
         print(f'A2A_TOKEN {token}', file=sys.stderr)
         print('A2A_TOKEN_NOTE 凭证为启动生成（未配置 DSH_TASKBOARD_A2A_TOKEN）——请带外交给调用方；'
               '重启即轮换，需固定凭证请以 env/--token 提供', file=sys.stderr)
     else:
         print('A2A_TOKEN 来源=env/--token（不回显）', file=sys.stderr)
+    print(f'A2A_LISTEN {card_url}', file=sys.stderr)
+    print(f'A2A_PROTOCOL {PROTOCOL_VERSION}（message/send 同步 + tasks/get 轮询；streaming/push 照实 false）', file=sys.stderr)
     print(f'A2A_WRITES {"open（message/send 可写）" if writes_on else "closed（缺省只读；message/send 具名拒 writes_disabled，DSH_TASKBOARD_A2A_WRITES=1 开）"}', file=sys.stderr)
     print(f'A2A_BOARD {board or "（沿 taskboard.py 缺省：<cwd> 板）"}', file=sys.stderr)
     print(f'A2A_BLOCK_MAX_SEC {block_max}', file=sys.stderr)

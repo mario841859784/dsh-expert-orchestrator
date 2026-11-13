@@ -4258,12 +4258,13 @@ test('RESUMABLE_STOP_REASONS 冻结：仅 error/max-tokens 可续跑；aborted/r
 })
 
 // ── dsh-expert-291 T1：alpha.2 startActivation 新轨（注册守卫/发射/seam 探测式
-//    双轨）。宿主契约以 0.2.1-alpha.2 宿主源码实证为准：SubagentRuntime 无
-//    start/startContinuable；startActivation(spec)（:3032，spec 顶层 provider/
-//    label/signal，request 内嵌，返回 receipt { childId, result, dispose }）；
-//    sendMessage(sender, targetId, content, options)（:3068）；回收面 drainChildren
-//    （:3129）；spawn provider 带 prepareContinuable（dsh-subagent-spawn-in-process
-//    lib/index.js:33 实证）。 ────────────────────────────────────────────────
+//    双轨）。宿主契约实证：SubagentRuntime 无 start/startContinuable；
+//    startActivation(spec)——**0.2.2-rc.2 契约=spec 顶层平铺**（SUMMON-FAIL-0.2.2-rc.2.md
+//    实证：宿主 :3018-3022 直读 spec.parent.id、:1478 startLocal spec 顶层、:2207
+//    receipt { childId, result, dispose }；alpha 升级指南示例的嵌套 request 与 rc.2
+//    运行时矛盾，插件曾按指南嵌套致 summon 全炸）；sendMessage(sender, targetId,
+//    content, options)（:3068）；回收面 drainChildren（:3129）；spawn provider 带
+//    prepareContinuable。 ────────────────────────────────────────────────
 
 /** alpha.2 宿主 mock：无 start/startContinuable，startActivation 面三件套+
  *  回收/中断辅助面 + ctx.on('subagent/end')。 */
@@ -4312,8 +4313,8 @@ test('detectResumeSeam: alpha.2 startActivation 面返回 activation seam（spec
   const { ctx, state, provider } = activationHost()
   const seam = detectResumeSeam(ctx, provider)
   assert.ok(seam && seam.track === 'activation')
-  // startContinuable → startActivation spec 原样收口（顶层 provider/label/signal，request 内嵌）
-  const spec = { provider: 'spawn', label: 'expert:x', request: { prompt: [] }, signal: new AbortController().signal }
+  // startContinuable → startActivation spec 原样收口（rc.2 平铺契约：顶层 prompt/parent/…）
+  const spec = { provider: 'spawn', label: 'expert:x', prompt: [], parent: {}, signal: new AbortController().signal }
   await seam.startContinuable(spec)
   assert.equal(state.startSpecs.length, 1)
   assert.equal(state.startSpecs[0], spec)
@@ -4380,7 +4381,7 @@ test('dsh-expert-291 T1 注册守卫双轨：alpha.2 面（startActivation 无 s
   }
 })
 
-test('dsh-expert-291 T1 alpha.2 面 one-shot：summon 经 startActivation 发射（顶层 provider/signal，request 内嵌）', async (t) => {
+test('dsh-expert-291 T1 alpha.2 面 one-shot：summon 经 startActivation 发射（rc.2 顶层平铺契约 + delivery=caller）', async (t) => {
   guardResumeEnv(t)
   const dst = mkdtempSync(join(tmpdir(), 't291-oneshot-'))
   try {
@@ -4397,13 +4398,14 @@ test('dsh-expert-291 T1 alpha.2 面 one-shot：summon 经 startActivation 发射
     const spec = state.startSpecs[0]
     assert.equal(spec.provider, 'spawn') // 顶层 provider（alpha.2 startActivation 契约）
     assert.ok(spec.label.startsWith('expert:'))
-    assert.ok(!('prompt' in spec) && !('persona' in spec) && !('toolFilter' in spec)) // request 内嵌，不外溢
-    assert.ok(spec.request.prompt[0].text.includes('任务'))
-    assert.ok(spec.request.toolFilter.deny.includes('summon_expert'))
-    assert.deepEqual(spec.request.parent, {}) // exec.agent 原样透传为 request.parent
+    assert.ok(!('request' in spec), 'rc.2 平铺契约：嵌套 request 不复存在') // SUMMON-FAIL-0.2.2-rc.2.md 修复
+    assert.ok(spec.prompt[0].text.includes('任务')) // prompt 顶层（rc.2 startLocal 直读）
+    assert.ok(spec.toolFilter.deny.includes('summon_expert')) // persona/toolFilter 顶层键（无 preset 通道时直传）
+    assert.deepEqual(spec.parent, {}) // exec.agent 原样透传为顶层 parent（宿主 :3018 spec.parent.id 直读）
+    assert.equal(spec.delivery, 'caller', 'one-shot=caller（宿主 :2216 不向 parent 投递结算消息；结果经 receipt.result 取）')
     assert.ok(spec.signal instanceof AbortSignal) // 宿主裸 throwIfAborted：缺省补永不中止 signal
     assert.equal(spec.signal.aborted, false)
-    assert.ok(!('agentOptions' in spec.request)) // 无档案 → 键不存在（#19 语义不变）
+    assert.ok(!('agentOptions' in spec)) // 无档案 → 键不存在（#19 语义不变）
     assert.equal(state.sendMessageCalls.length, 0)
   } finally {
     rmSync(dst, { recursive: true, force: true })
@@ -4425,7 +4427,7 @@ test('dsh-expert-291 T1 alpha.2 面 continuable 全链：首轮 error → sendMe
   assert.equal(state.startCalls, 1)
   const spec = state.startSpecs[0]
   assert.equal(spec.provider, 'spawn')
-  assert.ok(spec.request.prompt[0].text.includes('实现 T1 的接口层'))
+  assert.ok(spec.prompt[0].text.includes('实现 T1 的接口层'))
   await tick()
   // 首轮中断：error + 部分产出（subagent/end 词表与旧轨一致）
   emitEnd({ id: 'child-1', stopReason: 'error', lastAssistantMessage: [{ type: 'text', text: '已导出 model.js……（中断）' }] })
@@ -4537,10 +4539,16 @@ test('dsh-expert-292 T1 选轨钉子①b：detectResumeSeam 对旧轨续跑面�
   }
   const seam = detectResumeSeam(ctx, provider)
   assert.ok(seam && seam.track === 'legacy')
-  const spec = { provider: 'spawn', request: { prompt: [] } }
+  // 调用方构造平铺 spec（rc.2 契约为准）——legacy adapter 包回嵌套 request（与旧嵌套
+  // 构造逐字节等价：rest 展开 = prompt/parent/persona?/toolFilter?/agentPreset?/agentOptions?）
+  const spec = { provider: 'spawn', label: 'expert:x', prompt: [], parent: {}, persona: 'p', toolFilter: { deny: ['summon_expert'] }, signal: 'sig-x' }
   await seam.startContinuable(spec)
   assert.equal(state.legacySpecs.length, 1)
-  assert.equal(state.legacySpecs[0], spec) // spec 原样收口（旧轨契约）
+  assert.deepEqual(state.legacySpecs[0], {
+    provider: 'spawn', label: 'expert:x',
+    request: { prompt: [], parent: {}, persona: 'p', toolFilter: { deny: ['summon_expert'] } },
+    signal: 'sig-x',
+  }) // 平铺包回嵌套（alpha 契约，rest 展开保序）
   assert.equal(state.activationSpecs.length, 0) // 新轨零调用
 })
 
@@ -8960,7 +8968,7 @@ test('T12 用完即注 ③：全链成功收尾注销——one-shot answer 返�
     const summon = descriptors.find((d) => d.name === 'summon_expert')
     const r = await summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} })
     assert.equal(r.answer, 'one-shot')
-    const id = state.startSpecs[0].request.agentPreset
+    const id = state.startSpecs[0].agentPreset
     assert.deepEqual(registry.unregisterCalls, [id], 'run 收尾（成功边沿）注销被调恰好一次')
     assert.equal(registry.active.has(id), false, '定义已从注册台摘除（preset 列表只保留主 expert 入口）')
     assert.equal(registry.registered.length, 1, 'registered 保留为曾注册历史（对账面）')
@@ -8985,7 +8993,7 @@ test('T12 用完即注 ④：全链失败边沿计数回收——one-shot stopRe
     registerExpertTools(ctx, { dst, getExpertContentImpl: () => ({ content: 'persona 正文' }) })
     const summon = descriptors.find((d) => d.name === 'summon_expert')
     await assert.rejects(() => summon.execute({ expert: '后端工程师', task: '任务' }, { agent: {} }), /专家执行未正常完成/)
-    const id = state.startSpecs[0].request.agentPreset
+    const id = state.startSpecs[0].agentPreset
     assert.deepEqual(registry.unregisterCalls, [id], '失败边沿同样归还引用并注销（成功与失败皆算收尾，兜底幂等）')
     assert.equal(registry.active.has(id), false)
   } finally {
@@ -9016,7 +9024,7 @@ test('T12 用完即注 ⑤：全链并发同键两召唤——先收尾者不注
   const p2 = summon.execute({ expert: '后端工程师', task: '任务B' }, { agent: {} })
   for (let i = 0; i < 200 && state.startCalls < 2; i++) await tick()
   assert.equal(state.startCalls, 2)
-  const ids = state.startSpecs.map((s) => s.request.agentPreset)
+  const ids = state.startSpecs.map((s) => s.agentPreset)
   assert.equal(ids[0], ids[1], '同专家同内容 → 同 preset id（并发共享同一引用计数）')
   assert.deepEqual(registry.unregisterCalls, [], '两召唤在途：定义必存活')
   gates[1]({ stopReason: 'completed', output: [{ type: 'text', text: 'B 完成' }] })
@@ -9077,10 +9085,10 @@ test('T10 真机回归：执行期 ctx 属性面抛错形态下 summon preset �
     assert.equal(r.answer, 'one-shot')
     assert.equal(host.state.startCalls, 1)
     const spec = host.state.startSpecs[0]
-    assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+    assert.ok(typeof spec.agentPreset === 'string' && spec.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
     // 注册台确经 get 注入式面走到：定义已注册（属性面在 mock 里只会 throw）
     assert.equal(host.registry.registered.length, 1)
-    assert.equal(host.registry.registered[0].id, spec.request.agentPreset)
+    assert.equal(host.registry.registered[0].id, spec.agentPreset)
     assert.equal(host.registry.registered[0].plugins[0].config.prefix, 'persona 正文')
   } finally {
     rmSync(dst, { recursive: true, force: true })
@@ -9103,13 +9111,13 @@ test('T3 ②③ alpha.3/4 面 one-shot：summon 经 agentPreset 发射（request
     const spec = state.startSpecs[0]
     assert.equal(spec.provider, 'spawn')
     // request：agentPreset 键在、persona/toolFilter 死键绝不发送（宿主 manager 只读 agentPreset）
-    assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
-    assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
-    assert.ok(!('agentOptions' in spec.request)) // 无档案 → 键不存在（#19 语义不变）
+    assert.ok(typeof spec.agentPreset === 'string' && spec.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+    assert.ok(!('persona' in spec) && !('toolFilter' in spec))
+    assert.ok(!('agentOptions' in spec)) // 无档案 → 键不存在（#19 语义不变）
     // per-summon preset 定义：persona 行携带专家 persona，收窄行 deny 全局层确证名
     assert.equal(registry.registered.length, 1)
     const def = registry.registered[0]
-    assert.equal(def.id, spec.request.agentPreset)
+    assert.equal(def.id, spec.agentPreset)
     assert.equal(def.plugins[0].name, '@deepseek-ai/dsh-persona')
     assert.equal(def.plugins[0].config.prefix, 'persona 正文')
     const restrict = def.plugins[def.plugins.length - 1]
@@ -9119,8 +9127,8 @@ test('T3 ②③ alpha.3/4 面 one-shot：summon 经 agentPreset 发射（request
     // 组合级递归省略照常成立
     assert.ok(!JSON.stringify(def).includes('"tool-subagent"'))
     // T12 用完即注：run 收尾（成功边沿）后定义被注销（方案 A 裁决语义）
-    assert.deepEqual(registry.unregisterCalls, [spec.request.agentPreset])
-    assert.equal(registry.active.has(spec.request.agentPreset), false)
+    assert.deepEqual(registry.unregisterCalls, [spec.agentPreset])
+    assert.equal(registry.active.has(spec.agentPreset), false)
   } finally {
     rmSync(dst, { recursive: true, force: true })
   }
@@ -9141,9 +9149,9 @@ test('T3 ③/T6 preset 通道 agentOptions 键位：档案 model 经 request.age
   // 键位断言：agentPreset 与 agentOptions 两键并存于 request 顶层（宿主 manager
   // composition 只读 agentPreset 交付 persona；model 解析走 request.agentOptions，
   // T2 报告③两通道一致的实证钉子）
-  assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
-  assert.equal(spec.request.agentOptions?.model, 'model-A', 'preset 通道 model 仍走 request.agentOptions 直传')
-  assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+  assert.ok(typeof spec.agentPreset === 'string' && spec.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+  assert.equal(spec.agentOptions?.model, 'model-A', 'preset 通道 model 仍走 request.agentOptions 直传')
+  assert.ok(!('persona' in spec) && !('toolFilter' in spec))
   // preset 组合面不携带 model：定义里无该值（persona 经 preset 行，model 经 request）
   assert.equal(registry.registered.length, 1)
   assert.ok(!JSON.stringify(registry.registered[0]).includes('model-A'), 'per-summon preset 定义不得内嵌档案 model')
@@ -9174,8 +9182,8 @@ test('T3 ③/T6 profile-allow 端到端 warn：preset 通道 summon 档案 tools
   const allowWarns = warns.filter((m) => m.includes('tools.allow') && m.includes('暂不执法'))
   assert.equal(allowWarns.length, 1, `全链恰一次 allow 降级 warn：${JSON.stringify(warns)}`)
   const spec = state.startSpecs[0]
-  assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
-  assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+  assert.ok(typeof spec.agentPreset === 'string' && spec.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+  assert.ok(!('persona' in spec) && !('toolFilter' in spec))
   // 降级执法面：restrict 行 deny-only（递归防护 deny 求交结果），allow 绝不进组合
   assert.equal(registry.registered.length, 1)
   const def = registry.registered[0]
@@ -9204,7 +9212,7 @@ test('T3 ② 门禁能力分支：无 agentPreset 能力且缺 persona/toolFilte
   }
 })
 
-test('T3 ③ alpha.3/4 面 continuable：startContinuable spec.request 携带 agentPreset；续跑链路行为保持', async (t) => {
+test('T3 ③ alpha.3/4 面 continuable：startContinuable spec 顶层携带 agentPreset（rc.2 平铺）；续跑链路行为保持', async (t) => {
   guardResumeEnv(t)
   const dst = mkdtempSync(join(tmpdir(), 't3-preset-resume-'))
   t.after(() => rmSync(dst, { recursive: true, force: true }))
@@ -9218,10 +9226,10 @@ test('T3 ③ alpha.3/4 面 continuable：startContinuable spec.request 携带 ag
   for (let i = 0; i < 200 && state.startCalls === 0; i++) await tick()
   assert.equal(state.startCalls, 1)
   const spec = state.startSpecs[0]
-  assert.ok(typeof spec.request.agentPreset === 'string' && spec.request.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
-  assert.ok(!('persona' in spec.request) && !('toolFilter' in spec.request))
+  assert.ok(typeof spec.agentPreset === 'string' && spec.agentPreset.startsWith(SUMMON_PRESET_ID_PREFIX))
+  assert.ok(!('persona' in spec) && !('toolFilter' in spec))
   assert.equal(registry.registered.length, 1)
-  assert.equal(registry.registered[0].id, spec.request.agentPreset)
+  assert.equal(registry.registered[0].id, spec.agentPreset)
   await tick()
   // 首轮中断 → 恰好一续跑 turn → 完成（断点续跑行为与直传通道一致）
   emitEnd({ id: 'child-1', stopReason: 'error', lastAssistantMessage: [{ type: 'text', text: '（中断）' }] })
@@ -9233,7 +9241,7 @@ test('T3 ③ alpha.3/4 面 continuable：startContinuable spec.request 携带 ag
   assert.ok(r.answer.includes('断点续跑'))
   // T12 用完即注：续跑完成收尾后注销（在途窗口——首轮中断+续跑——定义始终存活，
   // 中断自动续跑发生在 settle 前，计数>0 保护不变）
-  assert.deepEqual(registry.unregisterCalls, [spec.request.agentPreset])
+  assert.deepEqual(registry.unregisterCalls, [spec.agentPreset])
 })
 
 // T3 ③ 副本漂移对账：cordis.patch.yml preset 行（权威源=agent.cordis.yml，生成器

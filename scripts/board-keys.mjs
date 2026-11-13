@@ -40,6 +40,14 @@ if (cmd === 'gen') {
   const pub = Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url')
   if (seed.length !== 32 || pub.length !== 32) fail('密钥长度异常（内部错误）')
   mkdirSync(outDir, { recursive: true })
+  // 低-3（REVIEW-ef3b962-security）：out-dir 落在 git 仓库内时 .gitignore 只覆盖缺省
+  // ~/.dsh/keys——告警防 `--out-dir .` 后私钥随 git add -A 误提交（不拒绝，操作者自决）。
+  try {
+    const { execFileSync } = await import('node:child_process')
+    execFileSync('git', ['-C', outDir, 'rev-parse', '--show-toplevel'], { stdio: 'pipe' })
+    console.error(`警告：输出目录位于 git 仓库内（${outDir}）——<name>.key 不在任何 .gitignore 覆盖面，` +
+      '严禁随仓库提交（私钥）；建议改用缺省 ~/.dsh/keys 或为该目录补 .gitignore 条目')
+  } catch { /* 非 git 仓库：静默 */ }
   writeFileSync(keyPath, b64(seed) + '\n', { mode: 0o600 })
   writeFileSync(pubPath, b64(pub) + '\n')
   try { if ((statSync(keyPath).mode & 0o777) !== 0o600) chmodSync(keyPath, 0o600) } catch { /* 尽力收紧 */ }

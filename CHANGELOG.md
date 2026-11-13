@@ -2,9 +2,9 @@
 
 All notable changes to `dsh-expert-orchestrator`. Format loosely follows Keep a Changelog; versions are plugin semver (independent of the host `dsh` version, which is declared via `engines.dsh` / `peerDependencies`).
 
-## [未发布]
+## [2.14.2] — 2026-11-13
 
-> 依据 `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md` §5 打包路线表近期轮（N1→N2→watchdog 收口→M1）落地。
+> 依据 `docs/research/exposure-crypto-trust/00-exposure-crypto-trust.md` §5 打包路线表（N1/N2/watchdog 收口/M1/⑤/M3 全部落地）+ 独立评审收口（docs/internal/REVIEW-ef3b962{,-security}.md）+ 宿主 0.2.2-rc.2 兼容修复（docs/internal/SUMMON-FAIL-0.2.2-rc.2.md 调查报告）。
 
 ### Added
 
